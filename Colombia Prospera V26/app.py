@@ -1,0 +1,11107 @@
+# Archivo principal del dashboard Altium Financiero
+# Ejecuta con: streamlit run app.py
+
+from modules.core import *
+from modules.prioridades import PRIORIDADES, ACCIONES
+from modules.report_pdf import generar_informe_financiero_pdf
+from modules.promedios import calcular_promedios_gasto
+from modules.regla_presupuesto import clasificar_regla, tooltip_regla
+from modules.analisis_avanzado import mostrar_pareto, mostrar_swarm_gastos
+from modules.sankey_financiero import mostrar_sankey_financiero
+import hashlib
+import base64
+import html
+import numpy as np
+from pathlib import Path
+from io import BytesIO
+from modules.origen_datos import descargar_libro_publico
+
+def construir_flujo_caja_diario(gastos_df, ingresos_df, desde, hasta):
+    """Acumulado de movimientos del período; nunca supone un saldo bancario inicial."""
+    from decimal import Decimal
+    inicio, fin = pd.Timestamp(desde).normalize(), pd.Timestamp(hasta).normalize()
+    if inicio > fin:
+        raise ValueError('La fecha inicial debe ser anterior a la final.')
+    calendario = pd.date_range(inicio, fin, freq='D')
+    eventos = []
+    def consolidar(tabla, fecha_col, valor_col, tipo, detalles):
+        if tabla is None or tabla.empty:
+            return pd.Series([Decimal(0)] * len(calendario), index=calendario, dtype=object)
+        fechas = pd.to_datetime(tabla[fecha_col], errors='coerce')
+        importes = pd.to_numeric(tabla[valor_col], errors='coerce')
+        mask = fechas.ge(inicio) & fechas.lt(fin + pd.Timedelta(days=1))
+        if importes.loc[mask].isna().any():
+            raise ValueError('Hay movimientos sin importe válido para el flujo diario.')
+        seleccion = tabla.loc[mask].copy()
+        seleccion['_dia_flujo'] = fechas.loc[mask].dt.normalize()
+        seleccion['_importe_flujo'] = importes.loc[mask].map(lambda v: Decimal(str(v)))
+        serie = seleccion.groupby('_dia_flujo')['_importe_flujo'].sum().reindex(calendario, fill_value=Decimal(0))
+        # Anotar movimientos reales, sin atribuir una causa que no figure en el archivo.
+        relevantes = seleccion[seleccion['_importe_flujo'].gt(0)].sort_values('_importe_flujo', ascending=False).head(2)
+        for _, row in relevantes.iterrows():
+            detalle = next((str(row[col]).strip() for col in detalles if col in row and pd.notna(row[col]) and str(row[col]).strip()), '')
+            eventos.append({'fecha':row['_dia_flujo'], 'importe':row['_importe_flujo'], 'tipo':tipo, 'detalle':detalle})
+        return serie
+    entradas = consolidar(ingresos_df, 'INGRESOS_FECHA', 'INGRESOS_CANTIDAD', 'Ingreso', ('INGRESOS_FUENTE','INGRESOS_DESCRIPCION'))
+    salidas = consolidar(gastos_df, 'GASTOS_FECHA', 'GASTOS_CANTIDAD', 'Gasto', ('GASTOS_DESCRIPCION','GASTOS_SUBCATEGORIA'))
+    diario = pd.DataFrame({'Fecha':calendario, 'Ingresos':entradas.values, 'Gastos':salidas.values})
+    diario['Flujo del día'] = diario['Ingresos'] - diario['Gastos']
+    diario['Acumulado'] = diario['Flujo del día'].cumsum()
+    return diario, eventos
+
+
+def crear_figura_flujo_caja_diario(diario, eventos):
+    from html import escape
+    from math import floor, log10
+    from decimal import Decimal
+    def pesos(valor):
+        return ('-$' if valor < 0 else '$') + f'{abs(valor):,.0f}'.replace(',', '.')
+    meses_cortos = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic']
+    figura = go.Figure()
+    curva = go.Scatter(
+        x=diario['Fecha'], y=diario['Acumulado'], mode='lines', name='Saldo acumulado',
+        line=dict(color='#C4A1FF', width=2.8, shape='linear'),
+        fill='tozeroy', fillcolor='rgba(155,92,246,0.23)',
+        customdata=[[pesos(r['Ingresos']),pesos(r['Gastos']),pesos(r['Flujo del día']),pesos(r['Acumulado'])] for _,r in diario.iterrows()],
+        hovertemplate='<b>%{x|%d/%m/%Y}</b><br>Ingresos del día: %{customdata[0]}<br>Gastos del día: %{customdata[1]}<br>Flujo neto del día: %{customdata[2]}<br><b>Acumulado: %{customdata[3]}</b><extra></extra>',
+    )
+    try:
+        curva.fillgradient = dict(type='vertical', colorscale=[[0,'rgba(155,92,246,0.015)'],[1,'rgba(168,110,255,0.52)']])
+    except ValueError:
+        pass  # Plotly antiguo: conserva el relleno uniforme sin cambiar los datos.
+    figura.add_trace(curva)
+    por_fecha = diario.set_index('Fecha')['Acumulado']
+    # Hasta tres anotaciones espaciadas para mantener la lectura en la columna del Resumen.
+    distancia = max((diario.Fecha.iloc[-1] - diario.Fecha.iloc[0]).days // 12, 1)
+    elegidos = []
+    for evento in sorted(eventos, key=lambda e:e['importe'], reverse=True):
+        if len(elegidos) >= 3: break
+        if any(abs((evento['fecha']-otro['fecha']).days) < distancia for otro in elegidos): continue
+        elegidos.append(evento)
+    for tipo, color in [('Ingreso','#5CE0AB'),('Gasto','#FF789C')]:
+        puntos = [e for e in elegidos if e['tipo']==tipo]
+        figura.add_trace(go.Scatter(
+            x=[e['fecha'] for e in puntos], y=[por_fecha.loc[e['fecha']] for e in puntos],
+            name='Ingreso destacado' if tipo=='Ingreso' else 'Gasto relevante', mode='markers',
+            marker=dict(size=8,color='#111F33',line=dict(width=2,color=color)),
+            customdata=[[escape(e['detalle']),('+' if tipo=='Ingreso' else '-')+pesos(e['importe']),pesos(por_fecha.loc[e['fecha']])] for e in puntos],
+            hovertemplate='<b>%{x|%d/%m/%Y}</b><br>%{customdata[0]}<br>Movimiento: %{customdata[1]}<br>Acumulado del día: %{customdata[2]}<extra></extra>',
+        ))
+    for i, evento in enumerate(sorted(elegidos,key=lambda e:e['fecha'])):
+        ingreso = evento['tipo']=='Ingreso'
+        color = '#5CE0AB' if ingreso else '#FF789C'
+        detalle = escape(evento['detalle'][:27] + ('…' if len(evento['detalle'])>27 else ''))
+        texto = ('Ingreso' if ingreso else 'Gasto relevante')+'<br><b>'+('+' if ingreso else '-')+pesos(evento['importe'])+'</b>'
+        if detalle: texto += '<br><span style="font-size:9px">'+detalle+'</span>'
+        figura.add_annotation(x=evento['fecha'],y=por_fecha.loc[evento['fecha']],text=texto,
+            showarrow=True,arrowhead=0,arrowwidth=1,arrowcolor=color,ax=0,
+            ay=-68 if ingreso else 70,font=dict(size=10,color='#E2E8F0'),
+            bgcolor='rgba(11,25,39,0.96)',bordercolor=color,borderwidth=1,borderpad=6)
+    saldo = diario['Acumulado'].iloc[-1]
+    figura.add_annotation(x=1,y=1.22,xref='paper',yref='paper',xanchor='right',yanchor='top',
+        text='<span style="font-size:10px">Acumulado del período</span><br><b>'+pesos(saldo)+'</b>',
+        showarrow=False,align='center',font=dict(size=14,color='#F4EAFF' if saldo>=0 else '#FFABC0'),
+        bgcolor='#352650' if saldo>=0 else '#452135',bordercolor='#9F7BE4' if saldo>=0 else '#B75270',borderpad=9)
+    indices = np.unique(np.linspace(0,len(diario)-1,min(7,len(diario)),dtype=int))
+    fechas_eje = diario.Fecha.iloc[indices]
+    valores = [float(v) for v in diario.Acumulado]
+    bajo,alto = min(0,min(valores)),max(0,max(valores))
+    amplitud = alto-bajo
+    referencia = amplitud/5 if amplitud else 1
+    potencia = 10**floor(log10(referencia))
+    paso = next((p*potencia for p in (1,2,5,10) if p*potencia>=referencia),10*potencia)
+    ticks = np.arange(floor(bajo/paso)*paso,alto+paso,paso)
+    figura.update_layout(
+        template='plotly_dark',height=540,paper_bgcolor='#07111F',plot_bgcolor='#0B1525',
+        font=dict(family='Arial, sans-serif',color='#E2E8F0',size=11),
+        title=dict(text='Flujo de caja acumulado<br><span style="font-size:11px;color:#94A3B8">Ingresos menos gastos, día a día</span>',font=dict(size=18,color='#F4EAFF'),x=.02,y=.98),
+        margin=dict(t=125,b=70,l=78,r=24),hovermode='x unified',
+        legend=dict(orientation='h',y=1.07,yanchor='bottom',x=0,font=dict(size=10),bgcolor='rgba(0,0,0,0)'),
+        xaxis=dict(title='Fecha',type='date',tickmode='array',tickvals=fechas_eje,
+            ticktext=[f'{d.day} {meses_cortos[d.month-1]}' for d in fechas_eje],
+            showgrid=True,gridcolor='rgba(148,163,184,.09)',zeroline=False),
+        yaxis=dict(title='COP',tickmode='array',tickvals=ticks,ticktext=[pesos(v) for v in ticks],
+            gridcolor='rgba(148,163,184,.12)',zeroline=True,zerolinecolor='rgba(196,161,255,.45)',automargin=True),
+        hoverlabel=dict(bgcolor='#111F33',bordercolor='#B794F6',font=dict(color='#F8FAFC',size=12)),
+    )
+    return figura
+
+
+def _voronoi_poligonos(sitios, pesos, alto=.55):
+    """Diagrama de potencia recortado: cada celda es una intersección de semiplanos."""
+    celdas=[]
+    for i,p in enumerate(sitios):
+        pol=np.array([[0.,0.],[1.,0.],[1.,alto],[0.,alto]])
+        for j,q in enumerate(sitios):
+            if i==j or not len(pol): continue
+            normal=2*(q-p)
+            limite=float(np.dot(q,q)-np.dot(p,p)+pesos[i]-pesos[j])
+            salida=[]
+            anterior=pol[-1]; d_ant=float(np.dot(normal,anterior)-limite)
+            for actual in pol:
+                d_act=float(np.dot(normal,actual)-limite)
+                if (d_act<=1e-12)!=(d_ant<=1e-12):
+                    proporcion=d_ant/(d_ant-d_act)
+                    salida.append(anterior+proporcion*(actual-anterior))
+                if d_act<=1e-12: salida.append(actual)
+                anterior,d_ant=actual,d_act
+            pol=np.array(salida) if salida else np.empty((0,2))
+        celdas.append(pol)
+    return celdas
+
+
+def _voronoi_area_centro(pol):
+    if len(pol)<3: return 0.,np.array([.5,.275])
+    siguiente=np.roll(pol,-1,axis=0)
+    cruz=pol[:,0]*siguiente[:,1]-siguiente[:,0]*pol[:,1]
+    doble=float(cruz.sum())
+    if abs(doble)<1e-15: return 0.,pol.mean(axis=0)
+    centro=((pol+siguiente)*cruz[:,None]).sum(axis=0)/(3*doble)
+    return abs(doble)/2,centro
+
+
+@st.cache_data(show_spinner=False,max_entries=24)
+def calcular_mapa_voronoi_proporcional(proporciones):
+    """Ajusta pesos de potencia hasta reproducir las proporciones de gasto."""
+    valores=np.asarray(proporciones,dtype=float)
+    if not len(valores) or np.any(~np.isfinite(valores)) or np.any(valores<=0):
+        raise ValueError('El mapa necesita proporciones positivas y finitas.')
+    valores=valores/valores.sum();alto=.55;n=len(valores)
+    if n==1: return [np.array([[0.,0.],[1.,0.],[1.,alto],[0.,alto]]).tolist()]
+    objetivos=valores*alto
+    # Semillas deterministas, distribuidas por filas alternas.
+    columnas=int(np.ceil(np.sqrt(n/alto)));filas=int(np.ceil(n/columnas))
+    sitios=np.array([((i%columnas+.5+(0.12 if (i//columnas)%2 else -.12))/columnas,(i//columnas+.5)/filas*alto) for i in range(n)])
+    pesos=np.zeros(n)
+    def resolver(sitios,pesos):
+        for _ in range(70):
+            pols=_voronoi_poligonos(sitios,pesos,alto)
+            areas=np.array([_voronoi_area_centro(p)[0] for p in pols])
+            error=objetivos-areas
+            if np.max(np.abs(error))<1e-8: break
+            base=float(np.sum(error**2/objetivos))
+            jac=np.empty((n-1,n-1));eps=1e-6
+            for j in range(n-1):
+                prueba=pesos.copy();prueba[j]+=eps
+                nuevas=np.array([_voronoi_area_centro(p)[0] for p in _voronoi_poligonos(sitios,prueba,alto)])
+                jac[:,j]=(nuevas[:-1]-areas[:-1])/eps
+            delta=np.r_[np.linalg.lstsq(jac,error[:-1],rcond=1e-10)[0],0.]
+            aceptado=False
+            for factor in (1.,.5,.25,.125,.0625,.03125,.015625,.0078125):
+                nuevos=pesos+factor*delta
+                nuevas=np.array([_voronoi_area_centro(p)[0] for p in _voronoi_poligonos(sitios,nuevos,alto)])
+                if np.all(nuevas>1e-13) and np.sum((nuevas-objetivos)**2/objetivos)<base:
+                    pesos=nuevos;aceptado=True;break
+            if not aceptado: break
+        return pesos
+    for _ in range(5):
+        pesos=resolver(sitios,pesos)
+        pols=_voronoi_poligonos(sitios,pesos,alto)
+        centros=np.array([_voronoi_area_centro(p)[1] for p in pols])
+        sitios=.45*sitios+.55*centros
+        pesos=np.zeros(n)
+    pesos=resolver(sitios,pesos)
+    pols=_voronoi_poligonos(sitios,pesos,alto)
+    areas=np.array([_voronoi_area_centro(p)[0] for p in pols])/alto
+    if np.max(np.abs(areas-valores))>.002:
+        raise ValueError('No se pudo ajustar el mapa a las proporciones de gasto con suficiente precisión.')
+    return [p.tolist() for p in pols]
+
+
+def crear_mapa_gastos_voronoi(gastos_df,desde,hasta,alto_panel=460):
+    from decimal import Decimal
+    from html import escape
+    import unicodedata
+    import textwrap
+    def clave(v): return ''.join(c for c in unicodedata.normalize('NFD',str(v).upper()) if unicodedata.category(c)!='Mn')
+    def dinero(v):return ('-$ ' if v<0 else '$ ')+f'{abs(v):,.0f}'.replace(',','.')
+    if gastos_df is not None and 'GASTOS_FECHA' in gastos_df:
+        fechas=pd.to_datetime(gastos_df['GASTOS_FECHA'],errors='coerce')
+        gastos_df=gastos_df.loc[fechas.ge(pd.Timestamp(desde).normalize()) & fechas.lt(pd.Timestamp(hasta).normalize()+pd.Timedelta(days=1))].copy()
+    if gastos_df is None or gastos_df.empty:
+        return '',0,None
+    montos=pd.to_numeric(gastos_df['GASTOS_CANTIDAD'],errors='coerce')
+    if montos.isna().any() or not np.isfinite(montos.to_numpy(dtype=float)).all(): raise ValueError('Hay gastos sin un importe válido para el mapa.')
+    tabla=pd.DataFrame({'Categoría':gastos_df['GASTOS_CATEGORIA'].fillna('Sin categoría').astype(str),'Gasto neto':montos.map(lambda v:Decimal(str(v)))})
+    tabla=tabla.groupby('Categoría',dropna=False)['Gasto neto'].sum().reset_index().sort_values('Gasto neto',ascending=False)
+    total=tabla['Gasto neto'].sum()
+    positivos=tabla[tabla['Gasto neto'].gt(0)].copy()
+    base=positivos['Gasto neto'].sum()
+    if positivos.empty:return '',0,tabla
+    positivos['% del mapa']=positivos['Gasto neto'].map(lambda v:float(v/base*100))
+    datos=[{'nombre':r['Categoría'],'valor':r['Gasto neto'],'detalle':r['Categoría']} for _,r in positivos.iterrows()]
+    if len(datos)>9:
+        cola=datos[8:]
+        datos=datos[:8]+[{'nombre':'Otras categorías','valor':sum((d['valor'] for d in cola),Decimal(0)),'detalle':', '.join(d['nombre'] for d in cola)}]
+    poligonos=calcular_mapa_voronoi_proporcional(tuple(float(d['valor']/base) for d in datos))
+    estilos=[('VIVIEN','#A44BEE','house'),('GUST','#00B8B0','game'),('ALIMENT','#00A9BA','food'),('SALUD','#9259DB','heart'),('CARRO','#2276E5','car'),('MOTO','#159DCD','car'),('TRANSP','#3475E7','car'),('HIJ','#536CED','people'),('EDUC','#8559E8','book'),('CREDIT','#2989DC','coin'),('DEUD','#2989DC','coin'),('IMPUEST','#B548E3','coin')]
+    iconos={
+        'house':'<path d="M3 11 12 3l9 8M6 10v11h5v-6h3v6h5V10"/>',
+        'game':'<path d="M7 8h10c3 0 5 9 3 11-1 1-4-3-5-3H9c-1 0-4 4-5 3-2-2 0-11 3-11Z"/><path d="M8 10v5m-2-2h4m6-2h.1m2 3h.1"/>',
+        'heart':'<path d="M12 21 3.5 12.5C-2 6 6 1 12 7c6-6 14-1 8.5 5.5Z"/>',
+        'car':'<path d="m5 10 2-6h10l2 6M4 10h16v8H4Zm1 8v3m14-3v3M7 13h.1M17 13h.1"/>',
+        'food':'<path d="M4 3v6m3-6v6m3-6v6M4 7h6M7 9v12M18 3c-3 3-3 9 0 9h2V3Zm2 9v9"/>',
+        'book':'<path d="M3 4c3-1 6-1 9 1 3-2 6-2 9-1v16c-3-1-6-1-9 1-3-2-6-2-9-1Zm9 1v16"/>',
+        'people':'<circle cx="12" cy="7" r="4"/><path d="M4 22v-3c0-8 16-8 16 0v3"/>',
+        'coin':'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v12c0 4 18 4 18 0V5M3 11c0 4 18 4 18 0"/>',
+        'other':'<circle cx="4" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="20" cy="12" r="1"/>',
+    }
+    definitions=['<linearGradient id="borde" x2="1" y2="1"><stop stop-color="#A855F7"/><stop offset=".5" stop-color="#38BDF8"/><stop offset="1" stop-color="#7C3AED"/></linearGradient>','<filter id="sombra"><feGaussianBlur stdDeviation="4"/></filter>']
+    partes=[]
+    def redondear(pol):
+        comandos=[]
+        for i,p in enumerate(pol):
+            antes=pol[i-1];despues=pol[(i+1)%len(pol)]
+            d1=np.linalg.norm(antes-p);d2=np.linalg.norm(despues-p)
+            r=min(12.,d1*.12,d2*.12)
+            entrada=p+(antes-p)*(r/d1 if d1 else 0)
+            salida=p+(despues-p)*(r/d2 if d2 else 0)
+            comandos.append(('M' if i==0 else 'L')+f'{entrada[0]:.3f},{entrada[1]:.3f} Q{p[0]:.3f},{p[1]:.3f} {salida[0]:.3f},{salida[1]:.3f}')
+        return ' '.join(comandos)+' Z'
+    for indice,(item,vertices) in enumerate(zip(datos,poligonos)):
+        pol=np.asarray(vertices)*856+np.array([22.,118.])
+        _,centro=_voronoi_area_centro(pol)
+        distancias=[]
+        for a,b in zip(pol,np.roll(pol,-1,axis=0)):
+            edge=b-a
+            distancias.append(abs(edge[0]*(centro-a)[1]-edge[1]*(centro-a)[0])/max(np.linalg.norm(edge),1e-10))
+        radio=float(min(distancias))
+        nombre=item['nombre'];porcentaje=float(item['valor']/base*100)
+        _,color,icono=next((e for e in estilos if e[0] in clave(nombre)),('', ['#1F75D9','#6858E8','#06A2B6'][indice%3],'other'))
+        gid='celda'+str(indice)
+        definitions.append(f'<radialGradient id="{gid}" cx="25%" cy="8%" r="100%"><stop stop-color="{color}" stop-opacity=".96"/><stop offset="1" stop-color="#0B1230" stop-opacity=".96"/></radialGradient>')
+        ayuda=escape(nombre+' · '+dinero(item['valor'])+' COP · '+f'{porcentaje:.1f}'.replace('.',',')+'% del gasto positivo del mapa'+(' · '+item['detalle'] if nombre=='Otras categorías' else ''),quote=True)
+        path=redondear(pol)
+        definitions.append(f'<clipPath id="limite-{gid}"><path d="{path}"/></clipPath>')
+        partes.append(f'<g class="vm-cell" tabindex="0" role="img" aria-label="{ayuda}" data-tip="{ayuda}"><title>{ayuda}</title><path d="{path}" fill="url(#{gid})" stroke="{color}" stroke-width="2.2"/>')
+        x,y=centro
+        partes.append(f'<g clip-path="url(#limite-{gid})"><g class="vm-label" data-x="{x:.4f}" data-y="{y:.4f}" data-radio="{max(0,radio-6):.4f}">')
+        if radio>=42:
+            font=min(23.,max(14.,radio*.28));ancho=radio*1.7
+            etiqueta=textwrap.wrap(nombre.title(),width=max(8,int(ancho/(font*.57))))[:2]
+            cantidad=dinero(item['valor'])
+            money_font=min(font*.92,ancho/(max(len(cantidad),1)*.57))
+            if money_font<11:money_font=11
+            alto_bloque=29+len(etiqueta)*(font+3)+money_font+19
+            inicio=y-alto_bloque/2
+            partes.append(f'<svg x="{x-15:.2f}" y="{inicio:.2f}" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#F5EEFF" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">{iconos[icono]}</svg>')
+            cursor=inicio+46
+            for linea in etiqueta:
+                partes.append(f'<text x="{x:.2f}" y="{cursor:.2f}" font-size="{font:.1f}" font-weight="700">{escape(linea)}</text>');cursor+=font+3
+            partes.append(f'<text x="{x:.2f}" y="{cursor+money_font-3:.2f}" font-size="{money_font:.1f}" font-weight="700">{escape(cantidad)}</text>')
+            partes.append(f'<text x="{x:.2f}" y="{cursor+money_font+17:.2f}" font-size="{max(11,font*.72):.1f}" fill="#DFD7F6">({porcentaje:.1f}%)</text>'.replace(f'({porcentaje:.1f}%)','('+f'{porcentaje:.1f}'.replace('.',',')+'%)'))
+        elif radio>=16:
+            texto=nombre.title() if len(nombre)<=12 else nombre[:11]+'…'
+            partes.append(f'<text x="{x:.2f}" y="{y-2:.2f}" font-size="11" font-weight="700">{escape(texto)}</text><text x="{x:.2f}" y="{y+14:.2f}" font-size="10">{porcentaje:.1f}%</text>')
+        partes.append('</g></g></g>')
+    ajustes=tabla.loc[tabla['Gasto neto'].lt(0),'Gasto neto'].sum()
+    nota='Área proporcional al gasto neto de cada categoría.' if ajustes==0 else 'Áreas: categorías con gasto neto positivo. Ajustes negativos: '+dinero(ajustes)+'.'
+    svg=f'''<svg viewBox="0 0 900 670" font-family="Arial, sans-serif" text-anchor="middle" fill="#F3F0FF" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mapa proporcional de gastos del período filtrado">
+    <defs>{''.join(definitions)}</defs>
+    <rect x="4" y="4" width="892" height="662" rx="26" fill="#07111F" stroke="url(#borde)" stroke-width="2"/>
+    <rect x="24" y="26" width="45" height="45" rx="14" fill="#5930A2" stroke="#A979F5"/>
+    <text x="46.5" y="56" font-size="23" font-weight="700">◈</text>
+    <text x="88" y="49" text-anchor="start" font-size="25" font-weight="700">Mapa de gastos por categoría</text>
+    <text x="88" y="76" text-anchor="start" font-size="13" fill="#AEBBD2">{pd.Timestamp(desde):%d/%m/%Y} — {pd.Timestamp(hasta):%d/%m/%Y} · Período filtrado</text>
+    {''.join(partes)}
+    <rect x="24" y="603" width="852" height="40" rx="14" fill="#111F33" stroke="#284562"/>
+    <text x="450" y="630" font-size="19" font-weight="700">Gasto neto del período: <tspan fill="#4ADDD2">{escape(dinero(total))} COP</tspan></text>
+    <text x="450" y="659" font-size="10" fill="#94A3B8">{escape(nota)}</text>
+    </svg>'''
+    # Separar las franjas permite igualar alturas sin deformar las áreas del mapa.
+    contenido_celdas=''.join(partes)
+    cabecera=svg[svg.index('<rect x="24" y="26"'):svg.index(contenido_celdas)]
+    pie=svg[svg.index('<rect x="24" y="603"'):svg.rindex('</svg>')]
+    atributos='xmlns="http://www.w3.org/2000/svg" fill="#F3F0FF" font-family="Arial, sans-serif" text-anchor="middle" preserveAspectRatio="xMidYMid meet"'
+    svg=(f'<div class="vm-card" style="height:{int(alto_panel)}px">'
+         f'<svg {atributos} viewBox="0 0 900 110" aria-label="Mapa de gastos por categoría">{cabecera}</svg>'
+         f'<svg {atributos} viewBox="18 114 864 480" role="img" aria-label="Categorías con áreas proporcionales al gasto"><defs>{"".join(definitions)}</defs>{contenido_celdas}</svg>'
+         f'<svg {atributos} viewBox="0 595 900 75" aria-label="Total del período">{pie}</svg></div>')
+    documento='''<!doctype html><html lang="es"><head><meta charset="utf-8"><style>
+    *{box-sizing:border-box}body{margin:0;background:#07111F;font-family:Arial,sans-serif}.vm-card{display:grid;grid-template-rows:70px minmax(0,1fr) 62px;width:100%;padding:6px 10px;border:1px solid transparent;border-radius:18px;overflow:hidden;background:linear-gradient(#07111F,#07111F) padding-box,linear-gradient(135deg,#A855F7,#38BDF8,#7C3AED) border-box}.vm-card>svg{display:block;width:100%;height:100%;min-height:0}text{pointer-events:none}.vm-cell{cursor:default;outline:none}.vm-cell:hover>path,.vm-cell:focus>path{filter:brightness(1.2);stroke-width:3.5}#vm-tip{position:fixed;display:none;background:#111F33;border:1px solid #8D6DCE;border-radius:10px;padding:10px 13px;max-width:min(330px,calc(100vw - 16px));color:#F8FAFC;font-size:12px;line-height:1.6;pointer-events:none;z-index:2;box-shadow:0 7px 25px #0008}
+    </style></head><body>'''+svg+'''<div id="vm-tip"></div><script>
+    // Medir el texto real y encajarlo en el círculo interior de cada categoría.
+    function ajustarEtiquetas(){
+      document.querySelectorAll('.vm-label').forEach(etiqueta=>{
+        etiqueta.removeAttribute('transform');
+        const caja=etiqueta.getBBox();
+        if(!caja.width || !caja.height)return;
+        const radio=Number(etiqueta.dataset.radio);
+        const escala=Math.min(1,radio/Math.hypot(caja.width/2,caja.height/2));
+        const cx=caja.x+caja.width/2,cy=caja.y+caja.height/2;
+        etiqueta.setAttribute('transform',`translate(${etiqueta.dataset.x} ${etiqueta.dataset.y}) scale(${escala}) translate(${-cx} ${-cy})`);
+      });
+    }
+    ajustarEtiquetas();
+    if(document.fonts)document.fonts.ready.then(ajustarEtiquetas);
+    const tip=document.getElementById('vm-tip');document.addEventListener('pointermove',e=>{const c=e.target.closest('.vm-cell');if(!c){tip.style.display='none';return}tip.textContent=c.dataset.tip;tip.style.display='block';tip.style.left=Math.max(8,Math.min(e.clientX+14,innerWidth-345))+'px';tip.style.top=Math.max(8,Math.min(e.clientY+12,innerHeight-90))+'px'});document.addEventListener('pointerleave',()=>tip.style.display='none');
+    </script></body></html>'''
+    tabla['% del mapa']=tabla['Gasto neto'].map(lambda v:float(v/base*100) if v>0 else None)
+    return documento,int(alto_panel),tabla
+
+
+def preparar_momentum_gastos(gastos_df, desde, hasta, mes_anterior=False, rango_anterior=None):
+    """Compara ventanas consecutivas de igual duración, sin extrapolar gastos."""
+    from decimal import Decimal
+    inicio, fin = pd.Timestamp(desde).normalize(), pd.Timestamp(hasta).normalize()
+    dias = (fin-inicio).days+1
+    if dias < 1:
+        raise ValueError('El período de fechas no es válido.')
+    anterior_fin = inicio-pd.Timedelta(days=1)
+    anterior_inicio = inicio-pd.Timedelta(days=dias)
+    if mes_anterior:
+        anterior_inicio = (inicio.to_period('M')-1).start_time
+        anterior_fin = inicio.to_period('M').start_time-pd.Timedelta(days=1)
+    if rango_anterior is not None:
+        anterior_inicio, anterior_fin = [pd.Timestamp(v).normalize() for v in rango_anterior]
+        if anterior_inicio > anterior_fin or anterior_fin >= inicio:
+            raise ValueError('El período anterior debe terminar antes del período actual.')
+    fechas = pd.to_datetime(gastos_df['GASTOS_FECHA'], errors='coerce')
+    montos = pd.to_numeric(gastos_df['GASTOS_CANTIDAD'], errors='coerce')
+    relevantes = fechas.ge(anterior_inicio) & fechas.lt(fin+pd.Timedelta(days=1))
+    if (relevantes & (montos.isna() | ~np.isfinite(montos))).any():
+        raise ValueError('Hay importes inválidos en los períodos comparados.')
+    def sumar(a,b):
+        mascara = fechas.ge(a) & fechas.lt(b+pd.Timedelta(days=1))
+        t = pd.DataFrame({'Categoría': gastos_df.loc[mascara,'GASTOS_CATEGORIA'].fillna('Sin categoría').astype(str),
+                          'valor': montos.loc[mascara].map(lambda v: Decimal(str(v)))})
+        return t.groupby('Categoría')['valor'].sum()
+    actual, anterior = sumar(inicio,fin), sumar(anterior_inicio,anterior_fin)
+    tabla = pd.concat([actual.rename('Gasto actual'),anterior.rename('Gasto anterior')],axis=1).fillna(Decimal(0)).reset_index()
+    tabla['Variación %'] = [float((a-b)/b*100) if b>0 else None for a,b in zip(tabla['Gasto actual'],tabla['Gasto anterior'])]
+    tabla['Estado'] = ['Comparable' if a>=0 and b>0 else 'Gasto nuevo' if a>0 and b==0 else 'Base anterior negativa' if b<0 else 'Ajuste neto negativo' if a<0 else 'Sin gasto positivo' for a,b in zip(tabla['Gasto actual'],tabla['Gasto anterior'])]
+    # El primer movimiento no acredita historial anterior a esa fecha.
+    historial = fechas.notna().any() and fechas.min().normalize() <= anterior_inicio
+    return tabla, anterior_inicio, anterior_fin, bool(historial)
+
+
+def resolver_periodos_momentum(gastos_df, desde, hasta, modo):
+    """Resuelve fechas explícitas sin cambiar el filtro global ni saltar meses por su resultado."""
+    inicio, fin = pd.Timestamp(desde).normalize(), pd.Timestamp(hasta).normalize()
+    if inicio > fin:
+        raise ValueError('El período de fechas no es válido.')
+    if modo == 'Último mes completo':
+        fechas = pd.to_datetime(gastos_df['GASTOS_FECHA'], errors='coerce').dropna()
+        meses = sorted(fechas.loc[fechas.ge(inicio) & fechas.lt(fin+pd.Timedelta(days=1))].dt.to_period('M').unique(), reverse=True)
+        completos = [m for m in meses if m.start_time >= inicio and m.end_time.normalize() <= fin]
+        if not completos:
+            raise ValueError('No hay un mes completo con movimientos dentro del filtro. Amplía las fechas o selecciona Mes en curso del filtro.')
+        mes = completos[0]
+        a,b = mes.start_time,mes.end_time.normalize()
+        anterior = mes-1
+        return a,b,anterior.start_time,anterior.end_time.normalize(),'Mes completo frente al mes calendario anterior.'
+    if modo == 'Mes en curso del filtro':
+        inicio = max(inicio,fin.replace(day=1))
+    mes_inicio, mes_fin = inicio.to_period('M'), fin.to_period('M')
+    if inicio.day == 1 and fin == mes_fin.end_time.normalize():
+        cantidad = (mes_fin.year-mes_inicio.year)*12+mes_fin.month-mes_inicio.month+1
+        pa = (mes_inicio-cantidad).start_time
+        pb = mes_inicio.start_time-pd.Timedelta(days=1)
+        return inicio,fin,pa,pb,f'{cantidad} mes(es) calendario frente a los {cantidad} anteriores.'
+    if inicio.day == 1 and mes_inicio == mes_fin:
+        anterior = mes_inicio-1
+        pa = anterior.start_time
+        pb = pa.replace(day=min(fin.day,anterior.days_in_month))
+        nota = 'Mismos días del mes anterior.'
+        if fin.day > anterior.days_in_month:
+            nota = 'Mismos días del mes anterior, hasta su último día disponible en el calendario.'
+        return inicio,fin,pa,pb,nota
+    dias = (fin-inicio).days+1
+    return inicio,fin,inicio-pd.Timedelta(days=dias),inicio-pd.Timedelta(days=1),f'Fechas personalizadas: tramo anterior de {dias} días.'
+
+
+def dividir_periodo_momentum(gastos_df, desde, hasta):
+    """Compara la segunda mitad con la primera dentro del historial disponible."""
+    fechas = pd.to_datetime(gastos_df['GASTOS_FECHA'], errors='coerce').dropna()
+    if fechas.empty:
+        raise ValueError('No hay fechas de gastos disponibles para dividir el período.')
+    inicio = max(pd.Timestamp(desde).normalize(), fechas.min().normalize())
+    fin = min(pd.Timestamp(hasta).normalize(), fechas.max().normalize())
+    dias = (fin-inicio).days+1
+    if dias < 2:
+        raise ValueError('Se necesitan al menos dos días de historial dentro del filtro para comparar sus mitades.')
+    primera = dias//2
+    pa, pb = inicio, inicio+pd.Timedelta(days=primera-1)
+    ma, mb = pb+pd.Timedelta(days=1), fin
+    nota = f'Sin historial anterior suficiente: segunda mitad ({dias-primera} días) frente a primera mitad ({primera} días) del historial disponible dentro del filtro.'
+    if dias%2:
+        nota += ' El día adicional queda en la segunda mitad; se comparan los gastos totales, sin normalizar por día.'
+    return ma,mb,pa,pb,nota
+
+
+def buscar_momentum_mensual(gastos_df, desde, hasta):
+    """Último mes completo dentro del filtro que tenga categorías comparables."""
+    fechas = pd.to_datetime(gastos_df['GASTOS_FECHA'], errors='coerce').dropna()
+    inicio, fin = pd.Timestamp(desde).normalize(), pd.Timestamp(hasta).normalize()
+    meses = sorted(fechas.loc[fechas.ge(inicio) & fechas.lt(fin+pd.Timedelta(days=1))].dt.to_period('M').unique(), reverse=True)
+    for mes in meses:
+        a,b = mes.start_time, mes.end_time.normalize()
+        if a < inicio or b > fin:
+            continue
+        tabla,pa,pb,historial = preparar_momentum_gastos(gastos_df,a,b,mes_anterior=True)
+        if historial and tabla['Estado'].eq('Comparable').any():
+            return tabla,pa,pb,historial,a,b
+    return None
+
+
+def crear_figura_momentum_gastos(tabla, periodos=None):
+    import plotly.graph_objects as go
+    from html import escape
+    datos = tabla.loc[tabla['Estado'].eq('Comparable')].copy()
+    if datos.empty:
+        return None, None
+    x = datos['Gasto actual'].map(float)
+    y = datos['Variación %'].astype(float)
+    umbral = float(x.median())
+    xmax = max(float(x.max())*1.3,umbral*1.8,1)
+    umbral = max(umbral,0.)
+    # Reserva espacio para el radio completo de las burbujas y su halo.
+    amplitud_y = max(float(y.max())-float(y.min()),40.)
+    margen_y = max(12.,amplitud_y*.18)
+    ymin = min(-30.,float(y.min())-margen_y)
+    ymax = max(30.,float(y.max())+margen_y)
+    fig = go.Figure()
+    # Fondo vectorial local con degradados y esquinas suaves, sin recursos externos.
+    from base64 import b64encode
+    xmin = -xmax*.12
+    corte_x = (umbral-xmin)/(xmax-xmin)*1000
+    corte_y = ymax/(ymax-ymin)*500
+    fondos=[]
+    defs=[]
+    for i,(qx,qy,qw,qh,color) in enumerate([(0,0,corte_x,corte_y,'#FFE600'),(corte_x,0,1000-corte_x,corte_y,'#FF1744'),(0,corte_y,corte_x,500-corte_y,'#00F5A0'),(corte_x,corte_y,1000-corte_x,500-corte_y,'#1685FF')]):
+        defs.append(f'<radialGradient id="q{i}" cx="50%" cy="50%" r="80%"><stop stop-color="{color}" stop-opacity=".34"/><stop offset="1" stop-color="{color}" stop-opacity=".07"/></radialGradient>')
+        fondos.append(f'<rect x="{qx}" y="{qy}" width="{qw}" height="{qh}" fill="url(#q{i})"/>')
+    fondo='<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="500" viewBox="0 0 1000 500"><defs>'+''.join(defs)+'<clipPath id="panel"><rect width="1000" height="500" rx="22"/></clipPath></defs><g clip-path="url(#panel)"><rect width="1000" height="500" fill="#0B1426"/>'+''.join(fondos)+'</g><rect x="1" y="1" width="998" height="498" rx="22" fill="none" stroke="#52628E" stroke-opacity=".5"/></svg>'
+    fig.add_layout_image(source='data:image/svg+xml;base64,'+b64encode(fondo.encode()).decode(),xref='paper',yref='paper',x=0,y=1,sizex=1,sizey=1,sizing='stretch',layer='below')
+    colores = ['#FFE600' if a<umbral and b>0 else '#FF1744' if a>=umbral and b>0 else '#00F5A0' if a<umbral else '#1685FF' for a,b in zip(x,y)]
+    cop = lambda v: '$ '+f'{v:,.0f}'.replace(',','.')+' COP'
+    detalle = []
+    for n,a,b,c in zip(datos['Categoría'],datos['Gasto actual'],datos['Gasto anterior'],y):
+        diferencia = a-b
+        direccion = 'Aumentó' if diferencia>0 else 'Disminuyó' if diferencia<0 else 'Sin cambios'
+        cuadrante = ('Vigilar' if float(a)<umbral else 'Controlar') if c>0 else ('Oportunidad' if float(a)<umbral else 'Estable')
+        resumen = direccion + (' '+cop(abs(diferencia)) if diferencia else '')
+        detalle.append([escape(str(n).title()),cop(a),cop(b),f'{c:+.2f} %'.replace('.',','),resumen,cuadrante])
+    etiqueta_actual, etiqueta_anterior = 'Período analizado', 'Período anterior'
+    if periodos is not None:
+        ma,mb,pa,pb = [pd.Timestamp(v) for v in periodos]
+        etiqueta_actual += f' · {ma:%d/%m/%Y}–{mb:%d/%m/%Y}'
+        etiqueta_anterior += f' · {pa:%d/%m/%Y}–{pb:%d/%m/%Y}'
+    plantilla_tooltip = (
+        '<b>%{customdata[0]}</b><br>'
+        '<span style="color:#B4C9D9">%{customdata[5]}</span><br><br>'
+        '<span style="font-size:11px;color:#94A3B8">'+etiqueta_actual+'</span><br>'
+        '<b>%{customdata[1]}</b><br>'
+        '<span style="font-size:11px;color:#94A3B8">'+etiqueta_anterior+'</span><br>'
+        '%{customdata[2]}<br><br>'
+        '<b>%{customdata[4]}</b><br>'
+        'Variación: <b>%{customdata[3]}</b>'
+        '<extra></extra>'
+    )
+    # Dos halos discretos resaltan las burbujas sin alterar sus posiciones ni proporciones.
+    referencia = 2*max(float(x.max()),1.)/(42**2)
+    for factor,opacidad in [(1.5,.045),(1.2,.12)]:
+        fig.add_trace(go.Scatter(x=x,y=y,mode='markers',hoverinfo='skip',showlegend=False,cliponaxis=True,
+            marker=dict(size=x*factor,sizemode='area',sizeref=referencia,sizemin=8*factor**.5,color=colores,opacity=opacidad,line_width=0)))
+    posiciones=[]
+    puntos=list(zip(x,y))
+    for i,(px,py) in enumerate(puntos):
+        cerca=any(abs(px-ax)/(xmax-xmin)<.12 and abs(py-ay)/(ymax-ymin)<.13 for ax,ay in puntos[:i])
+        posiciones.append('bottom center' if cerca else 'top center')
+    fig.add_trace(go.Scatter(x=x,y=y,mode='markers+text',text=[escape(str(n).title()) for n in datos['Categoría']],textposition=posiciones,textfont=dict(size=13,color='#F8FAFC',family='Segoe UI, Arial, sans-serif'),cliponaxis=True,
+        marker=dict(size=x,sizemode='area',sizeref=referencia,sizemin=8,color=colores,opacity=1.,line=dict(color='rgba(255,255,255,.65)',width=1.2)),
+        customdata=detalle,hovertemplate=plantilla_tooltip,
+        hoverlabel=dict(align='left',bgcolor='#0C192B',bordercolor=colores,font=dict(color='#F8FAFC',size=13,family='Segoe UI, Arial, sans-serif'),namelength=-1)))
+    fig.add_vline(x=umbral,line_dash='dot',line_color='rgba(196,210,243,.5)',line_width=1)
+    fig.add_hline(y=0,line_dash='dot',line_color='rgba(196,210,243,.5)',line_width=1)
+    # Explicaciones en las cuatro esquinas del gráfico.
+    cuadrantes = [
+        ('Vigilar', 'Gasto bajo<br>y aumenta', .02, .98, '#FFE600'),
+        ('Controlar', 'Gasto alto<br>y aumenta', .98, .98, '#FF4566'),
+        ('Oportunidad', 'Gasto bajo<br>y baja o se mantiene', .02, .02, '#00F5A0'),
+        ('Estable', 'Gasto alto<br>y baja o se mantiene', .98, .02, '#339CFF'),
+    ]
+    for nombre,explicacion,xx,yy,color in cuadrantes:
+        fig.add_annotation(x=xx,y=yy,xref='paper',yref='paper',
+            text=f'<b>{nombre}</b><br><span style="font-size:11px;color:#D9E5F2">{explicacion}</span>',
+            showarrow=False,xanchor='left' if xx<.5 else 'right',yanchor='top' if yy>.5 else 'bottom',align='left' if xx<.5 else 'right',
+            font=dict(size=14,color=color),bgcolor='rgba(7,17,31,.72)',bordercolor='rgba(148,163,184,.18)',borderwidth=1,borderpad=7)
+    fig.update_layout(height=550,paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',font=dict(color='#E2E8F0',family='Segoe UI, Arial, sans-serif'),margin=dict(l=75,r=35,t=65,b=65),showlegend=False,
+        title=dict(text='¿Qué gastos crecen<br>y cuáles están bajo control?',font=dict(size=15,color='#B4C9D9'),x=.02),
+        hovermode='closest',hoverdistance=24,
+        hoverlabel=dict(align='left',bgcolor='#0C192B',bordercolor='#284562',font=dict(color='#F8FAFC',size=13)),
+        xaxis=dict(title='Gasto del período comparado (COP)',range=[xmin,xmax],tickvals=np.linspace(0,xmax,5),ticktext=[('$ '+f'{v/1000000:.1f}'.replace('.',',')+' M') if v>=1000000 else ('$ '+f'{v:,.0f}'.replace(',','.')) for v in np.linspace(0,xmax,5)],showgrid=False,showline=False,ticks='',zeroline=False,tickfont=dict(color='#B4C9D9',size=11)),
+        yaxis=dict(title='Variación frente al período anterior (%)',range=[ymin,ymax],ticksuffix='%',showgrid=False,showline=False,ticks='',zeroline=False,tickfont=dict(color='#B4C9D9',size=11)))
+    return fig,umbral
+
+
+def preparar_escudos_estado(montos, ingresos, objetivos=None):
+    """Misma regla 50/30/20 del resumen; saldo no utilizado no es ahorro."""
+    from decimal import Decimal, InvalidOperation
+    def numero(v):
+        try:
+            d=Decimal(str(v))
+            return d if d.is_finite() else None
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+    metas = {'Necesidades':50,'Gustos':30,'Ahorro':20} if objetivos is None else objetivos
+    metas = {grupo:numero(metas.get(grupo)) for grupo in ['Necesidades','Gustos','Ahorro']}
+    if any(v is None or v<0 or v>100 for v in metas.values()) or sum(metas.values())!=100:
+        raise ValueError('Las metas deben estar entre 0 y 100 y sumar 100 %.')
+    base=numero(ingresos)
+    registros=[]
+    for grupo,objetivo in metas.items():
+        monto=numero(montos.get(grupo,0))
+        valido=base is not None and base>0 and monto is not None and monto>=0
+        porcentaje=monto/base*100 if valido else None
+        diferencia=porcentaje-Decimal(objetivo) if valido else None
+        if not valido:
+            estado,color='SIN BASE' if base is None or base<=0 else 'REVISAR','#94A3B8'
+        elif abs(diferencia)<=Decimal('0.000000001'):
+            estado,color=('META' if grupo=='Ahorro' else 'DENTRO'),'#00F5A0'
+        elif grupo=='Ahorro':
+            estado,color=('SUPERADA','#00F5A0') if diferencia>0 else ('PENDIENTE','#FFE600')
+        else:
+            estado,color=('EXCEDIDO','#FF1744') if diferencia>0 else ('DENTRO','#00F5A0')
+        registros.append(dict(grupo=grupo,monto=monto,porcentaje=porcentaje,diferencia=diferencia,objetivo=objetivo,estado=estado,color=color,referencia=base*Decimal(objetivo)/100 if base is not None and base>0 else None))
+    return registros
+
+
+def crear_escudos_estado_html(registros, periodos=None):
+    from html import escape
+    def cop(v):
+        return '$ '+f'{v:,.0f}'.replace(',','.')+' COP' if v is not None else 'Sin dato válido'
+    iconos={
+        'Necesidades':'<path d="M3 11 12 3l9 8M6 10v11h5v-6h3v6h5V10"/>',
+        'Gustos':'<path d="M2 3h3l3 13h11l3-10H6M9 10h11M10 20h.1M18 20h.1"/>',
+        'Ahorro':'<path d="M5 8 3 6v6c-2 2-1 6 2 7v3h3v-2h8v2h3v-4c4-3 4-8 0-11l-1-4-5 3H9C3 5 3 9 5 8ZM9 8h5M18 11h.1M3 12H1"/>',
+    }
+    partes=[]
+    for i,r in enumerate(registros):
+        x=12+i*196;c=('#55FF0A' if r['estado'] in ['DENTRO','META','SUPERADA'] else '#FF3131' if r['estado']=='EXCEDIDO' else '#FFE600' if r['estado']=='PENDIENTE' else '#94A3B8');g=escape(r['grupo'])
+        pct=f"{r['porcentaje']:.1f}".replace('.',',')+' %' if r['porcentaje'] is not None else '—'
+        delta=f"{r['diferencia']:+.1f}".replace('.',',')+' pp' if r['diferencia'] is not None else 'Sin porcentaje'
+        referencia=('≥' if r['grupo']=='Ahorro' else '≤')+' '+str(r['objetivo'])+' %'
+        titulo=escape(f"{r['grupo']}: {cop(r['monto'])}. Parte de los ingresos: {pct}. Referencia {referencia}: {cop(r['referencia'])}. Estado: {r['estado']}. Diferencia: {delta}.")
+        simbolo='<path d="m79 250 8 8 16-19"/>' if r['estado'] in ['DENTRO','META','SUPERADA'] else '<path d="m82 240 16 16m0-16-16 16"/>' if r['estado']=='EXCEDIDO' else '<path d="M90 237v15m0 6v1"/>'
+        partes.append(f'''<g transform="translate({x} 0)" tabindex="0" role="img" aria-label="{titulo}"><title>{titulo}</title>
+        <defs><radialGradient id="escudo{i}" cx="35%" cy="15%" r="95%"><stop stop-color="{c}" stop-opacity=".62"/><stop offset="1" stop-color="{c}" stop-opacity=".06"/></radialGradient><linearGradient id="badge{i}" x2="0" y2="1"><stop stop-color="{c}" stop-opacity=".48"/><stop offset="1" stop-color="{c}" stop-opacity=".12"/></linearGradient><filter id="glow{i}" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="3"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+        <text x="90" y="35" fill="#F8FAFC" font-size="19" font-weight="700">{g}</text>
+        <path d="M90 54 174 88v77c0 45-30 75-84 102C36 240 6 210 6 165V88Z" fill="none" stroke="{c}" stroke-opacity=".2" stroke-width="11"/>
+        <path d="M90 54 174 88v77c0 45-30 75-84 102C36 240 6 210 6 165V88Z" fill="url(#escudo{i})" stroke="{c}" stroke-width="3.5" filter="url(#glow{i})"/>
+        <svg x="70" y="87" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{iconos[r['grupo']]}</svg>
+        <text x="90" y="166" fill="#FFFFFF" font-size="32" font-weight="800">{pct}</text>
+        <text x="90" y="195" fill="#B4C9D9" font-size="18">{referencia}</text>
+        <circle cx="90" cy="249" r="23" fill="{c}" stroke="#F8FAFC" stroke-opacity=".65" stroke-width="2" filter="url(#glow{i})"/>
+        <g fill="none" stroke="#07111F" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">{simbolo}</g>
+        <rect x="3" y="289" width="174" height="70" rx="13" fill="url(#badge{i})" stroke="{c}" stroke-width="2"/>
+        <text x="90" y="318" fill="#FFFFFF" font-size="16" font-weight="800">{r['estado']}</text>
+        <text x="90" y="341" fill="#E2E8F0" font-size="15">{delta}</text>
+        <text x="90" y="394" fill="#F8FAFC" font-size="15" font-weight="600">{escape(cop(r['monto']))}</text>
+        </g>''')
+    fechas_html=''
+    if periodos is not None:
+        desde,hasta=[pd.Timestamp(v) for v in periodos]
+        fechas_html=f'<div class="escudos-fechas"><span>{desde:%d/%m/%Y}</span><span class="flecha">→</span><span>{hasta:%d/%m/%Y}</span></div>'
+    return '''<!doctype html><html lang="es"><head><meta charset="utf-8"><style>
+    *{box-sizing:border-box}html,body{margin:0;width:100%;max-width:100%;background:transparent;font-family:'Segoe UI',Arial,sans-serif}
+    .escudos-card{height:550px;width:100%;min-width:0;padding:0;border:0;background:transparent;display:flex;flex-direction:column;gap:12px;overflow:hidden}
+    .escudos-header{display:flex;align-items:center;gap:10px;min-width:0;color:#F8FAFC;font-size:clamp(16px,4.2vw,22px);font-weight:700;line-height:1.3}
+    .escudos-emblema{display:grid;place-items:center;flex:0 0 33px;height:33px;border:1px solid #B884FF;border-radius:11px;background:linear-gradient(145deg,#AC39F0,#4931A6);box-shadow:0 0 12px #A855F733}
+    .escudos-header span:last-child{min-width:0;overflow-wrap:anywhere}
+    .escudos-fechas{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:5px 10px;width:100%;min-width:0;max-width:100%;padding:9px 7px;border:1px solid #284562;border-radius:11px;background:#111F33;color:#D7E6FA;font-size:12px;line-height:1.4;font-variant-numeric:tabular-nums}
+    .escudos-fechas span{max-width:100%;overflow-wrap:anywhere}.flecha{color:#38BDF8}
+    .escudos{flex:1;min-height:0;min-width:0;display:flex;align-items:flex-end;justify-content:center;width:100%}
+    .escudos>svg{width:100%;max-width:100%;max-height:100%;height:auto;display:block}
+    g[tabindex]:focus{outline:none}g[tabindex]:hover>path,g[tabindex]:focus>path{filter:brightness(1.15)}
+    </style></head><body><div class="escudos-card"><div class="escudos-header"><span class="escudos-emblema">🛡</span><span>Escudo de estado</span></div>'''+fechas_html+'''<div class="escudos"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 425" font-family="Segoe UI,Arial,sans-serif" text-anchor="middle" role="group" aria-label="Escudos de estado de la regla 50 30 20">'''+''.join(partes)+'''</svg></div></div></body></html>'''
+
+
+def preparar_contexto_resumen_pdf(gastos_filtrados, ingresos_filtrados, gastos_historial, desde, hasta, ingresos_total, estado):
+    """Instantánea local del Resumen; reutiliza sus mismos motores de cálculo."""
+    datos={'desde':pd.Timestamp(desde),'hasta':pd.Timestamp(hasta)}
+    diario,eventos=construir_flujo_caja_diario(gastos_filtrados,ingresos_filtrados,desde,hasta)
+    datos.update(diario=diario,eventos=eventos)
+    try:
+        _,_,tabla=crear_mapa_gastos_voronoi(gastos_filtrados,desde,hasta)
+        datos['mapa_tabla']=tabla
+        if tabla is not None:
+            from decimal import Decimal
+            positivos=tabla.loc[tabla['Gasto neto'].gt(0)].copy()
+            items=list(positivos[['Categoría','Gasto neto']].itertuples(index=False,name=None))
+            if len(items)>9:
+                items=items[:8]+[('Otras categorías',sum((v for _,v in items[8:]),Decimal(0)))]
+            total_positivo=sum((v for _,v in items),Decimal(0))
+            if total_positivo>0:
+                datos['mapa_items']=items
+                datos['mapa_poligonos']=calcular_mapa_voronoi_proporcional(tuple(float(v/total_positivo) for _,v in items))
+    except ValueError as error:
+        datos['mapa_error']=str(error)
+    modo=estado.get('momentum_reglas_periodos_radio_v22','Último mes completo')
+    try:
+        ma,mb,pa,pb,nota=resolver_periodos_momentum(gastos_historial,desde,hasta,modo)
+        tabla,_,_,historial=preparar_momentum_gastos(gastos_historial,ma,mb,rango_anterior=(pa,pb))
+        if not historial:
+            ma,mb,pa,pb,nota=dividir_periodo_momentum(gastos_historial,desde,hasta)
+            tabla,_,_,_=preparar_momentum_gastos(gastos_historial,ma,mb,rango_anterior=(pa,pb))
+        datos.update(momentum_tabla=tabla,momentum_fechas=(ma,mb,pa,pb),momentum_nota=nota,momentum_modo=modo)
+    except ValueError as error:
+        datos['momentum_error']=str(error)
+    base=gastos_filtrados.copy()
+    claves=['GASTOS_CATEGORIA','GASTOS_SUBCATEGORIA']
+    base[claves]=base[claves].fillna('Sin clasificar').astype(str)
+    grupos=base.groupby(claves,as_index=False)['GASTOS_CANTIDAD'].sum()
+    grupos['Grupo']=[clasificar_regla(c,s) for c,s in grupos[claves].itertuples(index=False,name=None)]
+    for indice,cambio in estado.get('resumen_clasificacion_503020_v19',{}).get('edited_rows',{}).items():
+        if int(indice) in grupos.index and cambio.get('Grupo') in ['Necesidades','Gustos','Ahorro']:
+            grupos.loc[int(indice),'Grupo']=cambio['Grupo']
+    montos=grupos.groupby('Grupo')['GASTOS_CANTIDAD'].sum()
+    datos['escudos']=preparar_escudos_estado(montos,ingresos_total,objetivos=estado.get('metas_escudo_v22'))
+    return datos
+
+
+AYUDA_TARJETAS = {
+    "Disponible": "Presupuesto del período menos gasto ejecutado. Verde indica saldo disponible o cero; rojo indica que el gasto superó el presupuesto.",
+    "Ingresos": "Suma de los ingresos registrados que cumplen los filtros seleccionados.",
+    "Gastos": "Suma de los gastos registrados que cumplen los filtros seleccionados.",
+    "Balance": "Ingresos menos gastos del período. Verde indica saldo positivo o cero; rojo indica que los gastos superan los ingresos.",
+    "Transacciones": "Cantidad de movimientos de gastos incluidos en el período y los filtros seleccionados.",
+    "Ahorro mensual": "Promedio de los balances mensuales del período: ingresos menos gastos por mes. Un valor negativo indica déficit promedio.",
+    "Ahorro anual": "Estimación del ahorro mensual promedio multiplicado por 12. Es una proyección, no dinero ya ahorrado.",
+    "Recomendado para invertir": "Referencia calculada como el 20% del ingreso promedio de los meses con ingresos. No representa una inversión realizada.",
+    "Recomendado para ahorrar": "Referencia calculada como el 10% del ingreso promedio de los meses con ingresos. No representa un ahorro realizado.",
+    "Capacidad de ahorro": "Balance del período dividido entre ingresos, expresado como porcentaje. La app muestra 0% cuando no hay ingresos para calcularlo.",
+    "Deudas / ingresos": "Porcentaje de ingresos destinado a gastos identificados por palabras como deuda, crédito, préstamo, cuota o tarjeta. La clasificación depende del texto registrado.",
+    "Capacidad endeudamiento": "Margen de referencia: 30% de los ingresos menos los pagos de deuda detectados, con mínimo cero. Se expresa como porcentaje de ingresos; no equivale a un crédito aprobado.",
+    "Variación mensual": "Cambio porcentual entre los dos últimos meses con gastos registrados del período. Positivo significa que el gasto aumentó; negativo, que disminuyó.",
+    "Persona": "Nombre de la persona registrado en la información personal del Excel.",
+    "Edad": "Edad mostrada por la aplicación a partir de la información personal disponible.",
+}
+
+
+def tarjeta_estilo_gac(destino, titulo, valor, subtitulo="", color="#39d7ff", icono="", tono_comparacion=None):
+    """Tarjeta reutilizable con el estilo visual de GAC."""
+    if titulo in ("Ingresos", "Promedio ingresos/mes", "Ingreso actual vs promedio"):
+        color = "#52e0a4"
+    elif titulo in ("Gastos", "Promedio gastos/mes", "Gasto actual vs promedio"):
+        color = "#ff526e"
+    seguro = html.escape
+    clase_color = {
+        "Ingresos": " gac-card-ingresos",
+        "Promedio ingresos/mes": " gac-card-ingresos",
+        "Ingreso actual vs promedio": " gac-card-ingresos",
+        "Gastos": " gac-card-gastos",
+        "Promedio gastos/mes": " gac-card-gastos",
+        "Gasto actual vs promedio": " gac-card-gastos",
+        "Balance": " gac-card-balance",
+        "Balance actual vs promedio": " gac-card-balance-promedio",
+    }.get(titulo, "")
+    if titulo == "Disponible":
+        clase_color = " gac-card-gastos" if color == "#ff526e" else " gac-card-ingresos"
+        clase_color += " gac-card-disponible"
+    if titulo in ("Ingreso actual vs promedio", "Gasto actual vs promedio", "Balance actual vs promedio"):
+        clase_color += " gac-card-comparacion"
+        if tono_comparacion in ("negativo", "positivo", "neutro"):
+            clase_color += f" gac-comparacion-{tono_comparacion}"
+    icono = icono or {"Ingresos": "💰", "Gastos": "💸", "Balance": "⚖️", "Transacciones": "🧾"}.get(str(titulo), "📊")
+    explicacion = AYUDA_TARJETAS.get(str(titulo), str(subtitulo) or str(titulo))
+    destino.markdown(
+        f'<div class="gac-card{clase_color}" style="--card-color:{seguro(color)};">'
+        f'<div class="gac-card-icon" aria-hidden="true">{seguro(icono)}</div>'
+        f'<div class="gac-card-label">{seguro(str(titulo))}' 
+        f'<span class="gac-help" tabindex="0" role="note" aria-label="{seguro(explicacion)}">'
+        f'ⓘ<span class="gac-tooltip" role="tooltip">{seguro(explicacion)}</span></span></div>' 
+        f'<div class="gac-card-value">{seguro(str(valor))}</div>'
+        f'<div class="gac-card-caption">{seguro(str(subtitulo))}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def tarjeta_perfil_patrimonio(destino, label, value, delta=None, delta_color="normal", help=None, **kwargs):
+    """Presentación de Patrimonio compartida con la tarjeta Transacciones."""
+    explicaciones = {
+        "Valor inmuebles": "Valor de los inmuebles reconocidos en el análisis. Permite ver cuánto patrimonio está invertido en bienes raíces.",
+        "Total pasivos": "Suma de las obligaciones pendientes incluidas en el análisis patrimonial. Es deuda por pagar, no gasto del mes.",
+        "Patrimonio neto": "Total de activos menos total de pasivos. Indica el valor que queda después de descontar las deudas; no equivale a dinero disponible en efectivo.",
+        "Endeudamiento": "Deudas divididas entre activos, multiplicado por 100. Indica qué porcentaje del valor de los activos corresponde a obligaciones pendientes.",
+        "Patrimonio financiero": "Valor neto de los activos identificados como cuentas, ahorros, fondos, inversiones u otros productos financieros. Excluye inmuebles y otros bienes físicos.",
+        "Activos líquidos": "Activos clasificados como corrientes o con liquidez alta o media, según el Excel. Su valor no significa que todo esté disponible para retirar inmediatamente.",
+        "Solvencia": "Total de activos dividido entre total de pasivos. Por ejemplo, 2 veces significa $2 en activos por cada $1 de deuda. No mide la disponibilidad inmediata de efectivo.",
+        "Concentración inmuebles": "Porcentaje del total de activos representado por inmuebles. Muestra cuánto depende el patrimonio del valor de bienes raíces.",
+        "LTV inmobiliario": "Saldo hipotecario dividido entre el valor de los inmuebles ajustado por propiedad. Por ejemplo, 40% equivale a $40 de hipoteca por cada $100 de valor inmobiliario.",
+        "Pasivos / activos": "Porcentaje de activos que corresponde a deuda: total de pasivos dividido entre total de activos, por 100.",
+        "Patrimonio libre": "Patrimonio neto como porcentaje de los activos. Muestra la proporción que queda al descontar las deudas; no equivale a efectivo libre para gastar.",
+        "Activos por cada $100 de pasivos": "Relación entre activos y deuda expresada en pesos por cada $100 adeudados. Un valor de $200 indica dos pesos de activos por cada peso de deuda.",
+        "TRM oficial · 1 USD": "Tasa consultada para convertir dólares estadounidenses a pesos colombianos. Revisa la fecha mostrada junto a la tasa.",
+        "Patrimonio acumulado": "Patrimonio mostrado al cierre del historial analizado y su variación indicada debajo. Es valor patrimonial, no suma de ingresos.",
+        "Meses creciendo": "Cantidad de meses en los que el patrimonio aumentó respecto al mes anterior del historial disponible.",
+        "Meses estables": "Cantidad de meses sin variación patrimonial en la comparación mensual utilizada por el gráfico.",
+        "Meses bajando": "Cantidad de meses en los que el patrimonio disminuyó respecto al mes anterior del historial disponible.",
+        "Impulsos positivos": "Suma de las variaciones positivas identificadas en la explicación del cambio patrimonial.",
+        "Reducciones": "Suma de las variaciones negativas identificadas en la explicación del cambio patrimonial.",
+        "Resultado neto explicado": "Impulsos positivos menos reducciones identificadas. Resume el cambio que explican los componentes del análisis.",
+    }
+    ayuda = help or next((texto for nombre, texto in explicaciones.items() if str(label).endswith(nombre)), f"{label}: valor calculado con los datos del análisis patrimonial.")
+    comparacion = (
+        f'<div class="gac-card-caption" style="margin-top:.6rem">{html.escape(str(delta))}</div>'
+        if delta is not None else ""
+    )
+    etiqueta_visual = html.escape(str(label))
+    if kwargs.get("icono_resumen"):
+        etiqueta_visual = (
+            f'<span class="icono-tarjeta-resumen" aria-hidden="true">{html.escape(kwargs["icono_resumen"])}</span>'
+            f'{html.escape(kwargs.get("titulo_resumen", str(label)))}'
+        )
+    destino.markdown(
+        f'<div class="perfil-persona {html.escape(kwargs.get("clase_panel", ""))}">'
+        f'<div class="perfil-etiqueta">{etiqueta_visual} '
+        f'<span class="gac-help" tabindex="0" role="note" aria-label="{html.escape(ayuda)}">'
+        f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(ayuda)}</span></span></div>'
+        f'<div class="perfil-nombre {html.escape(kwargs.get("clase_valor", ""))}">{html.escape(str(value))}</div>'
+        f'{comparacion}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def tarjeta_perfil_felicidad(destino, label, value, delta=None, delta_color="normal", help=None, **kwargs):
+    """Conserva los datos y comparte el acabado visual de Patrimonio."""
+    explicaciones = {
+        "Fondo actual": "Valor del fondo de emergencia reconocido por el cálculo del panel.",
+        "Meta 3 meses": "Objetivo del fondo: tres veces el gasto mensual promedio del análisis.",
+        "Cumplimiento": "Fondo actual dividido entre la meta del fondo, expresado como porcentaje.",
+        "Días cubiertos": "Fondo actual dividido entre el gasto diario estimado; se usa un mes de 30 días.",
+        "Faltante": "Dinero que falta para alcanzar el objetivo de esta sección, con mínimo cero.",
+        "Valor actual": "Monto registrado como avance de esta meta financiera.",
+        "Valor objetivo": "Importe que se quiere alcanzar según la hoja Metas.",
+        "Porcentaje de cumplimiento": "Avance de la meta comparado con su objetivo. La barra visual se limita al 100%.",
+        "Ingresos registrados": "Suma de los importes del bloque de trabajos que cumplen los filtros de fechas.",
+        "Horas trabajadas": "Suma de las horas válidas registradas en los trabajos filtrados.",
+        "Valor promedio por hora": "Ingresos registrados divididos entre horas trabajadas; sin horas se usa la referencia disponible de valor por hora.",
+        "Empresas activas": "Número de empresas diferentes identificadas en los registros del período.",
+        "Fuente principal": "Empresa con mayor ingreso registrado en el período.",
+        "Concentración principal": "Porcentaje del ingreso que aporta la empresa principal.",
+        "Mayor concentración de tiempo": "Empresa que concentra la mayor proporción de horas registradas.",
+        "Ingreso simulado": "Resultado del escenario seleccionado; no modifica los ingresos originales.",
+        "Horas liberadas": "Diferencia de horas obtenida en el escenario de simulación.",
+        "Tarifa para conservar ingreso": "Ingreso que se busca conservar dividido entre las horas del escenario simulado.",
+    }
+    descripcion = help or next((v for k,v in explicaciones.items() if str(label).endswith(k)),
+                                f"{label}: indicador del análisis de bienestar financiero con los filtros seleccionados.")
+    if str(label).endswith("Días cubiertos"):
+        kwargs["clase_valor"] = "dias-cubiertos-parpadeo"
+    tarjeta_perfil_patrimonio(destino, label, value, delta, delta_color, help=descripcion, **kwargs)
+
+
+def tarjeta_perfil_gastos(destino, label, value, delta=None, delta_color="normal", help=None, **kwargs):
+    icono, _, titulo = str(label).partition(" ")
+    explicaciones = {
+        "Gasto total": "Suma de los gastos incluidos en el período y los filtros seleccionados.",
+        "Transacciones": "Cantidad de movimientos de gasto incluidos en esta sección.",
+        "Categoría principal": "Categoría que concentra el mayor importe de gasto filtrado.",
+        "Subcategoría principal": "Subcategoría que concentra el mayor importe de gasto filtrado.",
+        "Gasto fijo": "Porcentaje del gasto total clasificado como fijo.",
+        "Gasto variable": "Porcentaje del gasto total clasificado como variable.",
+        "Top 3 categorías": "Porcentaje del gasto que reúnen las tres categorías de mayor importe. Debajo aparece su suma en pesos.",
+        "Top 10 movimientos": "Porcentaje del gasto que reúnen los diez movimientos de mayor importe, o todos si hay menos de diez.",
+        "Gasto habitual": "Gasto total menos los gastos clasificados como extraordinarios.",
+        "Extraordinario": "Participación de los gastos clasificados como extraordinarios en el total filtrado.",
+        "Descripciones recurrentes": "Cantidad de descripciones que se repiten según el análisis de recurrencia.",
+        "Monto recurrente": "Suma de los gastos identificados como recurrentes en esta sección.",
+        "Movimientos pequeños": "Cantidad de operaciones identificadas como gastos pequeños por el criterio de esta sección.",
+        "Acumulado pequeño": "Importe total de las operaciones identificadas como gastos pequeños.",
+        "Sin categoría": "Cantidad de registros sin categoría informada.",
+        "Sin subcategoría": "Cantidad de registros sin subcategoría informada.",
+        "Sin descripción": "Cantidad de registros sin descripción informada.",
+        "Posibles duplicados": "Registros señalados por la revisión de duplicados. Comprueba si representan operaciones distintas antes de cambiarlos.",
+        "Fijos": "Suma de gastos clasificados como fijos; debajo se muestra su participación.",
+        "Variables": "Suma de gastos clasificados como variables; debajo se muestra su participación.",
+        "Extraordinarios": "Suma de gastos clasificados como extraordinarios; debajo se muestra su participación.",
+        "Prescindibles": "Suma de gastos clasificados como prescindibles en este análisis.",
+        "Total clasificado": "Importe de los gastos incluidos en la clasificación por tipo.",
+    }
+    tarjeta_perfil_patrimonio(
+        destino, label, value, delta, delta_color,
+        help=help or explicaciones.get(titulo, "Indicador de gastos según los filtros seleccionados."),
+        icono_resumen=icono, titulo_resumen=titulo, **kwargs,
+    )
+
+
+def medidor_indice_financiero(titulo, valor, estado, limites, *, score_crediticio=False, dependencia=False, detalle_resultado=None, radio_interior=.7):
+    """Medidor con los límites acordados y sin ocultar porcentajes mayores a 100."""
+    if valor is None or pd.isna(valor) or (valor < 0 and not dependencia):
+        fig = go.Figure()
+        fig.add_annotation(text=f"<b>{html.escape(titulo)}</b><br>No calculable con los datos actuales", x=.5, y=.5, showarrow=False, font=dict(size=16, color="#dcecf5"))
+        fig.update_layout(height=310, paper_bgcolor="#0b1728", plot_bgcolor="#0b1728", xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return fig
+    minimo = 150 if score_crediticio else 0
+    maximo = 950 if score_crediticio else max(100, (int(valor // 10) + 1) * 10)
+    unidad = " puntos" if score_crediticio else "%"
+    lectura = f"{valor:.0f}{unidad}" if score_crediticio else f"{valor:.1f}%"
+    escala = maximo - minimo
+    colores = ["#68F52B", "#FFD52E", "#FF8B24", "#FF152E"]
+    cortes = [minimo] + list(limites) + [maximo]
+    import math
+    nombres = (["Muy bien", "Adecuado", "Crítico", "Sobreendeudado"]
+               if list(limites) == [10, 30, 40] else
+               ["Nivel bueno", "Manejable", "Crítico", "Sobreendeudado"])
+    fig = go.Figure()
+    es_flujo = list(limites) == [10, 30, 40]
+    explicaciones_niveles = (
+        [
+            "Los pagos de CRÉDITOS consumen hasta $10<br>por cada $100 de ingreso mensual promedio.",
+            "Los pagos de CRÉDITOS consumen más de $10<br>y hasta $30 por cada $100 de ingreso mensual promedio.",
+            "Los pagos de CRÉDITOS consumen más de $30<br>y hasta $40 por cada $100 de ingreso mensual promedio.",
+            "Los pagos de CRÉDITOS consumen más de $40<br>por cada $100 de ingreso mensual promedio.",
+        ] if es_flujo else [
+            "Las deudas representan hasta $15<br>por cada $100 del valor total de tus activos.",
+            "Las deudas representan más de $15 y hasta $40<br>por cada $100 del valor total de tus activos.",
+            "Las deudas representan más de $40 y hasta $60<br>por cada $100 del valor total de tus activos.",
+            "Las deudas representan más de $60<br>por cada $100 del valor total de tus activos.",
+        ]
+    )
+    if score_crediticio:
+        colores = ["#FF152E", "#FFD52E", "#68F52B"]
+        nombres = ["Bajo", "Regular", "Bueno"]
+        explicaciones_niveles = [
+            "Tu puntaje está en la parte baja de la escala.<br>En general, un puntaje más bajo indica un mayor riesgo crediticio estimado.",
+            "Tu puntaje está en la parte intermedia de la escala.<br>La entidad puede evaluar también tus ingresos, deudas e historial.",
+            "Tu puntaje está en la parte alta de la escala.<br>En general, un puntaje más alto indica un menor riesgo crediticio estimado.",
+        ]
+    elif dependencia:
+        from plotly.colors import sample_colorscale
+
+        segmentos = 48
+        colores = sample_colorscale(
+            ["#68F52B", "#FFD52E", "#FF8B24", "#FF152E"], segmentos,
+        )
+        nombres = ["Dependencia de otros recursos"] * segmentos
+        explicaciones_niveles = [
+            "Mide la parte de los gastos que queda por cubrir<br>después de los ingresos residuales."
+        ] * segmentos
+    cortes_arco = [minimo + escala * i / segmentos for i in range(segmentos + 1)] if dependencia else cortes
+    for i, (color, categoria) in enumerate(zip(colores, nombres)):
+        desde, hasta = cortes_arco[i], cortes_arco[i+1]
+        angulos = [math.pi * (1 - (desde - minimo + (hasta-desde)*j/60) / escala) for j in range(61)]
+        xs = [math.cos(t) for t in angulos] + [radio_interior*math.cos(t) for t in reversed(angulos)]
+        ys = [math.sin(t) for t in angulos] + [radio_interior*math.sin(t) for t in reversed(angulos)]
+        rango = f"Más de {desde:g}% hasta {hasta:g}%" if i < 3 else f"Más de {desde:g}%"
+        if score_crediticio:
+            rango = f"Desde {desde:g} hasta menos de {hasta:g} puntos" if i < len(nombres) - 1 else f"De {desde:g} a {hasta:g} puntos"
+        elif dependencia:
+            rango = f"Escala visual de 0% a {maximo:g}%"
+        acento_tooltip = colores[i]
+        detalle = (
+            f"<span style='font-size:18px;color:{acento_tooltip}'><b>{categoria}</b></span><br><br>"
+            f"<b>📏 Rango del indicador</b><br>{rango}"
+            f"<br><br><b>💡 Qué significa</b><br>{explicaciones_niveles[i]}"
+        )
+        if i == 0 and not score_crediticio and not dependencia:
+            detalle += "<br><br><b>En 0%</b><br>" + ("Ideal" if list(limites) == [10, 30, 40] else "Todo lo que tienes es tuyo")
+        detalle += (
+            "<br><br><span style='font-size:12px;color:#b4c9d9'>Clasificación según tus rangos.<br>"
+            + ("Un valor negativo indica que tus residuales superan tus gastos." if dependencia else
+               "Colores orientativos de Altium en la escala de Mi DataCrédito." if score_crediticio else
+               "Suma los movimientos de la categoría CRÉDITOS." if es_flujo else "Compara deudas y activos; no mide la cuota mensual.")
+            + "</span>"
+        )
+        if detalle_resultado:
+            detalle += f"<br><br><b>📍 Tu resultado</b> · {lectura} · {html.escape(estado)}"
+        fig.add_trace(go.Scatter(
+            x=xs+[xs[0]], y=ys+[ys[0]], mode="lines", fill="toself",
+            fillcolor=color, line=dict(color=color if dependencia else "#07111f", width=0.5 if dependencia else 3),
+            text=[detalle]*(len(xs)+1), hoveron="fills", hoverinfo="text",
+            hoverlabel=dict(bgcolor="#10263c", bordercolor=acento_tooltip,
+                            font=dict(family="Arial, sans-serif", size=14, color="#eef7ff"), align="left"),
+            name=categoria, showlegend=False,
+        ))
+    posicion = min(max(float(valor), minimo), maximo)
+    angulo_actual = math.pi * (1 - (posicion - minimo) / escala)
+    fig.add_trace(go.Scatter(
+        x=[0, .88 * math.cos(angulo_actual)], y=[0, .88 * math.sin(angulo_actual)],
+        mode="lines+markers", line=dict(width=2, color="#E7F7FF"),
+        marker=dict(size=[9, 0], color="#F5FBFF"),
+        hovertemplate=(
+            f"<span style='font-size:12px;color:#b4c9d9'>📍 TU RESULTADO ACTUAL</span><br><br>"
+            f"<span style='font-size:22px;color:#68e5ff'><b>{lectura}</b></span><br>"
+            f"<b>{html.escape(estado)}</b><br><br>"
+            + (detalle_resultado or (
+                "Puntaje registrado en Personales.<br>Escala de Mi DataCrédito de 150 a 950 puntos."
+                if score_crediticio else
+                "Egresos menos ingresos residuales,<br>dividido entre los egresos del período."
+                if dependencia else
+                f"De cada $100 de ingreso mensual promedio,<br><b>${valor:.1f}</b> corresponden a pagos de la categoría CRÉDITOS."
+                if es_flujo else
+                f"Por cada $100 del valor de tus activos,<br>tienes <b>${valor:.1f}</b> en deudas."
+            ))
+            + "<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+    for corte in cortes:
+        angulo=math.pi*(1-(corte-minimo)/escala)
+        fig.add_annotation(x=1.12*math.cos(angulo),y=1.12*math.sin(angulo),
+                           text=f"{corte:g}" if score_crediticio else f"{corte:g}%",showarrow=False,font=dict(size=12,color="#c9ddeb"))
+    fig.add_annotation(x=0,y=.26,text=f"<b>{lectura}</b>",showarrow=False,font=dict(size=32,color="#eef7ff"))
+    fig.add_annotation(x=0,y=.10,text=html.escape(estado),showarrow=False,font=dict(size=14,color="#c9ddeb"))
+    fig.update_layout(
+        title=dict(text=html.escape(titulo),x=.5,xanchor="center",font=dict(size=17,color="#dcecf5")),
+        height=330, margin=dict(t=60,b=25,l=35,r=35), paper_bgcolor="#0b1728",plot_bgcolor="#0b1728",
+        xaxis=dict(range=[-1.3,1.3],visible=False,fixedrange=True),
+        yaxis=dict(range=[-.18,1.3],visible=False,fixedrange=True,scaleanchor="x",scaleratio=1),
+        hovermode="closest",dragmode=False,
+        hoverlabel=dict(bgcolor="#10263c",bordercolor="#39d7ff",align="left",font=dict(size=14,color="#eef7ff")),
+    )
+    return fig
+
+
+def medidor_idr_con_tooltips(ratio, idr, patrimonio, estado):
+    import math
+    fig = go.Figure()
+    if idr <= 0:
+        fig.add_annotation(x=.5,y=.5,text="No calculable: falta un IDR positivo",showarrow=False,font=dict(color="#eef7ff",size=16))
+        fig.update_layout(height=330,paper_bgcolor="#0b1728",plot_bgcolor="#0b1728",xaxis=dict(visible=False),yaxis=dict(visible=False))
+        return fig
+    bandas = [
+        (0,1,"Destructor de patrimonio","#FF1744","Menos de 1 vez el IDR.<br>Tu patrimonio neto está por debajo de la referencia IDR."),
+        (1,2,"Constructor de patrimonio","#FFEA00","Desde 1 hasta menos de 2 veces el IDR.<br>Tu patrimonio alcanza la referencia, pero aún no la duplica."),
+        (2,3,"Excelente constructor de patrimonio","#39FF14","Desde 2 veces el IDR.<br>Tu patrimonio duplica o supera la referencia IDR."),
+    ]
+    for desde,hasta,nombre,color,explicacion in bandas:
+        angulos=[math.pi*(1-(desde+(hasta-desde)*i/60)/3) for i in range(61)]
+        x=[math.cos(t) for t in angulos]+[.7*math.cos(t) for t in reversed(angulos)]
+        y=[math.sin(t) for t in angulos]+[.7*math.sin(t) for t in reversed(angulos)]
+        texto = html.escape(nombre)
+        fig.add_trace(go.Scatter(x=x+[x[0]],y=y+[y[0]],mode="lines",fill="toself",fillcolor=color,line=dict(color="#0b1728",width=3),text=[texto]*(len(x)+1),hoveron="fills",hoverinfo="text",showlegend=False,hoverlabel=dict(bordercolor=color)))
+        # Puntos de interacción sobre toda la franja: aseguran un tooltip
+        # consistente incluso en versiones que no detectan bien los rellenos.
+        puntos_hover = [(radio*math.cos(t), radio*math.sin(t))
+                        for radio in [.72,.78,.84,.90,.97] for t in angulos]
+        fig.add_trace(go.Scatter(
+            x=[p[0] for p in puntos_hover], y=[p[1] for p in puntos_hover],
+            mode="markers", marker=dict(size=16, color="rgba(0,0,0,0.001)"),
+            text=[texto]*len(puntos_hover), hovertemplate="%{text}<extra></extra>",
+            showlegend=False, hoverlabel=dict(bordercolor=color),
+        ))
+    nivel=min(max(ratio,0),3); angulo=math.pi*(1-nivel/3)
+    explicacion_actual_idr = (
+        "Tu patrimonio neto es menor que la referencia IDR.<br>La relación está por debajo de 1."
+        if ratio < 1 else
+        "Tu patrimonio neto alcanza o supera la referencia IDR,<br>pero todavía no la duplica: desde 1 hasta menos de 2."
+        if ratio < 2 else
+        "Tu patrimonio neto duplica o supera la referencia IDR.<br>La relación es de 2 o más."
+    )
+    fig.add_trace(go.Scatter(
+        x=[0,.96*math.cos(angulo)],y=[0,.96*math.sin(angulo)],mode="lines+markers",
+        line=dict(color="#ffffff",width=4),marker=dict(color="#ffffff",size=[9,7]),showlegend=False,
+        hovertemplate=(
+            f"<b>{html.escape(estado)}</b><br><br>"
+            f"{explicacion_actual_idr}<br><br>"
+            f"Tu resultado: <b>{ratio:.2f} veces el IDR</b><extra></extra>"
+        ),
+    ))
+    for corte in [0,1,2,3]:
+        angulo=math.pi*(1-corte/3)
+        fig.add_annotation(x=1.12*math.cos(angulo),y=1.12*math.sin(angulo),text=f"{corte:g}x",showarrow=False,font=dict(color="#c9ddeb",size=12))
+    fig.add_annotation(x=0,y=.25,text=f"<b>{ratio:.2f}x</b>",showarrow=False,font=dict(color="#eef7ff",size=32))
+    fig.update_layout(height=330,margin=dict(t=40,b=20,l=35,r=35),paper_bgcolor="#0b1728",plot_bgcolor="#0b1728",xaxis=dict(range=[-1.3,1.3],visible=False,fixedrange=True),yaxis=dict(range=[-.18,1.3],visible=False,fixedrange=True,scaleanchor="x",scaleratio=1),hovermode="closest",dragmode=False,hoverlabel=dict(bgcolor="#10263c",align="left",font=dict(size=14,color="#eef7ff",family="Arial, sans-serif")))
+    return fig
+
+
+def formatear_prosperidad(meses):
+    if meses is None or pd.isna(meses):
+        return "No calculable"
+    if meses <= 12:
+        return f"{meses:.2f} meses"
+    # Se expresa en meses completos, sin redondear al alza la cobertura.
+    meses_completos = int(meses)
+    anios, resto = divmod(meses_completos, 12)
+    texto_anios = f"{anios} año" if anios == 1 else f"{anios} años"
+    if resto == 0:
+        return texto_anios
+    return f"{texto_anios} y {resto} " + ("mes" if resto == 1 else "meses")
+
+
+def calcular_indicadores_panel(total_ingresos, total_gastos, periodos_sel, score_actual, ingresos_filtrados, df):
+    meses_indicadores = max(len(periodos_sel), 1)
+    ingreso_mensual_ind = float(total_ingresos) / meses_indicadores
+    egreso_mensual_ind = float(total_gastos) / meses_indicadores
+    # Definición específica del usuario para Felicidad.
+    activos_ind = float(score_actual["activos"])
+    pasivos_ind = float(score_actual["pasivos"])
+    liquido_ind = activos_ind - pasivos_ind
+    prosperidad_ind = liquido_ind / egreso_mensual_ind if egreso_mensual_ind > 0 else None
+    tipos_ind = resumen_ingresos_laborales_no_laborales(ingresos_filtrados)
+    residual_ind = float(tipos_ind["Residuales"].sum()) if not tipos_ind.empty else 0.0
+    dependencia_ind = (total_gastos - residual_ind) / total_gastos * 100 if total_gastos > 0 else None
+    categorias_deuda_ind = df.get("GASTOS_CATEGORIA", pd.Series("", index=df.index))
+    mascara_deuda_ind = categorias_deuda_ind.fillna("").map(normalizar).str.strip().eq("CREDITOS")
+    pago_deuda_ind = float(pd.to_numeric(df.loc[mascara_deuda_ind, "GASTOS_CANTIDAD"], errors="coerce").fillna(0).sum()) / meses_indicadores
+    flujo_deuda_ind = pago_deuda_ind / ingreso_mensual_ind * 100 if ingreso_mensual_ind > 0 else None
+    estado_flujo_ind, tono_flujo_ind = clasificar_flujo_deuda_mensual(flujo_deuda_ind)
+    endeudamiento_ind = pasivos_ind / activos_ind * 100 if activos_ind > 0 else None
+    estado_endeudamiento_ind, tono_endeudamiento_ind = clasificar_indice_endeudamiento(endeudamiento_ind)
+    return {
+        "meses_indicadores": meses_indicadores,
+        "ingreso_mensual_ind": ingreso_mensual_ind,
+        "egreso_mensual_ind": egreso_mensual_ind,
+        "activos_ind": activos_ind,
+        "pasivos_ind": pasivos_ind,
+        "liquido_ind": liquido_ind,
+        "prosperidad_ind": prosperidad_ind,
+        "dependencia_ind": dependencia_ind,
+        "pago_deuda_ind": pago_deuda_ind,
+        "flujo_deuda_ind": flujo_deuda_ind,
+        "estado_flujo_ind": estado_flujo_ind,
+        "tono_flujo_ind": tono_flujo_ind,
+        "endeudamiento_ind": endeudamiento_ind,
+        "estado_endeudamiento_ind": estado_endeudamiento_ind,
+        "tono_endeudamiento_ind": tono_endeudamiento_ind,
+        "prosperidad_texto": formatear_prosperidad(prosperidad_ind),
+    }
+
+
+def tarjeta_perfil_panel(destino, label, value, delta=None, delta_color="normal", help=None, **kwargs):
+    texto = str(label)
+    icono, _, titulo = texto.partition(" ")
+    if not titulo:
+        icono, titulo = "📊", texto
+    descripcion = help or AYUDA_TARJETAS.get(titulo) or f"{titulo}: indicador calculado con los datos de esta sección y los filtros seleccionados."
+    tarjeta_perfil_patrimonio(
+        destino, label, value, delta, delta_color, help=descripcion,
+        icono_resumen=icono, titulo_resumen=titulo, **kwargs,
+    )
+
+
+def tarjeta_comparacion_panel(destino, titulo, valor, subtitulo="", color="#39d7ff", icono="📊", tono_comparacion=None):
+    clase = "gac-card-comparacion"
+    if tono_comparacion in ("positivo", "negativo", "neutro"):
+        clase += f" gac-comparacion-{tono_comparacion}"
+    tarjeta_perfil_panel(
+        destino, f"{icono} {titulo}", valor, delta=subtitulo or None,
+        help=f"{titulo}. La comparación muestra la diferencia frente al promedio mensual de los datos analizados.",
+        clase_panel=clase,
+    )
+
+
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+encabezado_principal = st.empty()
+with encabezado_principal.container():
+    titulo_col, boton_col = st.columns([5.2, 1.8])
+    with titulo_col:
+        st.markdown('<p class="hero-title">Colombia Prospera V26</p>', unsafe_allow_html=True)
+    with boton_col:
+        st.button(
+            "📄 Descargar informe PDF",
+            disabled=True,
+            use_container_width=True,
+            help="Carga el archivo Excel para habilitar el informe.",
+            key="pdf_deshabilitado",
+        )
+st.markdown(
+    '<p class="hero-sub">Panel de control presupuestal · seguimiento de gastos e ingresos</p>',
+    unsafe_allow_html=True,
+)
+st.markdown('<div class="hero-accent"></div>', unsafe_allow_html=True)
+
+archivo = BytesIO(st.session_state["libro_activo_altium"]) if st.session_state.get("libro_activo_altium") else None
+carga_solicitada = False
+panel_carga = st.empty()
+def abrir_panel_carga_datos():
+    st.session_state["mostrar_carga_datos"] = True
+
+if archivo is None or st.session_state.get("mostrar_carga_datos", False):
+    with panel_carga.container():
+        if archivo is None:
+            st.markdown("""
+            <style>
+            .plantilla-bienvenida {display:flex;flex-direction:column;align-items:center;
+                padding:30px 16px 36px;text-align:center;gap:20px;}
+            .plantilla-bienvenida a.plantilla-drive {
+                position:relative;display:flex;align-items:center;gap:22px;
+                box-sizing:border-box;width:100%;max-width:580px;min-height:108px;
+                padding:24px 28px;border-radius:22px;overflow:hidden;
+                border:1px solid rgba(187,205,230,.26);
+                background:radial-gradient(ellipse at 0% 0%,rgba(62,148,176,.18),transparent 65%),
+                    linear-gradient(120deg,#162b42,#152238 70%,#1d2b45);
+                box-shadow:0 16px 40px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.08);
+                color:#f1f6fc !important;text-decoration:none !important;
+                transition:transform .22s ease,border-color .22s ease,box-shadow .22s ease;}
+            .plantilla-drive::before {content:"";position:absolute;inset:0 auto 0 0;
+                width:3px;background:linear-gradient(180deg,#72ddd9,#c9b77d);}
+            .plantilla-drive .plantilla-icono {display:flex;align-items:center;justify-content:center;
+                flex:0 0 54px;height:54px;border-radius:16px;color:#8ce0db;
+                background:linear-gradient(145deg,rgba(86,186,193,.16),rgba(95,137,195,.07));
+                border:1px solid rgba(116,208,211,.22);}
+            .plantilla-icono svg {width:27px;height:27px;}
+            .plantilla-drive .plantilla-copy {display:flex;flex-direction:column;gap:7px;text-align:left;}
+            .plantilla-drive .plantilla-texto {font-size:20px;font-weight:650;line-height:1.3;letter-spacing:-.3px;}
+            .plantilla-drive .plantilla-detalle {color:#a7b9ce;font-size:13px;font-weight:400;line-height:1.4;}
+            .plantilla-drive .plantilla-flecha {margin-left:auto;flex:0 0 auto;color:#d5c28d;
+                font-size:26px;font-weight:400;transition:transform .22s ease;}
+            .plantilla-bienvenida a.plantilla-drive:hover {
+                transform:translateY(-3px);border-color:rgba(116,208,211,.65);
+                box-shadow:0 20px 48px rgba(0,0,0,.3),0 0 26px rgba(80,183,198,.09);}
+            .plantilla-drive:hover .plantilla-flecha {transform:translateX(4px);}
+            .plantilla-bienvenida a.plantilla-drive:focus-visible {
+                outline:3px solid #8ce0db;outline-offset:5px;}
+            .plantilla-bienvenida p {max-width:510px;margin:0;color:#a9bdce;font-size:14px;line-height:1.75;}
+            @media(max-width:600px){
+                .plantilla-bienvenida{padding:20px 0 28px;}
+                .plantilla-bienvenida a.plantilla-drive{padding:22px 18px;gap:14px;min-height:100px;}
+                .plantilla-drive .plantilla-texto{font-size:17px;}
+                .plantilla-drive .plantilla-icono{flex-basis:44px;height:48px;border-radius:13px;}
+                .plantilla-drive .plantilla-detalle{font-size:12px;}
+            }
+            @media(prefers-reduced-motion:reduce){
+                .plantilla-bienvenida a.plantilla-drive,.plantilla-drive .plantilla-flecha{transition:none;}
+            }
+            </style>
+            <div class="plantilla-bienvenida">
+                <a class="plantilla-drive"
+                   href="https://docs.google.com/spreadsheets/d/1_-RDFht7kevHbSBu57m_mydpx41dEcVcfzb1QVp35Dw/copy"
+                   target="_blank" rel="noopener noreferrer">
+                    <span class="plantilla-icono" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <path d="M14 2v6h6M8 13h8M8 17h5"/>
+                        </svg>
+                    </span>
+                    <span class="plantilla-copy">
+                        <span class="plantilla-texto">Guardar plantilla en mi Drive</span>
+                        <span class="plantilla-detalle">Tu espacio para empezar a organizar tus finanzas</span>
+                    </span>
+                    <span class="plantilla-flecha" aria-hidden="true">→</span>
+                </a>
+                <p>Empieza con tu propia plantilla. Guarda una copia en tu Drive,
+                completa tus datos y carga aquí el enlace público o tu archivo Excel.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        origen_datos = st.radio("¿Cómo quieres cargar tus datos?", ["Subir archivo Excel", "Enlace público de Google"], horizontal=True)
+        if origen_datos == "Subir archivo Excel":
+            archivo_nuevo = st.file_uploader("Sube altium.xlsx", type=["xlsx"], key="archivo_carga_panel")
+            if archivo_nuevo is not None:
+                archivo = archivo_nuevo
+                carga_solicitada = True
+        else:
+            st.caption('Pega el enlace de Google Sheets o de un Excel en Drive, compartido como «Cualquier persona con el enlace». Altium solo lee los datos. Pulsa cargar o actualizar para traer los cambios.')
+            with st.form("cargar_enlace_publico"):
+                enlace_publico = st.text_input("Enlace público de Google Sheets o Drive", placeholder="https://docs.google.com/spreadsheets/d/…")
+                cargar_enlace = st.form_submit_button("Cargar / actualizar datos")
+            if cargar_enlace:
+                st.session_state.pop("libro_enlace_publico", None)
+                try:
+                    with st.spinner("Leyendo el archivo de Google…"):
+                        contenido_publico = descargar_libro_publico(enlace_publico)
+                        with pd.ExcelFile(BytesIO(contenido_publico)) as libro_publico:
+                            if not any(nombre in libro_publico.sheet_names for nombre in ("Gastos", "Transaccional")):
+                                raise ValueError('El archivo debe tener la hoja Gastos o Transaccional de la plantilla de Altium.')
+                        st.session_state["libro_enlace_publico"] = contenido_publico
+                        st.session_state["mostrar_carga_datos"] = False
+                        carga_solicitada = True
+                except Exception as exc:
+                    st.error(str(exc) if isinstance(exc, ValueError) else 'No se pudo leer el libro. Revisa que sea un Excel válido con la estructura de Altium e inténtalo de nuevo.')
+            if carga_solicitada and st.session_state.get("libro_enlace_publico"):
+                archivo = BytesIO(st.session_state["libro_enlace_publico"])
+                st.caption("Datos cargados desde Google. Usa Cargar / actualizar datos para volver a leer el archivo.")
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def cargar_hoja_deudas(file):
+    """Lee Pasivos o Deudas una sola vez por archivo cargado."""
+    file.seek(0)
+    deudas_excel = leer_deudas_excel(file)
+    return deudas_excel[[
+        "Nombre", "Deuda inicial", "Interés", "Saldo",
+        "Avance Excel", "Inicio del crédito",
+    ]]
+
+if archivo:
+
+    trm_colombia = obtener_trm_colombia()
+    gastos, ingresos, presupuesto_cat_base, presupuesto_sub_base, presupuesto_mensual_base, patrimonio, metas, personales, felicidad_trabajos, historico_presupuesto, deudas_cargadas = cargar_excel(
+        archivo,
+        trm_usd_cop=trm_colombia.get("valor"),
+        incluir_deudas=True,
+    )
+
+    st.session_state["libro_activo_altium"] = archivo.getvalue()
+    if carga_solicitada:
+        st.session_state["mostrar_carga_datos"] = False
+        panel_carga.empty()
+        st.rerun()
+
+    # El Escudo de estado toma sus metas predeterminadas de la hoja Personales.
+    # Conserva los ajustes manuales durante la sesión y vuelve a leerlos al cambiar el Excel.
+    metas_escudo_excel = personales.get("metas_escudo", {"Necesidades":50.0,"Gustos":30.0,"Ahorro":20.0})
+    firma_excel_escudo = hashlib.sha256(archivo.getvalue()).hexdigest()
+    if st.session_state.get("metas_escudo_excel_firma_v22") != firma_excel_escudo:
+        st.session_state["metas_escudo_v22"] = dict(metas_escudo_excel)
+        for nombre, clave in [("Necesidades", "necesidades"), ("Gustos", "gustos"), ("Ahorro", "ahorro")]:
+            st.session_state["meta_escudo_" + clave + "_v22"] = float(metas_escudo_excel[nombre])
+        st.session_state["metas_escudo_excel_firma_v22"] = firma_excel_escudo
+
+    # ============================================================
+    # CORRECCIÓN SEGURA DE LOS MESES DE INGRESOS
+    # ============================================================
+    # Se conserva íntegramente el DataFrame generado por cargar_excel(),
+    # porque otras zonas como Ejecutivo, Score Financiero y Felicidad
+    # dependen de su estructura original.
+    #
+    # Solo se recalculan MES y ANIO a partir de INGRESOS_FECHA.
+    # Así, un movimiento fechado en julio se contabiliza en julio aunque
+    # la columna auxiliar del Excel tenga un concepto como "Prima".
+    if not ingresos.empty and "INGRESOS_FECHA" in ingresos.columns:
+        ingresos = ingresos.copy()
+
+        ingresos["INGRESOS_FECHA"] = pd.to_datetime(
+            ingresos["INGRESOS_FECHA"],
+            errors="coerce",
+            dayfirst=True,
+        )
+
+        meses_desde_fecha = {
+            1: "ENERO",
+            2: "FEBRERO",
+            3: "MARZO",
+            4: "ABRIL",
+            5: "MAYO",
+            6: "JUNIO",
+            7: "JULIO",
+            8: "AGOSTO",
+            9: "SEPTIEMBRE",
+            10: "OCTUBRE",
+            11: "NOVIEMBRE",
+            12: "DICIEMBRE",
+        }
+
+        fechas_validas_ingresos = ingresos["INGRESOS_FECHA"].notna()
+
+        ingresos.loc[fechas_validas_ingresos, "MES"] = (
+            ingresos.loc[fechas_validas_ingresos, "INGRESOS_FECHA"]
+            .dt.month
+            .map(meses_desde_fecha)
+        )
+
+        ingresos.loc[fechas_validas_ingresos, "ANIO"] = (
+            ingresos.loc[fechas_validas_ingresos, "INGRESOS_FECHA"]
+            .dt.year
+        )
+
+    # ============================================================
+    # HOJA PASIVOS / DEUDAS
+    # El lector ya devuelve columnas normalizadas por nombre, incluido Tipo.
+    # ============================================================
+    try:
+        deudas_raw = deudas_cargadas.copy()
+
+        columnas_deudas = [
+            "Nombre",
+            "Deuda inicial",
+            "Interés",
+            "Saldo",
+            "Avance Excel",
+            "Inicio del crédito",
+            "Tipo",
+            "Pago mensual",
+            "Interés EA",
+            "Interés del pago",
+            "Capital",
+            "Seguro",
+            "Costos extra",
+            "Cuotas restantes", "Próximo vencimiento", "Total pendiente con intereses y cargos",
+            "Sistema de amortización",
+            "Cuotas totales",
+            "Hoja origen",
+        ]
+        deudas = deudas_raw.reindex(columns=columnas_deudas).copy()
+        deudas["Nombre"] = deudas["Nombre"].astype("string").str.strip()
+        deudas = deudas[
+            deudas["Nombre"].notna()
+            & deudas["Nombre"].ne("")
+            & deudas["Nombre"].str.lower().ne("nan")
+        ].copy()
+
+        for columna in ["Deuda inicial", "Interés", "Saldo", "Avance Excel"]:
+            deudas[columna] = pd.to_numeric(
+                deudas[columna],
+                errors="coerce",
+            )
+
+        deudas["Inicio del crédito"] = pd.to_datetime(
+            deudas["Inicio del crédito"],
+            errors="coerce",
+            dayfirst=True,
+        )
+
+        deudas["Deuda inicial"] = deudas["Deuda inicial"].fillna(0).clip(lower=0)
+        deudas["Interés"] = deudas["Interés"].fillna(0).clip(lower=0)
+        deudas["Saldo"] = deudas["Saldo"].fillna(
+            deudas["Deuda inicial"]
+        ).clip(lower=0)
+
+        # El avance se recalcula para no depender de fórmulas guardadas en Excel.
+        deudas["Pagado"] = (
+            deudas["Deuda inicial"] - deudas["Saldo"]
+        ).clip(lower=0)
+
+        deuda_inicial_valida = deudas["Deuda inicial"].where(deudas["Deuda inicial"].gt(0))
+        deudas["Avance"] = deudas["Pagado"].div(deuda_inicial_valida).mul(100).fillna(0.0)
+
+        # Prioridad tipo avalancha:
+        # 1. Mayor interés.
+        # 2. En empate, mayor saldo pendiente.
+        deudas = deudas.sort_values(
+            ["Interés", "Saldo"],
+            ascending=[False, False],
+        ).reset_index(drop=True)
+
+    except Exception:
+        deudas = pd.DataFrame(
+            columns=[
+                "Nombre",
+                "Deuda inicial",
+                "Interés",
+                "Saldo",
+                "Pagado",
+                "Avance",
+                "Inicio del crédito",
+            ]
+        )
+
+    with st.sidebar:
+        st.markdown("### ✦ Filtros inteligentes")
+        st.markdown(
+            '<div class="filter-card"><p style="margin:0;color:#DDF8FF;">'
+            'Selecciona el período para analizar tus finanzas.</p></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ============================================================
+        # Filtro de fechas simplificado: periodos rápidos o rango personalizado.
+        # ============================================================
+        fechas_gastos_validas = gastos["GASTOS_FECHA"].dropna()
+        fecha_minima = fechas_gastos_validas.min().date() if not fechas_gastos_validas.empty else pd.Timestamp.today().date()
+        fecha_ultima_dato = fechas_gastos_validas.max().date() if not fechas_gastos_validas.empty else fecha_minima
+        fecha_hoy = pd.Timestamp.today().date()
+        fecha_maxima = max(fecha_hoy, fecha_minima, fecha_ultima_dato)
+
+        st.markdown('<div class="filter-card">', unsafe_allow_html=True)
+        periodo_rapido = st.selectbox(
+            "🗓️ Período",
+            [
+                "Todo el historial",
+                "Mes actual",
+                "Mes anterior",
+                "Últimos 3 meses",
+                "Últimos 6 meses",
+                "Último año",
+                "Año actual",
+                "Personalizado",
+            ],
+            index=0,
+            help="Selecciona un periodo rápido o elige Personalizado para definir ambas fechas.",
+            key="filtro_periodo_rapido_v13",
+        )
+
+        hoy_ts = pd.Timestamp(fecha_hoy)
+        ultima_fecha_ts = pd.Timestamp(fecha_ultima_dato)
+        if periodo_rapido == "Mes actual":
+            fecha_desde = hoy_ts.replace(day=1).date()
+            fecha_hasta = min(fecha_hoy, fecha_maxima)
+        elif periodo_rapido == "Mes anterior":
+            inicio_mes_actual = hoy_ts.replace(day=1)
+            fecha_desde = (inicio_mes_actual - pd.offsets.MonthBegin(1)).date()
+            fecha_hasta = (inicio_mes_actual - pd.Timedelta(days=1)).date()
+        elif periodo_rapido == "Últimos 3 meses":
+            fecha_desde = (hoy_ts.replace(day=1) - pd.DateOffset(months=2)).date()
+            fecha_hasta = min(fecha_hoy, fecha_maxima)
+        elif periodo_rapido == "Últimos 6 meses":
+            fecha_desde = (
+                ultima_fecha_ts.replace(day=1) - pd.DateOffset(months=5)
+            ).date()
+            fecha_hasta = fecha_ultima_dato
+        elif periodo_rapido == "Último año":
+            fecha_desde = (
+                ultima_fecha_ts.replace(day=1) - pd.DateOffset(months=11)
+            ).date()
+            fecha_hasta = fecha_ultima_dato
+        elif periodo_rapido == "Año actual":
+            fecha_desde = hoy_ts.replace(month=1, day=1).date()
+            fecha_hasta = min(fecha_hoy, fecha_maxima)
+        elif periodo_rapido == "Personalizado":
+            rango_personalizado = st.date_input(
+                "📅 Desde y hasta",
+                value=(fecha_minima, fecha_maxima),
+                min_value=fecha_minima,
+                max_value=fecha_maxima,
+                help="Selecciona la fecha inicial y luego la fecha final en el mismo calendario.",
+                key="filtro_rango_personalizado_v13",
+            )
+            if isinstance(rango_personalizado, (tuple, list)) and len(rango_personalizado) == 2:
+                fecha_desde, fecha_hasta = rango_personalizado
+            elif isinstance(rango_personalizado, (tuple, list)) and len(rango_personalizado) == 1:
+                fecha_desde = fecha_hasta = rango_personalizado[0]
+            else:
+                fecha_desde = fecha_hasta = rango_personalizado
+        else:
+            fecha_desde, fecha_hasta = fecha_minima, fecha_maxima
+
+        fecha_desde = max(fecha_desde, fecha_minima)
+        fecha_hasta = min(fecha_hasta, fecha_maxima)
+        if fecha_desde > fecha_hasta:
+            fecha_desde, fecha_hasta = fecha_minima, fecha_maxima
+            st.info("Ese periodo está fuera del historial disponible; se mostrará todo el historial.")
+
+        st.caption(f"Aplicado: {fecha_desde:%d/%m/%Y} → {fecha_hasta:%d/%m/%Y}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+        modo_dashboard = st.radio(
+            "Vista del dashboard",
+            ["Básico", "Avanzado"],
+            index=1,
+            horizontal=True,
+            key="modo_dashboard_v22",
+        )
+
+        fecha_desde_ts = pd.Timestamp(fecha_desde)
+        fecha_hasta_ts = pd.Timestamp(fecha_hasta) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        periodos_sel = [
+            (int(periodo.year), MESES_ORDEN[int(periodo.month) - 1])
+            for periodo in pd.period_range(fecha_desde_ts, fecha_hasta_ts, freq="M")
+        ]
+
+        gastos_por_fecha = gastos[
+            gastos["GASTOS_FECHA"].between(fecha_desde_ts, fecha_hasta_ts, inclusive="both")
+        ].copy()
+
+        meses_sel = sorted(
+            gastos_por_fecha["MES"].dropna().astype(str).str.upper().unique(),
+            key=lambda m: MESES_NUM.get(str(m).upper(), 99),
+        )
+        anios_sel = sorted(gastos_por_fecha["ANIO"].dropna().astype(int).unique())
+
+        # El panel usa todas las categorías del período seleccionado.
+        categorias = sorted(gastos_por_fecha["GASTOS_CATEGORIA"].dropna().unique())
+        categorias_elegidas = []
+        categorias_sel = categorias
+        subcategorias = sorted(gastos_por_fecha["GASTOS_SUBCATEGORIA"].dropna().unique())
+        subcategorias_elegidas = []
+        subcategorias_sel = subcategorias
+        st.session_state.pop("filtro_categorias_v13", None)
+        st.session_state.pop("filtro_subcategorias_v13", None)
+
+        st.markdown("""
+        <style>
+        section[data-testid="stSidebar"] .stButton > button {
+            width: 100%; margin-top: 1.25rem; min-height: 2.75rem;
+            border: 1px solid rgba(98, 193, 219, .32);
+            border-radius: 14px;
+            background: linear-gradient(135deg, #142d40, #19283f);
+            color: #d8f2fa; font-weight: 500;
+            box-shadow: 0 3px 12px rgba(0, 0, 0, .12);
+            transition: background .18s ease, border-color .18s ease;
+        }
+        section[data-testid="stSidebar"] .stButton > button:hover {
+            background: linear-gradient(135deg, #1d4055, #243952);
+            border-color: #63c5dd; color: #ffffff;
+        }
+        section[data-testid="stSidebar"] .stButton > button:focus-visible {
+            outline: 2px solid #63c5dd; outline-offset: 3px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        st.button(
+            "↻ Cambiar / actualizar datos", key="abrir_carga_datos",
+            on_click=abrir_panel_carga_datos, use_container_width=True,
+            help="Carga otro archivo o actualiza los datos del enlace de Google.",
+        )
+
+
+
+    df = gastos_por_fecha[
+        gastos_por_fecha["GASTOS_CATEGORIA"].isin(categorias_sel)
+        & gastos_por_fecha["GASTOS_SUBCATEGORIA"].isin(subcategorias_sel)
+    ].copy()
+
+    # Presupuesto aplicable al periodo filtrado. Cada mes toma su valor específico
+    # de Historico_presupuesto; una celda vacía ya fue reemplazada por propuesto.
+    presupuesto_cat, presupuesto_sub, presupuesto_mensual_general, presupuesto_mensual_por_periodo = (
+        presupuestos_para_dataframe(
+            historico_presupuesto,
+            df=df,
+            periodos=periodos_sel,
+            categorias=categorias_sel if categorias_elegidas else None,
+            subcategorias=subcategorias_sel if subcategorias_elegidas else None,
+        )
+    )
+    if (historico_presupuesto is None or historico_presupuesto.empty) and presupuesto_cat_base:
+        presupuesto_cat = presupuesto_cat_base
+        presupuesto_sub = presupuesto_sub_base
+        cantidad_periodos = max(len(periodos_sel), 1)
+        presupuesto_mensual_general = float(presupuesto_mensual_base or 0.0) * cantidad_periodos
+        presupuesto_mensual_por_periodo = {
+            (anio, mes): float(presupuesto_mensual_base or 0.0)
+            for anio, mes in periodos_sel
+        }
+
+
+    if not ingresos.empty:
+        ingresos_tmp = ingresos.copy()
+        ingresos_tmp["INGRESOS_FECHA"] = pd.to_datetime(ingresos_tmp["INGRESOS_FECHA"], errors="coerce")
+        ingresos_filtrados = ingresos_tmp[
+            ingresos_tmp["INGRESOS_FECHA"].between(fecha_desde_ts, fecha_hasta_ts, inclusive="both")
+        ].copy()
+    else:
+        ingresos_filtrados = ingresos.copy()
+
+    # La pestaña Felicidad debe respetar el mismo filtro global de fechas.
+    # Antes usaba felicidad_trabajos sin filtrar, por eso sus métricas y gráficas
+    # no cambiaban al modificar Desde/Hasta en la barra lateral.
+    if not felicidad_trabajos.empty:
+        felicidad_tmp = felicidad_trabajos.copy()
+        felicidad_tmp["FECHA"] = pd.to_datetime(felicidad_tmp["FECHA"], errors="coerce")
+        felicidad_trabajos_filtrados = felicidad_tmp[
+            felicidad_tmp["FECHA"].between(fecha_desde_ts, fecha_hasta_ts, inclusive="both")
+        ].copy()
+    else:
+        felicidad_trabajos_filtrados = felicidad_trabajos.copy()
+
+    total_ingresos = ingresos_filtrados["INGRESOS_CANTIDAD"].sum() if not ingresos_filtrados.empty else 0
+    total_gastos = df["GASTOS_CANTIDAD"].sum()
+    balance = total_ingresos - total_gastos
+
+    nombre_persona = personales.get("nombre", "Sin registrar") if isinstance(personales, dict) else "Sin registrar"
+    edad_persona = personales.get("edad") if isinstance(personales, dict) else None
+
+    # Base mensual compartida por la aplicación y el informe PDF.
+    flujo_reporte = construir_flujo_mensual(
+        gastos_df=df,
+        ingresos_df=ingresos_filtrados,
+        meses_sel=meses_sel,
+        presupuesto_mensual=presupuesto_mensual_por_periodo or presupuesto_mensual_general,
+        periodos_sel=periodos_sel,
+    )
+
+    score_actual = calcular_score_financiero(
+        gastos_valor=float(total_gastos),
+        ingresos_valor=float(total_ingresos),
+        presupuesto_valor=float(presupuesto_mensual_general or 0.0),
+        patrimonio=patrimonio,
+        metas_df=metas,
+        gastos_df=df,
+        cantidad_periodos=len(periodos_sel),
+    )
+
+    from modules.report_deudas import recoger_simulaciones_deudas
+    simulaciones_pdf = recoger_simulaciones_deudas(deudas, st.session_state)
+    contexto_pdf = hashlib.sha256(
+        archivo.getvalue()
+        + b"pdf-dashboard-v26-id-egresos-5"
+        + repr((
+            fecha_desde.isoformat(), fecha_hasta.isoformat(),
+            tuple(sorted(map(str, categorias_sel))),
+            tuple(sorted(map(str, subcategorias_sel))),
+            bool(st.session_state.get("idr_incluir_no_laborales", True)),
+            st.session_state.get("resumen_clasificacion_503020_v19", {}),
+            st.session_state.get("tendencias_capital_inicial_proyeccion_v13"),
+            st.session_state.get("tendencias_tasa_interes_ea_v13", 10),
+            st.session_state.get("felicidad_colibri_confirmado_v19", False),
+            st.session_state.get("analisis_mes_base_v20"),
+            st.session_state.get("analisis_mes_actual_v20"),
+            st.session_state.get("galeria_caida",40),
+            st.session_state.get("galeria_subida",40),
+            st.session_state.get("momentum_reglas_periodos_radio_v22", "Último mes completo"),
+            st.session_state.get("metas_escudo_v22", {"Necesidades":50,"Gustos":30,"Ahorro":20}),
+            simulaciones_pdf,
+        )).encode("utf-8")
+    ).hexdigest()
+    if st.session_state.get("informe_pdf_v9_contexto") != contexto_pdf:
+        st.session_state.pop("informe_pdf_v9", None)
+        st.session_state.pop("informe_pdf_v9_nombre", None)
+        st.session_state.pop("informe_pdf_v9_error", None)
+        st.session_state["informe_pdf_v9_contexto"] = contexto_pdf
+
+    # El PDF se construye únicamente cuando el usuario lo solicita.
+    # Los bytes quedan en session_state para que el botón de descarga no
+    # vuelva a ejecutar todo el informe durante cada interacción.
+    encabezado_principal.empty()
+    with encabezado_principal.container():
+        titulo_col, boton_col = st.columns([5.2, 1.8])
+        with titulo_col:
+            st.markdown('<p class="hero-title">Colombia Prospera V26</p>', unsafe_allow_html=True)
+        with boton_col:
+            generar_pdf_click = st.button(
+                "📄 Preparar informe PDF",
+                use_container_width=True,
+                help="Genera el informe consolidado con los filtros activos.",
+                key="preparar_informe_pdf_v9",
+            )
+
+    if generar_pdf_click:
+        try:
+            with st.spinner("Preparando informe PDF..."):
+                st.session_state["informe_pdf_v9"] = generar_informe_financiero_pdf(
+                    nombre_persona=nombre_persona,
+                    edad_persona=edad_persona if edad_persona is not None else "Sin registrar",
+                    fecha_desde=fecha_desde.strftime("%d/%m/%Y"),
+                    fecha_hasta=fecha_hasta.strftime("%d/%m/%Y"),
+                    total_ingresos=float(total_ingresos),
+                    total_gastos=float(total_gastos),
+                    balance=float(balance),
+                    gastos=df,
+                    ingresos=ingresos_filtrados,
+                    flujo=flujo_reporte,
+                    deudas=deudas,
+                    patrimonio=patrimonio,
+                    metas=metas,
+                    felicidad=felicidad_trabajos_filtrados,
+                    presupuesto_periodo=float(presupuesto_mensual_general or 0),
+                    presupuesto_categoria=presupuesto_cat,
+                    score_financiero=score_actual["score"],
+                    componentes_score=score_actual["componentes"],
+                    dashboard_data={
+                        "resumen_v22": preparar_contexto_resumen_pdf(df,ingresos_filtrados,gastos,fecha_desde,fecha_hasta,total_ingresos,st.session_state),
+                        "simulaciones_deudas": simulaciones_pdf,
+                        "fondo": score_actual["fondo"], "gasto_mensual": score_actual["gasto_mensual"],
+                        "indicadores": calcular_indicadores_panel(total_ingresos, total_gastos, periodos_sel, score_actual, ingresos_filtrados, df),
+                        "idr_incluir_no_laborales": bool(st.session_state.get("idr_incluir_no_laborales", True)),
+                        "regla_ediciones": st.session_state.get("resumen_clasificacion_503020_v19", {}),
+                        "capital_proyeccion": st.session_state.get("tendencias_capital_inicial_proyeccion_v13"),
+                        "tasa_proyeccion": st.session_state.get("tendencias_tasa_interes_ea_v13", 10),
+                        "colibri_confirmado": st.session_state.get("felicidad_colibri_confirmado_v19", False),
+                        "analisis": {
+                            "mes_base": st.session_state.get("analisis_mes_base_v20"),
+                            "mes_actual": st.session_state.get("analisis_mes_actual_v20"),
+                            "caida": st.session_state.get("galeria_caida",40),
+                            "aumento": st.session_state.get("galeria_subida",40),
+                        },
+                    },
+                )
+                nombre_pdf_seguro = normalizar(nombre_persona).title().replace(" ", "_")
+                nombre_pdf_seguro = "".join(
+                    caracter for caracter in nombre_pdf_seguro
+                    if caracter.isalnum() or caracter in {"_", "-"}
+                ).strip("_") or "Persona"
+                st.session_state["informe_pdf_v9_nombre"] = (
+                    f"{nombre_pdf_seguro}_{fecha_desde:%Y-%m-%d}_{fecha_hasta:%Y-%m-%d}.pdf"
+                )
+                st.session_state.pop("informe_pdf_v9_error", None)
+        except Exception as error_pdf:
+            st.session_state.pop("informe_pdf_v9", None)
+            st.session_state["informe_pdf_v9_error"] = f"{type(error_pdf).__name__}: {error_pdf}"
+
+    if st.session_state.get("informe_pdf_v9"):
+        st.download_button(
+            "⬇️ Descargar informe PDF preparado",
+            data=st.session_state["informe_pdf_v9"],
+            file_name=st.session_state.get("informe_pdf_v9_nombre", "altium_financiero_v13.pdf"),
+            mime="application/pdf",
+            use_container_width=True,
+            key="descargar_informe_pdf_v9",
+        )
+
+    if st.session_state.get("informe_pdf_v9_error"):
+        st.error(
+            "No fue posible crear el PDF. Detalle técnico: "
+            + st.session_state["informe_pdf_v9_error"]
+        )
+
+    p1, p2 = st.columns([2, 1])
+    p1.markdown(
+        '<div class="perfil-persona">'
+        '<div class="perfil-etiqueta">👤 PERFIL PERSONAL '
+        f'<span class="gac-help" tabindex="0" role="note" aria-label="{html.escape(AYUDA_TARJETAS["Persona"])}">'
+        f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(AYUDA_TARJETAS["Persona"])}</span></span></div>'
+        f'<div class="perfil-nombre">{html.escape(str(nombre_persona))}</div>'
+        '<div class="perfil-acento"></div></div>',
+        unsafe_allow_html=True,
+    )
+    valor_edad_perfil = str(edad_persona) if edad_persona is not None else "Sin registrar"
+    p2.markdown(
+        '<div class="perfil-persona">'
+        '<div class="perfil-etiqueta">🎂 EDAD '
+        f'<span class="gac-help" tabindex="0" role="note" aria-label="{html.escape(AYUDA_TARJETAS["Edad"])}">'
+        f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(AYUDA_TARJETAS["Edad"])}</span></span></div>'
+        f'<div class="perfil-nombre">{html.escape(valor_edad_perfil)}</div>'
+        '<div class="perfil-acento"></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    tarjeta_estilo_gac(c1, "Ingresos", f"${total_ingresos:,.0f}", "Recibido en el período seleccionado", "#52e0a4")
+    tarjeta_estilo_gac(c2, "Gastos", f"${total_gastos:,.0f}", "Gastos del período seleccionado", "#ff526e")
+    delta_balance = f"{(balance / total_ingresos * 100):+.1f}% de ingresos" if total_ingresos else None
+    tarjeta_estilo_gac(c3, "Balance", f"${balance:,.0f}", delta_balance or "Ingresos menos gastos", "#ff526e" if balance < 0 else "#52e0a4")
+    c4.markdown(
+        '<div class="perfil-persona">'
+        '<div class="perfil-etiqueta">🧾 TRANSACCIONES '
+        f'<span class="gac-help" tabindex="0" role="note" aria-label="{html.escape(AYUDA_TARJETAS["Transacciones"])}">'
+        f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(AYUDA_TARJETAS["Transacciones"])}</span></span></div>'
+        f'<div class="perfil-nombre">{len(df):,}</div>'
+        '<div class="perfil-acento"></div>'
+        '<div class="gac-card-caption" style="margin-top:.6rem">Movimientos del período seleccionado</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    etiquetas_pestanas = [
+        "📈 Resumen",
+        "🧾 Gastos",
+        "📅 Tendencias",
+        "🎯 Presupuesto",
+        "💰 Ingresos",
+        "💳 Deudas",
+        "🏠 Patrimonio",
+        "😊 Felicidad",
+    ]
+    pestanas_visibles = (
+        [etiquetas_pestanas[0]]
+        if modo_dashboard == "Básico" else etiquetas_pestanas
+    )
+    if st.session_state.get("navegacion_principal_v13") not in pestanas_visibles:
+        st.session_state["navegacion_principal_v13"] = etiquetas_pestanas[0]
+    pestana_activa = st.radio(
+        "Sección del informe",
+        pestanas_visibles,
+        index=pestanas_visibles.index(st.session_state["navegacion_principal_v13"]),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="navegacion_principal_v13",
+    )
+
+        
+
+    # Tooltips de navegación: cada pestaña explica la pregunta que responde.
+    st.markdown(
+        """
+        <style>
+        [data-testid="stRadio"] [role="radiogroup"] {
+            gap: 0.38rem;
+            flex-wrap: wrap;
+            padding: 0.35rem 0 0.7rem 0;
+        }
+        [data-testid="stRadio"] [role="radiogroup"] label {
+            border: 1px solid rgba(56, 189, 248, 0.30);
+            border-radius: 999px;
+            padding: 0.38rem 0.72rem;
+            background: linear-gradient(145deg, rgba(15,23,42,0.90), rgba(2,6,23,0.96));
+            transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+        }
+        [data-testid="stRadio"] [role="radiogroup"] label:hover {
+            border-color: rgba(0, 240, 255, 0.85);
+            box-shadow: 0 0 14px rgba(0, 240, 255, 0.18);
+            transform: translateY(-1px);
+        }
+        [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+            border-color: #00F0FF;
+            background: linear-gradient(145deg, rgba(0,240,255,0.18), rgba(123,47,255,0.16));
+            box-shadow: 0 0 18px rgba(0, 240, 255, 0.24);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def contexto_pestana(pregunta, respuesta):
+        st.markdown(
+            f"""
+            <div style="
+                margin: 0.2rem 0 1.2rem 0;
+                padding: 14px 16px;
+                border-radius: 14px;
+                border: 1px solid rgba(56,189,248,0.38);
+                background: linear-gradient(135deg, rgba(15,23,42,0.92), rgba(2,6,23,0.96));
+            ">
+                <div style="color:#38BDF8;font-weight:800;font-size:1rem;">{pregunta}</div>
+                <div style="color:#CBD5E1;margin-top:5px;line-height:1.45;">{respuesta}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def seccion_resumen(numero, titulo, descripcion):
+        st.markdown(
+            f"""
+            <div style="
+                margin: 1.55rem 0 0.85rem 0;
+                padding: 13px 16px;
+                border-left: 5px solid #38BDF8;
+                border-radius: 12px;
+                background: linear-gradient(90deg, rgba(56,189,248,0.13), rgba(15,23,42,0.25));
+            ">
+                <div style="font-size:1.12rem;font-weight:800;color:#F8FAFC;">{numero}. {titulo}</div>
+                <div style="font-size:0.88rem;color:#94A3B8;margin-top:4px;">{descripcion}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if pestana_activa == etiquetas_pestanas[0]:
+        # El marco se dibuja por encima del panel sin añadir ancho al lienzo.
+        # El padding anterior hacía que el SVG de Plotly invadiera el borde.
+        st.markdown("""
+        <style>
+        [data-testid="stPlotlyChart"] {
+            position: relative;
+            box-sizing: border-box !important;
+            padding: 0 !important;
+            border: 0 !important;
+            width: 100%;
+            min-width: 0;
+            border-radius: 18px;
+            overflow: hidden;
+            isolation: isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            border: 1px solid rgba(0, 240, 255, 0.55);
+            border-radius: 18px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing: border-box;
+            min-width: 0;
+            max-width: 100%;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        contexto_pestana("¿Cómo estoy hoy?", "Entrega una lectura inmediata de ingresos, gastos, balance, ahorro, proyección y alertas financieras.")
+        st.markdown("## Resumen financiero")
+        st.caption("Una lectura jerarquizada del estado actual. Todos los indicadores respetan los filtros activos.")
+
+        # ======================================================
+        # INDICADORES EJECUTIVOS DEL RESUMEN
+        # ======================================================
+        # Ya fue calculado para los indicadores globales y el PDF.
+        resumen_flujo = flujo_reporte
+
+        tipo_df_resumen = agregar_tipo_gasto(df)
+        gastos_fijos = float(tipo_df_resumen.loc[tipo_df_resumen["TIPO_GASTO"].eq("Fijo"), "GASTOS_CANTIDAD"].sum()) if not tipo_df_resumen.empty else 0.0
+        gastos_variables = float(tipo_df_resumen.loc[tipo_df_resumen["TIPO_GASTO"].eq("Variable"), "GASTOS_CANTIDAD"].sum()) if not tipo_df_resumen.empty else 0.0
+        pct_fijos = (gastos_fijos / total_gastos * 100) if total_gastos else 0.0
+        pct_variables = (gastos_variables / total_gastos * 100) if total_gastos else 0.0
+
+        (gasto_promedio_diario, gasto_promedio_semanal,
+         gasto_promedio_mensual, dias_periodo, meses_equivalentes) = calcular_promedios_gasto(
+            total_gastos, fecha_desde, fecha_hasta
+        )
+        ahorro_mensual = float(resumen_flujo["Balance"].mean()) if not resumen_flujo.empty else 0.0
+        ahorro_anual_proyectado = ahorro_mensual * 12
+        pct_ahorro = (balance / total_ingresos * 100) if total_ingresos else 0.0
+        capacidad_ahorro = pct_ahorro
+
+        # Recomendaciones calculadas sobre el promedio mensual real de ingresos.
+        meses_con_ingresos = resumen_flujo[resumen_flujo["Ingresos"].gt(0)]
+        ingreso_promedio_mensual = (
+            float(meses_con_ingresos["Ingresos"].mean())
+            if not meses_con_ingresos.empty
+            else 0.0
+        )
+        recomendado_inversion_mensual = ingreso_promedio_mensual * 0.20
+        recomendado_ahorro_mensual = ingreso_promedio_mensual * 0.10
+
+
+        texto_deuda = (
+            df.get("GASTOS_CATEGORIA", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+            df.get("GASTOS_SUBCATEGORIA", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+            df.get("GASTOS_SUBCATEGORIA_2", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+            df.get("GASTOS_DESCRIPCION", pd.Series(dtype=str)).astype(str).map(normalizar)
+        ) if not df.empty else pd.Series(dtype=str)
+        claves_deuda = ["DEUDA", "CREDITO", "PRESTAMO", "CUOTA", "HIPOTECA", "TARJETA", "LIBRANZA"]
+        mask_deuda = texto_deuda.map(lambda x: any(k in x for k in claves_deuda)) if not texto_deuda.empty else pd.Series(dtype=bool)
+        pagos_deuda = float(df.loc[mask_deuda, "GASTOS_CANTIDAD"].sum()) if not df.empty and len(mask_deuda) == len(df) else 0.0
+        pct_ingresos_deuda = (pagos_deuda / total_ingresos * 100) if total_ingresos else 0.0
+        capacidad_endeudamiento_valor = max((total_ingresos * 0.30) - pagos_deuda, 0.0)
+        capacidad_endeudamiento_pct = (capacidad_endeudamiento_valor / total_ingresos * 100) if total_ingresos else 0.0
+
+        gastos_por_mes_resumen = resumen_flujo[resumen_flujo["Gastos"].gt(0)].copy()
+        variacion_mes_anterior = 0.0
+        variacion_texto = "Sin comparación"
+        if len(gastos_por_mes_resumen) >= 2:
+            gasto_actual = float(gastos_por_mes_resumen.iloc[-1]["Gastos"])
+            gasto_anterior = float(gastos_por_mes_resumen.iloc[-2]["Gastos"])
+            variacion_mes_anterior = ((gasto_actual - gasto_anterior) / gasto_anterior * 100) if gasto_anterior else 0.0
+            variacion_texto = f"{variacion_mes_anterior:+.1f}%"
+
+        presupuesto_anual_estimado = (float(presupuesto_mensual_general or 0) / max(len(presupuesto_mensual_por_periodo), 1)) * 12
+        gasto_proyectado_diciembre = gasto_promedio_mensual * 12
+        diferencia_meta_anual = presupuesto_anual_estimado - gasto_proyectado_diciembre
+        if presupuesto_anual_estimado > 0:
+            estado_proyeccion = (
+                f"Te quedarían ${diferencia_meta_anual:,.0f} disponibles frente a la meta anual."
+                if diferencia_meta_anual >= 0
+                else f"Te faltarían ${abs(diferencia_meta_anual):,.0f} para cumplir la meta anual."
+            )
+        else:
+            estado_proyeccion = "Completa propuesto o los valores mensuales en Historico_presupuesto para calcular la meta anual."
+
+        st.markdown(
+            """
+            <style>
+            @keyframes alerta-ahorro-negativo {
+                0%, 100% { box-shadow: 0 0 10px rgba(255, 23, 68, 0.35); }
+                50% { box-shadow: 0 0 30px rgba(255, 23, 68, 0.95); }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        def tarjeta_kpi(titulo, valor, subtitulo="", color="#38BDF8", icono="📊", alerta=False):
+            tarjeta_perfil_patrimonio(
+                st, f"{icono} {titulo}", valor, delta=subtitulo or None,
+                help=AYUDA_TARJETAS.get(titulo, subtitulo or titulo),
+                icono_resumen=icono, titulo_resumen=titulo,
+            )
+
+        mostrar_sankey_financiero(df, ingresos_filtrados)
+
+        seccion_resumen("1", "Ahorro y liquidez", "Capacidad de ahorro actual, proyección anual y referencias mensuales para ahorrar e invertir.")
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            ahorro_mensual_negativo = ahorro_mensual < 0
+            tarjeta_kpi(
+                "Ahorro mensual",
+                f"${ahorro_mensual:,.0f}",
+                "Déficit promedio: los gastos superan los ingresos." if ahorro_mensual_negativo else "Promedio de los meses filtrados",
+                "#52e0a4",
+                "🐷",
+                alerta=False,
+            )
+        with k2:
+            ahorro_anual_negativo = ahorro_anual_proyectado < 0
+            tarjeta_kpi(
+                "Ahorro anual",
+                f"${ahorro_anual_proyectado:,.0f}",
+                "Proyección anual deficitaria." if ahorro_anual_negativo else "Proyección con el ahorro mensual",
+                "#FF1744" if ahorro_anual_negativo else COLOR_INGRESOS,
+                "📈",
+                alerta=ahorro_anual_negativo,
+            )
+        with k3:
+            tarjeta_kpi(
+                "Recomendado para invertir",
+                f"${recomendado_inversion_mensual:,.0f}",
+                "20% del ingreso promedio mensual",
+                "#C084FC",
+                "📊",
+            )
+        with k4:
+            tarjeta_kpi(
+                "Recomendado para ahorrar",
+                f"${recomendado_ahorro_mensual:,.0f}",
+                "10% del ingreso promedio mensual",
+                "#FDBA74",
+                "🏦",
+            )
+
+        seccion_resumen("2", "Riesgos principales", "Endeudamiento, presión de las deudas y variación reciente del gasto.")
+
+        k5, k6, k7, k8 = st.columns(4)
+        with k5:
+            capacidad_ahorro_negativa = capacidad_ahorro < 0
+            tarjeta_kpi(
+                "Capacidad de ahorro",
+                f"{capacidad_ahorro:.1f}%",
+                "Los gastos superan los ingresos." if capacidad_ahorro_negativa else "Entre más alto, mejor margen",
+                "#FF1744" if capacidad_ahorro_negativa else "#2DD4BF",
+                "⚡",
+                alerta=capacidad_ahorro_negativa,
+            )
+        with k6:
+            tarjeta_kpi("Deudas / ingresos", f"{pct_ingresos_deuda:.1f}%", f"Pagos detectados: ${pagos_deuda:,.0f}", "#FBBF24", "💳")
+        with k7:
+            tarjeta_kpi("Capacidad endeudamiento", f"{capacidad_endeudamiento_pct:.1f}%", f"Margen disponible: ${capacidad_endeudamiento_valor:,.0f}", "#FB7185", "🛡️")
+        with k8:
+            tarjeta_kpi("Variación mensual", variacion_texto, "Gasto actual vs mes anterior", "#93C5FD", "🔁")
+
+        st.markdown("#### Indicadores de riesgo y composición")
+        g1, g2, g3 = st.columns([1.05, 1.05, 1.2])
+
+        with g1:
+            fig_comp = go.Figure(go.Pie(
+                labels=["Gastos fijos", "Gastos variables"], values=[gastos_fijos,gastos_variables],
+                hole=.70,sort=False,rotation=35,
+                domain=dict(x=[.08,.92],y=[.22,.96]),
+                marker=dict(colors=["#38BDF8","#A78BFA"],line=dict(color="#07111F",width=4)),
+                textinfo="percent",texttemplate="%{percent:.1%}",textposition="inside",
+                textfont=dict(size=12,color="#F8FAFC"),
+                hovertemplate=("<b>🧩 %{label}</b><br><br>"
+                    "💰 Monto: <b>$%{value:,.0f}</b><br>"
+                    "📊 Del grupo fijos + variables: <b>%{percent:.2%}</b>"
+                    "<extra></extra>"),
+            ))
+            fig_comp.update_layout(
+                template="plotly_dark",height=360,separators=",.",showlegend=True,
+                paper_bgcolor="#07111F",plot_bgcolor="#07111F",
+                title=dict(text="🧩 Gastos fijos y variables",x=.5,xanchor="center",font=dict(size=15,color="#E2E8F0")),
+                margin=dict(t=60,b=20,l=15,r=15),
+                legend=dict(orientation="h",x=.5,xanchor="center",y=.10,yanchor="top",title_text="",
+                            font=dict(size=11,color="#B4C9D9"),bgcolor="rgba(0,0,0,0)"),
+                hoverlabel=dict(bgcolor="#111F33",bordercolor="#38BDF8",align="left",font=dict(size=12,color="#F8FAFC")),
+                uniformtext_minsize=10,uniformtext_mode="hide",
+                annotations=[
+                    dict(x=.5,y=.65,xref="paper",yref="paper",showarrow=False,text="TOTAL REGISTRADO",font=dict(size=10,color="#94A3B8")),
+                    dict(x=.5,y=.54,xref="paper",yref="paper",showarrow=False,
+                         text="<b>"+f"${total_gastos:,.0f}".replace(",",".")+"</b>",font=dict(size=20,color="#F8FAFC")),
+                ],
+                shapes=[dict(type="path",xref="paper",yref="paper",layer="below",
+                    path="M 0.06,0 L 0.94,0 Q 1,0 1,0.06 L 1,0.94 Q 1,1 0.94,1 L 0.06,1 Q 0,1 0,0.94 L 0,0.06 Q 0,0 0.06,0 Z",
+                    fillcolor="#07111F",line=dict(color="#213C58",width=1))],
+            )
+            st.plotly_chart(fig_comp,use_container_width=True,key="resumen_composicion_altium_noche_v20")
+
+        with g2:
+            from modules.medidor_deuda import crear_medidor_deuda
+            fig_deuda=crear_medidor_deuda(
+                pct_ingresos_deuda, valido=total_ingresos>0 and pagos_deuda>=0
+            )
+            st.plotly_chart(fig_deuda,use_container_width=True,key="resumen_medidor_deudas_v20")
+        with g3:
+            barras_pct = pd.DataFrame({
+                "Indicador": ["% ahorro", "% fijos", "% variables", "% deudas", "Capacidad deuda"],
+                "Porcentaje": [pct_ahorro, pct_fijos, pct_variables, pct_ingresos_deuda, capacidad_endeudamiento_pct],
+            })
+            barras_pct["Base"]=[
+                "Balance ÷ ingresos × 100",
+                "Gastos fijos ÷ gastos totales × 100",
+                "Gastos variables ÷ gastos totales × 100",
+                "Pagos de deuda detectados ÷ ingresos × 100",
+                "Margen hasta el 30 % de ingresos, descontando pagos de deuda",
+            ]
+            colores_indicadores={"% ahorro":"#00D99B" if pct_ahorro>=0 else "#FF526E",
+                "% fijos":"#38BDF8","% variables":"#A78BFA","% deudas":"#F59E0B","Capacidad deuda":"#2863BD"}
+            fig_barras_pct = px.bar(
+                barras_pct,x="Porcentaje",y="Indicador",orientation="h",text="Porcentaje",
+                color="Indicador",color_discrete_map=colores_indicadores,custom_data=["Base"],
+            )
+            fig_barras_pct.update_traces(
+                texttemplate="%{text:.2f} %",textposition="outside",cliponaxis=False,width=.48,
+                textfont=dict(size=12,color="#F8FAFC"),
+                marker_line=dict(color="rgba(255,255,255,.28)",width=.7),
+                hovertemplate=("<b>📊 %{y}</b><br><br>"
+                    "🎯 Resultado: <b>%{x:.2f} %</b><br>"
+                    "🧮 %{customdata[0]}<br>"
+                    "📅 Período y filtros seleccionados<extra></extra>"),
+            )
+            maximo_pct=max(float(barras_pct.Porcentaje.max()),1)
+            minimo_pct=min(float(barras_pct.Porcentaje.min()),0)
+            fig_barras_pct.update_layout(
+                template="plotly_dark",height=360,showlegend=False,separators=",.",
+                paper_bgcolor="#07111F",plot_bgcolor="#07111F",
+                barcornerradius="50%",bargap=.45,
+                title=dict(text="📊 Indicadores porcentuales clave",x=.5,xanchor="center",font=dict(size=15,color="#E2E8F0")),
+                margin=dict(t=60,b=35,l=110,r=65),
+                hoverlabel=dict(bgcolor="#111F33",bordercolor="#38BDF8",align="left",font=dict(size=12,color="#F8FAFC")),
+                shapes=[dict(type="path",xref="paper",yref="paper",layer="below",
+                    path="M 0.06,0 L 0.94,0 Q 1,0 1,0.06 L 1,0.94 Q 1,1 0.94,1 L 0.06,1 Q 0,1 0,0.94 L 0,0.06 Q 0,0 0.06,0 Z",
+                    fillcolor="#07111F",line=dict(color="#213C58",width=1))],
+            )
+            fig_barras_pct.update_yaxes(title="",autorange="reversed",showgrid=False,tickfont=dict(size=11,color="#B4C9D9"))
+            fig_barras_pct.update_xaxes(title="",ticksuffix=" %",tickformat=".0f",range=[minimo_pct*1.3,maximo_pct*1.4],
+                gridcolor="rgba(148,163,184,.1)",zerolinecolor="#284562",tickfont=dict(size=10,color="#94A3B8"))
+            st.plotly_chart(fig_barras_pct,use_container_width=True,key="resumen_porcentajes_altium_noche_v20")
+
+        seccion_resumen("3", "Evolución rápida", "Compara ingresos, gastos y balance por mes sin sustituir el análisis detallado de Tendencias.")
+        st.markdown("#### Evolución mensual y proyección")
+        ev1, ev2 = st.columns([1.45, 1])
+        with ev1:
+            resumen_plot = resumen_flujo.copy()
+            fig_evo = go.Figure()
+            datos_evolucion_resumen = resumen_plot[["Ingresos", "Gastos", "Balance"]]
+            tooltip_evolucion_resumen = (
+                "<b>📅 %{x}</b><br><br>"
+                "💵 Ingresos: $%{customdata[0]:,.0f}<br>"
+                "🧾 Gastos: $%{customdata[1]:,.0f}<br>"
+                "⚖️ Balance: <b>$%{customdata[2]:,.0f}</b>"
+                "<extra></extra>"
+            )
+            fig_evo.add_trace(go.Bar(x=resumen_plot["MES"], y=resumen_plot["Ingresos"], name="Ingresos", marker_color=COLOR_INGRESOS, opacity=0.72, customdata=datos_evolucion_resumen, hovertemplate=tooltip_evolucion_resumen))
+            fig_evo.add_trace(go.Bar(x=resumen_plot["MES"], y=resumen_plot["Gastos"], name="Gastos", marker_color=COLOR_GASTOS, opacity=0.72, customdata=datos_evolucion_resumen, hovertemplate=tooltip_evolucion_resumen))
+            fig_evo.add_trace(go.Scatter(x=resumen_plot["MES"], y=resumen_plot["Balance"], name="Ahorro / Balance", mode="lines+markers", line=dict(color=COLOR_BALANCE, width=4, shape="spline"), marker=dict(size=10), customdata=datos_evolucion_resumen, hovertemplate=tooltip_evolucion_resumen))
+            fig_evo.update_layout(barmode="group", height=430, xaxis=dict(categoryorder="array", categoryarray=MESES_ORDEN), yaxis=dict(tickformat=",.0f"), legend=dict(orientation="h", y=1.08), margin=dict(t=70,b=35,l=35,r=20))
+            st.plotly_chart(
+                preparar_grafico_resumen(
+                    fig_evo,
+                    titulo="Ingresos, gastos y ahorro por mes",
+                    x="Mes",
+                    y="Valor",
+                    leyenda="Concepto",
+                    mostrar_leyenda=True,
+                ),
+                use_container_width=True,
+            )
+
+        with ev2:
+            proy_df = pd.DataFrame({
+                "Concepto": ["Gasto proyectado a diciembre", "Meta anual presupuesto"],
+                "Valor": [gasto_proyectado_diciembre, presupuesto_anual_estimado],
+            })
+            fig_proy = px.bar(
+                proy_df,
+                x="Concepto",
+                y="Valor",
+                text="Valor",
+                color="Concepto",
+                color_discrete_map={"Gasto proyectado a diciembre": COLOR_GASTOS, "Meta anual presupuesto": COLOR_PRESUPUESTO},
+            )
+            fig_proy.update_traces(
+                texttemplate="$%{text:,.0f}",
+                textposition="outside",
+                hovertemplate=(
+                    "<b>🔮 %{x}</b><br><br>"
+                    "💰 Valor estimado: <b>$%{y:,.0f}</b><br>"
+                    "📅 Proyección calculada al cierre de diciembre"
+                    "<extra></extra>"
+                ),
+            )
+            fig_proy.update_layout(height=430, showlegend=False, margin=dict(t=70,b=70,l=30,r=20))
+            st.plotly_chart(
+                preparar_grafico_resumen(
+                    fig_proy,
+                    titulo="Proyección anual de gasto frente al presupuesto",
+                    x="Concepto",
+                    y="Valor",
+                    mostrar_leyenda=False,
+                ),
+                use_container_width=True,
+            )
+
+        seccion_resumen("4", "Proyección", "Estima el cierre anual y compara el ritmo actual de gasto con la meta presupuestal.")
+
+        avance_meta = (gasto_proyectado_diciembre / presupuesto_anual_estimado * 100) if presupuesto_anual_estimado else 0
+        st.markdown(
+            f"""
+            <div style="background:#0a0a0a; border:1px solid rgba(99,102,241,0.45); border-radius:18px; padding:18px; margin-top:4px;">
+                <div style="font-size:1.15rem; font-weight:800; color:#f8fafc; margin-bottom:8px;">🔮 Lectura automática de la proyección</div>
+                <div style="color:#cbd5e1; line-height:1.6;">
+                    Si continúas gastando igual, en diciembre habrías gastado aproximadamente
+                    <b style="color:#FB7185;">${gasto_proyectado_diciembre:,.0f}</b>.
+                    Meta anual estimada: <b style="color:#FDE68A;">${presupuesto_anual_estimado:,.0f}</b>.
+                    {estado_proyeccion}
+                </div>
+                <div style="margin-top:14px; height:16px; background:#111827; border-radius:999px; overflow:hidden; border:1px solid rgba(148,163,184,0.28);">
+                    <div style="height:100%; width:{min(avance_meta,100):.1f}%; background:linear-gradient(90deg,#38BDF8,#FDE68A,#FB7185); border-radius:999px;"></div>
+                </div>
+                <div style="color:#94a3b8; font-size:0.88rem; margin-top:6px;">Avance proyectado frente a la meta anual: {avance_meta:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ======================================================
+        # CAPACIDAD DE AHORRO MENSUAL: VALOR Y PORCENTAJE
+        # Ambos gráficos respetan el periodo y los filtros activos.
+        # Valor en pesos = ingresos del mes - gastos del mes.
+        # Porcentaje = ahorro del mes / ingresos del mes * 100.
+        # ======================================================
+        st.markdown("#### Ahorro mensual: valor y porcentaje")
+        st.caption(
+            "Comparación mensual del dinero disponible después de gastos, "
+            "expresado en pesos y como porcentaje de los ingresos del mismo mes."
+        )
+
+        capacidad_ahorro_df = resumen_flujo.copy()
+        capacidad_ahorro_df["Ahorro mensual"] = (
+            capacidad_ahorro_df["Ingresos"] - capacidad_ahorro_df["Gastos"]
+        )
+        capacidad_ahorro_df["Capacidad de ahorro %"] = capacidad_ahorro_df.apply(
+            lambda fila: (
+                fila["Ahorro mensual"] / fila["Ingresos"] * 100
+                if fila["Ingresos"] > 0
+                else 0.0
+            ),
+            axis=1,
+        )
+
+        ahorro_col1, ahorro_col2 = st.columns(2)
+
+        with ahorro_col1:
+            fig_ahorro_pesos = go.Figure()
+            fig_ahorro_pesos.add_trace(go.Scatter(
+                x=capacidad_ahorro_df["MES"],
+                y=capacidad_ahorro_df["Ahorro mensual"],
+                name="Ahorro mensual",
+                mode="lines+markers+text",
+                line=dict(color=COLOR_BALANCE, width=4, shape="spline"),
+                marker=dict(size=10, color=COLOR_BALANCE),
+                text=capacidad_ahorro_df["Ahorro mensual"],
+                texttemplate="$%{text:,.0f}",
+                textposition="top center",
+                customdata=capacidad_ahorro_df[["Ingresos", "Gastos"]],
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Ahorro: $%{y:,.0f}<br>"
+                    "Ingresos: $%{customdata[0]:,.0f}<br>"
+                    "Gastos: $%{customdata[1]:,.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_ahorro_pesos.add_hline(
+                y=0,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="rgba(248,113,113,0.75)",
+            )
+            fig_ahorro_pesos.update_layout(
+                height=420,
+                xaxis=dict(
+                    categoryorder="array",
+                    categoryarray=MESES_ORDEN,
+                ),
+                yaxis=dict(tickprefix="$", tickformat=",.0f"),
+                margin=dict(t=65, b=35, l=55, r=25),
+                showlegend=False,
+            )
+            st.plotly_chart(
+                preparar_grafico_resumen(
+                    fig_ahorro_pesos,
+                    titulo="Capacidad de ahorro mensual en pesos",
+                    x="Mes",
+                    y="Ahorro mensual",
+                    mostrar_leyenda=False,
+                ),
+                use_container_width=True,
+                key="resumen_capacidad_ahorro_pesos",
+            )
+
+        with ahorro_col2:
+            fig_ahorro_pct = go.Figure()
+            fig_ahorro_pct.add_trace(go.Scatter(
+                x=capacidad_ahorro_df["MES"],
+                y=capacidad_ahorro_df["Capacidad de ahorro %"],
+                name="Capacidad de ahorro",
+                mode="lines+markers+text",
+                line=dict(color="#2DD4BF", width=4, shape="spline"),
+                marker=dict(size=10, color="#2DD4BF"),
+                text=capacidad_ahorro_df["Capacidad de ahorro %"],
+                texttemplate="%{text:.1f}%",
+                textposition="top center",
+                customdata=capacidad_ahorro_df[["Ahorro mensual", "Ingresos"]],
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Capacidad de ahorro: %{y:.1f}%<br>"
+                    "Ahorro: $%{customdata[0]:,.0f}<br>"
+                    "Ingresos: $%{customdata[1]:,.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_ahorro_pct.add_hline(
+                y=0,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="rgba(248,113,113,0.75)",
+            )
+            fig_ahorro_pct.add_hline(
+                y=20,
+                line_width=2,
+                line_dash="dot",
+                line_color="rgba(253,230,138,0.85)",
+                annotation_text="Meta 20%",
+                annotation_position="top left",
+            )
+            fig_ahorro_pct.update_layout(
+                height=420,
+                xaxis=dict(
+                    categoryorder="array",
+                    categoryarray=MESES_ORDEN,
+                ),
+                yaxis=dict(ticksuffix="%", tickformat=".1f"),
+                margin=dict(t=65, b=35, l=55, r=25),
+                showlegend=False,
+            )
+            st.plotly_chart(
+                preparar_grafico_resumen(
+                    fig_ahorro_pct,
+                    titulo="Capacidad de ahorro mensual en porcentaje",
+                    x="Mes",
+                    y="Porcentaje de ahorro",
+                    mostrar_leyenda=False,
+                ),
+                use_container_width=True,
+                key="resumen_capacidad_ahorro_porcentaje",
+            )
+
+        seccion_resumen("5", "Distribución general del dinero", "Muestra cómo se reparten los gastos y qué parte de los ingresos permanece disponible.")
+
+        col1, col2 = st.columns(2, gap="large")
+        with st.expander("Acciones de control: mantener, reducir o eliminar"):
+            st.caption("Gastos prevalece sobre Datos. Las acciones son decisiones previstas: no cambian los importes ni representan ahorro ya realizado.")
+            if not df.empty and "ACCION_CONTROL" in df.columns:
+                resumen_control = df.groupby("ACCION_CONTROL").agg(
+                    Monto_registrado=("GASTOS_CANTIDAD", "sum"), Movimientos=("GASTOS_CANTIDAD", "size")
+                ).reindex(ACCIONES + ["Sin acción"], fill_value=0).rename_axis("Acción").reset_index()
+                st.dataframe(resumen_control, hide_index=True, use_container_width=True,
+                             column_config={"Monto_registrado":st.column_config.NumberColumn("Monto registrado",format="$%.0f")})
+                detalle_control = df[["GASTOS_FECHA", "GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA", "GASTOS_CANTIDAD",
+                                      "CONTROL_DATOS", "CONTROL_MANUAL", "ACCION_CONTROL", "ORIGEN_CONTROL"]].rename(columns={
+                    "GASTOS_FECHA":"Fecha", "GASTOS_CATEGORIA":"Categoría", "GASTOS_SUBCATEGORIA":"Subcategoría",
+                    "GASTOS_CANTIDAD":"Monto", "CONTROL_DATOS":"Acción en Datos", "CONTROL_MANUAL":"Elección en Gastos",
+                    "ACCION_CONTROL":"Acción aplicada", "ORIGEN_CONTROL":"Origen",
+                })
+                st.dataframe(detalle_control, hide_index=True, use_container_width=True,
+                             column_config={"Monto":st.column_config.NumberColumn("Monto",format="$%.0f")})
+            else:
+                st.info("No hay gastos para mostrar con los filtros actuales.")
+
+        with st.expander("Prioridad de los gastos: Datos y excepciones por movimiento"):
+            st.caption(
+                "La prioridad de Gastos prevalece cuando esta diligenciada. "
+                "Si esta vacia, se usa la de la subcategoria en Datos. "
+                "Sin ninguna de las dos, el movimiento figura como Sin clasificar."
+            )
+            if not df.empty and "PRIORIDAD_GASTO" in df.columns:
+                resumen_prioridad = (
+                    df.groupby("PRIORIDAD_GASTO")["GASTOS_CANTIDAD"].sum()
+                    .reindex(PRIORIDADES + ["Sin clasificar"], fill_value=0)
+                    .rename_axis("Prioridad").reset_index(name="Gasto")
+                )
+                fig_prioridad = px.bar(
+                    resumen_prioridad, x="Prioridad", y="Gasto", color="Prioridad",
+                    category_orders={"Prioridad": PRIORIDADES + ["Sin clasificar"]},
+                    color_discrete_map={"Básicos":"#22C55E", "Calidad de vida":"#38BDF8",
+                                        "Estilo de vida":"#F59E0B", "Caprichosos":"#F472B6",
+                                        "Sin clasificar":"#94A3B8"},
+                )
+                fig_prioridad.update_layout(showlegend=False)
+                st.plotly_chart(estilo_grafico(fig_prioridad, "Gastos por prioridad"), use_container_width=True)
+                st.dataframe(resumen_prioridad, hide_index=True, use_container_width=True,
+                             column_config={"Gasto":st.column_config.NumberColumn("Gasto",format="$%.0f")})
+                detalle_prioridad = df[["GASTOS_FECHA", "GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA",
+                                        "GASTOS_CANTIDAD", "PRIORIDAD_DATOS", "PRIORIDAD_MANUAL",
+                                        "PRIORIDAD_GASTO", "ORIGEN_PRIORIDAD"]].rename(columns={
+                    "GASTOS_FECHA":"Fecha", "GASTOS_CATEGORIA":"Categoría",
+                    "GASTOS_SUBCATEGORIA":"Subcategoría", "GASTOS_CANTIDAD":"Monto",
+                    "PRIORIDAD_DATOS":"Predeterminada en Datos", "PRIORIDAD_MANUAL":"Elección en Gastos",
+                    "PRIORIDAD_GASTO":"Prioridad aplicada", "ORIGEN_PRIORIDAD":"Origen",
+                })
+                st.dataframe(detalle_prioridad, hide_index=True, use_container_width=True,
+                             column_config={"Monto":st.column_config.NumberColumn("Monto",format="$%.0f")})
+            else:
+                st.info("No hay gastos para mostrar con los filtros actuales.")
+
+        controles_distribucion = st.container()
+        with col1:
+            pie = df.groupby("GASTOS_CATEGORIA")["GASTOS_CANTIDAD"].sum().reset_index()
+            total_pie = pie["GASTOS_CANTIDAD"].sum()
+            pie["Porcentaje ingresos"] = pie["GASTOS_CANTIDAD"].map(
+                lambda monto: f"{monto / total_ingresos * 100:.1f}%" if total_ingresos > 0
+                else "No disponible (sin ingresos positivos)"
+            )
+            fig_pie = px.pie(
+                pie,
+                names="GASTOS_CATEGORIA",
+                values="GASTOS_CANTIDAD",
+                hole=0.45,
+                color="GASTOS_CATEGORIA",
+                color_discrete_sequence=PALETA_NEON,
+                custom_data=["Porcentaje ingresos"],
+            )
+            fig_pie.update_traces(
+                textposition="inside",
+                textinfo="percent+label",
+                textfont=dict(color="#ffffff", size=12, family="DM Sans, sans-serif"),
+                insidetextorientation="radial",
+                marker=dict(line=dict(color="#000000", width=2.5)),
+                hovertemplate=(
+                    "<b>🏷️ %{label}</b><br><br>"
+                    "💰 Monto registrado: <b>$%{value:,.0f}</b><br>"
+                    "📊 Parte del total de gastos: <b>%{percent:.1%}</b><br>"
+                    "📈 Parte de tus ingresos: <b>%{customdata[0]}</b><br>"
+                    f"📤 Total de gastos: ${total_pie:,.0f}<br>"
+                    f"📥 Total de ingresos: ${total_ingresos:,.0f}<br><br>"
+                    f"📅 Período: {fecha_desde:%d/%m/%Y} → {fecha_hasta:%d/%m/%Y}<br>"
+                    "🔎 Incluye únicamente los gastos de los filtros activos."
+                    "<extra></extra>"
+                ),
+            )
+            fig_pie.update_layout(hoverlabel=dict(bgcolor="#0a0a0a", bordercolor="#38BDF8", font=dict(size=13, color="#f8fafc")))
+            fig_pie.add_annotation(
+                text=f"${total_pie:,.0f}",
+                x=0.5, y=0.5, font=dict(size=18, color=COLOR_INGRESOS), showarrow=False,
+            )
+            from modules.anillos_neon import mostrar_anillo_neon
+            mostrar_anillo_neon(
+                fig_pie, float(total_pie), "Distribución de gastos por categoría",
+                "distribucion_categorias_neon_v20",
+            )
+        with col2:
+            base_regla = df.copy()
+            claves_regla = ["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"]
+            base_regla[claves_regla] = base_regla[claves_regla].fillna("Sin clasificar").astype(str)
+            clasificacion_regla = base_regla.groupby(claves_regla, as_index=False)["GASTOS_CANTIDAD"].sum()
+            clasificacion_regla["Grupo"] = [
+                clasificar_regla(c, s) for c, s in clasificacion_regla[claves_regla].itertuples(index=False, name=None)
+            ]
+            clasificacion_regla = clasificacion_regla.rename(columns={
+                "GASTOS_CATEGORIA": "Categoría", "GASTOS_SUBCATEGORIA": "Subcategoría",
+                "GASTOS_CANTIDAD": "Monto",
+            })
+            with controles_distribucion.expander("Revisar clasificación 50/30/20"):
+                st.caption(
+                    "Gustos corresponde a tu categoría GUSTOS. Ahorro incluye aportes explícitos a ahorro, "
+                    "inversión y fondo de tranquilidad/emergencia. El resto se propone como necesidades. "
+                    "Revisa cadenas, fondos, educación y otros conceptos ambiguos: si acumulan dinero tuyo, "
+                    "elige Ahorro; si son cuotas de deuda, Necesidades. Los abonos extra van en Ahorro. "
+                    "Los ajustes se conservan durante esta sesión; no modifican tu Excel."
+                )
+                clasificacion_regla = st.data_editor(
+                    clasificacion_regla, hide_index=True, use_container_width=True,
+                    disabled=["Categoría", "Subcategoría", "Monto"],
+                    column_config={"Grupo": st.column_config.SelectboxColumn(
+                        "Grupo", options=["Necesidades", "Gustos", "Ahorro"], required=True
+                    ), "Monto": st.column_config.NumberColumn("Monto", format="$%.0f")},
+                    key="resumen_clasificacion_503020_v19",
+                )
+            montos_regla = clasificacion_regla.groupby("Grupo")["Monto"].sum()
+            no_utilizado_resumen = max(float(total_ingresos) - float(total_gastos), 0.0)
+
+            pie_general = pd.DataFrame({
+                "Concepto": ["Necesidades", "Gustos", "Ahorro", "No utilizado"],
+                "Monto": [
+                    float(montos_regla.get("Necesidades", 0)),
+                    float(montos_regla.get("Gustos", 0)),
+                    float(montos_regla.get("Ahorro", 0)),
+                    no_utilizado_resumen,
+                ],
+            })
+
+            # Se eliminan solamente porciones de valor cero para evitar segmentos vacíos.
+            pie_general = pie_general[pie_general["Monto"].gt(0)].copy()
+
+            base_porcentaje_general = (
+                float(total_ingresos)
+                if total_ingresos > 0
+                else 0.0
+            )
+            pie_general["% de ingresos"] = (
+                pie_general["Monto"] / base_porcentaje_general * 100
+                if base_porcentaje_general > 0
+                else 0.0
+            )
+            pie_general["Etiqueta"] = pie_general["% de ingresos"].map(
+                lambda x: f"{x:.1f}%"
+            )
+
+            colores_grupos = {
+                "No utilizado": "#00FF66",
+                "Gustos": "#C084FC",
+                "Necesidades": "#38BDF8",
+                "Ahorro": "#FBBF24",
+            }
+            limites_regla = {"Necesidades": 0.50, "Gustos": 0.30, "Ahorro": 0.20}
+            if total_ingresos > 0:
+                for grupo, limite in limites_regla.items():
+                    if float(montos_regla.get(grupo, 0)) > float(total_ingresos) * limite + 0.000001:
+                        colores_grupos[grupo] = "#EF4444"
+
+            fig_pie_general = go.Figure(go.Pie(
+                labels=pie_general["Concepto"],
+                values=pie_general["Monto"],
+                hole=0.45,
+                marker=dict(
+                    colors=[colores_grupos.get(c, "#94A3B8") for c in pie_general["Concepto"]],
+                    line=dict(color="#000000", width=2.5),
+                ),
+                text=pie_general["Etiqueta"],
+                textposition="inside",
+                textinfo="label+text",
+                textfont=dict(color="#ffffff", size=12, family="DM Sans, sans-serif"),
+                insidetextorientation="radial",
+                customdata=pie_general[["% de ingresos"]],
+                hovertext=[
+                    tooltip_regla(fila["Concepto"], float(fila["Monto"]), float(total_ingresos))
+                    + f"<br><br>📅 Período: {fecha_desde:%d/%m/%Y} → {fecha_hasta:%d/%m/%Y}"
+                    + ("<br>⚠️ Hay déficit: los porcentajes sobre ingresos suman más de 100 %."
+                       if total_gastos > total_ingresos and total_ingresos > 0 else "")
+                    for _, fila in pie_general.iterrows()
+                ],
+                hovertemplate=(
+                    "%{hovertext}<extra></extra>"
+                ),
+            ))
+            fig_pie_general.update_layout(
+                hoverlabel=dict(
+                    bgcolor="#0a0a0a",
+                    bordercolor="#38BDF8",
+                    font=dict(size=13, color="#f8fafc"),
+                )
+            )
+            fig_pie_general.add_annotation(
+                text=f"${total_ingresos:,.0f}<br><span style='font-size:11px'>Ingresos</span>",
+                x=0.5,
+                y=0.5,
+                font=dict(size=17, color=COLOR_INGRESOS),
+                showarrow=False,
+            )
+            mostrar_anillo_neon(
+                fig_pie_general, float(total_ingresos), "Regla 50/30/20 sobre tus ingresos",
+                "distribucion_regla_neon_v20", regla=True,
+            )
+            controles_distribucion.caption(
+                "Distribución real de los ingresos filtrados. Referencia: Necesidades 50 % · Gustos 30 % · "
+                "Ahorro y abonos extra 20 %. Rojo indica que la categoría supera su porcentaje de referencia; "
+                "en Ahorro, superar el 20 % significa ahorrar más que la meta. "
+                "No utilizado es el saldo disponible; no se cuenta como ahorro realizado."
+            )
+            if total_ingresos > 0:
+                comparacion_regla = pd.DataFrame({
+                    "Grupo": ["Necesidades", "Gustos", "Ahorro"],
+                    "Objetivo %": [50, 30, 20],
+                    "Real %": [float(montos_regla.get(g, 0)) / float(total_ingresos) * 100
+                               for g in ["Necesidades", "Gustos", "Ahorro"]],
+                    "Referencia $": [float(total_ingresos) * p for p in [.5, .3, .2]],
+                })
+                controles_distribucion.dataframe(comparacion_regla, hide_index=True, use_container_width=True,
+                             column_config={"Real %": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "Referencia $": st.column_config.NumberColumn(format="$%.0f")})
+            else:
+                controles_distribucion.info("Sin ingresos positivos en el período no se pueden calcular porcentajes sobre ingresos.")
+
+            if total_gastos > total_ingresos and total_ingresos > 0:
+                controles_distribucion.warning(
+                    f"Los gastos superan los ingresos en ${total_gastos - total_ingresos:,.0f}; "
+                    "no hay dinero no utilizado. Los porcentajes se calculan sobre ingresos y suman más de 100 %; "
+                    "el tamaño de las porciones representa la distribución de las salidas."
+                )
+
+        seccion_resumen("6", "Análisis complementario", "Promedios de gasto y distribución de los tamaños de las transacciones; útiles para profundizar, no para la lectura inicial.")
+
+        st.markdown("#### ⏱️ Promedios de gasto")
+        st.caption(
+            f"Base: ${total_gastos:,.0f} de gastos filtrados entre {fecha_desde:%d/%m/%Y} "
+            f"y {fecha_hasta:%d/%m/%Y}: {dias_periodo} días calendario y "
+            f"{meses_equivalentes:.2f} meses equivalentes. Incluye días y meses sin gastos. "
+            "Diario = total ÷ días; semanal = diario × 7; mensual = total ÷ meses equivalentes. "
+            "Cada mes parcial cuenta como días seleccionados ÷ días de ese mes; "
+            "el semanal y el mensual son equivalentes estimados del período."
+        )
+        promedios_df = pd.DataFrame({
+            "Periodo": ["Diario", "Semanal", "Mensual"],
+            "Valor": [gasto_promedio_diario, gasto_promedio_semanal, gasto_promedio_mensual],
+        })
+        promedios_df["Fórmula"] = [
+            f"Total ÷ {dias_periodo} días calendario",
+            "Promedio diario × 7 días",
+            f"Total ÷ {meses_equivalentes:.2f} meses equivalentes".replace(".", ","),
+        ]
+        fig_prom = px.bar(
+            promedios_df, x="Periodo", y="Valor", orientation="v", text="Valor",
+            color="Periodo", color_discrete_map={"Diario":"#38BDF8","Semanal":"#C084FC","Mensual":"#34D399"},
+            custom_data=["Fórmula"],
+        )
+        fig_prom.update_traces(
+            texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+            width=.5, textfont=dict(size=16,color="#F8FAFC"),
+            marker_line=dict(color="rgba(255,255,255,.4)",width=1),
+            hovertemplate=(
+                "<b>⏱️ Promedio %{x}</b><br><br>"
+                "💰 Valor: <b>$%{y:,.0f}</b><br>"
+                "🧮 %{customdata[0]}<br>"
+                f"📅 {fecha_desde:%d/%m/%Y} → {fecha_hasta:%d/%m/%Y}<br>"
+                "ℹ️ Incluye días sin gastos.<extra></extra>"
+            ),
+        )
+        max_promedio_gasto=max(float(promedios_df["Valor"].max()),1.)
+        min_promedio_gasto=min(float(promedios_df["Valor"].min()),0.)
+        fig_prom=preparar_grafico_resumen(fig_prom,titulo="Gasto promedio diario, semanal y mensual",mostrar_leyenda=False)
+        fig_prom.update_layout(
+            height=440,margin=dict(t=85,b=55,l=85,r=40),separators=",.",
+            barcornerradius="50%",bargap=.4,
+        )
+        fig_prom.update_xaxes(title="",categoryorder="array",categoryarray=["Diario","Semanal","Mensual"],
+                             showgrid=False,tickfont=dict(size=13))
+        fig_prom.update_yaxes(title="Promedio de gasto (COP)",tickprefix="$",tickformat=",.0f",
+                             range=[min_promedio_gasto*1.25,max_promedio_gasto*1.30],gridcolor="rgba(148,163,184,.12)")
+        st.plotly_chart(
+            fig_prom,
+            use_container_width=True,
+            key="resumen_promedios_gasto_valores_visibles",
+        )
+
+        st.markdown("#### Perfil por día de la semana")
+        st.caption("Gasto neto medio por cada día de la semana, incluidos los días sin movimientos del periodo filtrado.")
+        from modules.perfil_semanal import crear_perfil_semanal
+        st.plotly_chart(
+            crear_perfil_semanal(df, fecha_desde, fecha_hasta),
+            use_container_width=True, key="resumen_perfil_dia_semana_v20",
+            config={"displaylogo": False},
+        )
+
+        # Histograma construido por intervalos para incluir el detalle de cada
+        # transacción dentro del tooltip de su barra.
+        st.markdown("#### Distribución de montos de gasto")
+        gastos_hist = df[["GASTOS_CANTIDAD", "GASTOS_DESCRIPCION"]].copy()
+        gastos_hist["GASTOS_CANTIDAD"] = pd.to_numeric(
+            gastos_hist["GASTOS_CANTIDAD"], errors="coerce"
+        )
+        gastos_hist = gastos_hist[gastos_hist["GASTOS_CANTIDAD"].notna()].copy()
+        excluidos_hist = int(gastos_hist["GASTOS_CANTIDAD"].le(0).sum())
+        gastos_hist = gastos_hist.loc[gastos_hist["GASTOS_CANTIDAD"].gt(0)].copy()
+
+        fig_hist = go.Figure()
+        if not gastos_hist.empty:
+            cantidades_hist = gastos_hist["GASTOS_CANTIDAD"].astype(float).to_numpy()
+            minimo_hist, maximo_hist = float(cantidades_hist.min()), float(cantidades_hist.max())
+            numero_intervalos_hist = min(24, max(8, int(np.sqrt(len(cantidades_hist)))))
+            bordes_hist = (
+                np.geomspace(minimo_hist, maximo_hist, numero_intervalos_hist + 1)
+                if maximo_hist > minimo_hist
+                else np.array([minimo_hist / np.sqrt(2), maximo_hist * np.sqrt(2)])
+            )
+            conteos_hist, bordes_hist = np.histogram(cantidades_hist, bins=bordes_hist)
+            gastos_hist["Intervalo"] = np.digitize(
+                cantidades_hist, bordes_hist[1:-1], right=False
+            )
+
+            centros_hist = []
+            frecuencias_hist = []
+            anchos_hist = []
+            datos_hist = []
+            for indice_hist, frecuencia_hist in enumerate(conteos_hist):
+                if frecuencia_hist <= 0:
+                    continue
+                desde_hist = float(bordes_hist[indice_hist])
+                hasta_hist = float(bordes_hist[indice_hist + 1])
+                movimientos_hist = gastos_hist[
+                    gastos_hist["Intervalo"].eq(indice_hist)
+                ].sort_values("GASTOS_CANTIDAD", ascending=False)
+                movimientos_tooltip_hist = movimientos_hist.head(5)
+
+                detalle_hist = "<br>".join(
+                    f"• {html.escape(str(descripcion).strip() if pd.notna(descripcion) and str(descripcion).strip() else 'Sin descripción')}: "
+                    f"<b>${float(valor):,.0f}</b>".replace(",", ".")
+                    for descripcion, valor in movimientos_tooltip_hist[
+                        ["GASTOS_DESCRIPCION", "GASTOS_CANTIDAD"]
+                    ].itertuples(index=False, name=None)
+                )
+                centros_hist.append((desde_hist + hasta_hist) / 2)
+                frecuencias_hist.append(int(frecuencia_hist))
+                anchos_hist.append((hasta_hist - desde_hist) * 0.94)
+                datos_hist.append([
+                    f"${desde_hist:,.0f} – ${hasta_hist:,.0f}".replace(",", "."),
+                    detalle_hist,
+                    float(movimientos_hist["GASTOS_CANTIDAD"].sum()),
+                    int(frecuencia_hist) / len(cantidades_hist) * 100,
+                ])
+
+            fig_hist.add_trace(go.Bar(
+                x=centros_hist,
+                y=frecuencias_hist,
+                width=anchos_hist,
+                customdata=datos_hist,
+                marker=dict(
+                    color=frecuencias_hist, colorscale=[[0,"#155E75"],[1,"#38BDF8"]],
+                    line=dict(color="#7DD3FC", width=1),
+                ),
+                hovertemplate=(
+                    "<b>📦 Rango de gasto: %{customdata[0]}</b><br>"
+                    "🔢 Transacciones: <b>%{y}</b><br>"
+                    "📊 Parte de los pagos: <b>%{customdata[3]:.2f}%</b><br>"
+                    "💰 Total del rango: <b>$%{customdata[2]:,.0f}</b><br><br>"
+                    "<b>Hasta 5 gastos más altos del rango:</b><br>%{customdata[1]}"
+                    "<extra></extra>"
+                ),
+            ))
+        fig_hist.update_layout(
+            hoverlabel=dict(
+                bgcolor="#0a0a0a",
+                bordercolor="#38BDF8",
+                font=dict(size=13, color="#f8fafc"),
+                align="left",
+            )
+        )
+        fig_hist.update_xaxes(type="log", title_text="Monto del gasto (COP) · escala logarítmica",tickprefix="$",tickformat=",.0f",automargin=True)
+        fig_hist.update_yaxes(title_text="Número de transacciones",rangemode="tozero",tickformat=",.0f",automargin=True)
+        fig_hist = preparar_grafico_resumen(fig_hist,titulo="Distribución de montos de gasto",mostrar_leyenda=False)
+        fig_hist.update_layout(height=500,separators=",.",margin=dict(t=75,b=115,l=80,r=35),bargap=.06,barcornerradius="15%")
+        # La escala logarítmica automática añadía etiquetas intermedias muy juntas.
+        # Mostrar como máximo seis montos, manteniendo las barras y sus rangos exactos.
+        if not gastos_hist.empty:
+            marcas_montos_hist = sorted(set(
+                float(f"{valor:.2g}") for valor in np.geomspace(
+                    float(bordes_hist[0]), float(bordes_hist[-1]), 6
+                )
+            ))
+            fig_hist.update_xaxes(
+                tickmode="array", tickvals=marcas_montos_hist,
+                ticktext=[f"${valor:,.0f}".replace(",", ".") for valor in marcas_montos_hist],
+                tickangle=-35, tickfont=dict(size=11),
+                ticklabelstandoff=10, automargin=True,
+                minor=dict(ticks="", showgrid=False), minorloglabels="none",
+            )
+        st.caption(
+            "Intervalos logarítmicos: cada barra reúne pagos de un rango proporcional de montos. "
+            "La altura muestra cuántos pagos hay, sin transformar el número de transacciones. "
+            + (f"Se excluyen {excluidos_hist} movimientos de importe cero o negativo. " if excluidos_hist else "")
+        )
+        if gastos_hist.empty:
+            st.info("No hay gastos positivos para construir la distribución logarítmica.")
+        st.plotly_chart(
+            fig_hist,
+            use_container_width=True,
+            key="resumen_distribucion_montos_gasto",
+        )
+
+    if pestana_activa == etiquetas_pestanas[0]:
+        st.divider()
+        st.markdown("## Profundización ejecutiva")
+        st.subheader("Ingresos, gastos, presupuesto y balance")
+        st.caption("Cruce de ingresos transaccionales, clasificados por su fecha real, contra los gastos filtrados.")
+
+        flujo = construir_flujo_mensual(
+            gastos_df=df,
+            ingresos_df=ingresos_filtrados,
+            meses_sel=meses_sel,
+            presupuesto_mensual=presupuesto_mensual_por_periodo or presupuesto_mensual_general,
+            periodos_sel=periodos_sel,
+        )
+
+        c5, c6, c7 = st.columns(3)
+        tarjeta_perfil_patrimonio(
+            c5, "🐷 Capacidad de ahorro",
+            f"{(balance / total_ingresos * 100):.1f}%" if total_ingresos else "0%",
+            delta="Balance como porcentaje de los ingresos",
+            help=AYUDA_TARJETAS["Capacidad de ahorro"],
+            icono_resumen="🐷", titulo_resumen="Capacidad de ahorro",
+        )
+        tarjeta_estilo_gac(
+            c6, "Promedio ingresos/mes",
+            f"${flujo['Ingresos'].mean():,.0f}" if not flujo.empty else "$0",
+            "Promedio de ingresos de los meses incluidos en el período", "#52e0a4", "💰",
+        )
+        tarjeta_estilo_gac(
+            c7, "Promedio gastos/mes",
+            f"${flujo['Gastos'].mean():,.0f}" if not flujo.empty else "$0",
+            "Promedio de gastos de los meses incluidos en el período", "#ff526e", "💸",
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_cmp = go.Figure()
+
+            # Color dinámico de la barra de gastos:
+            # Azul neón  = gastos por debajo o igual al presupuesto mensual.
+            # Rosa neón  = gastos por encima del presupuesto, pero sin superar los ingresos.
+            # Rojo fuerte = gastos por encima de los ingresos del mes.
+            def color_gasto_ejecutivo(gasto, presupuesto, ingreso):
+                if gasto > ingreso and ingreso > 0:
+                    return "#FF0033"  # rojo fuerte
+                if presupuesto > 0 and gasto > presupuesto:
+                    return "#FF2E9A"  # rosa neón
+                return "#00F0FF"      # azul neón
+
+            colores_gastos = [
+                color_gasto_ejecutivo(g, p, i)
+                for g, p, i in zip(
+                    flujo["Gastos"],
+                    flujo["Presupuesto mensual"],
+                    flujo["Ingresos"],
+                )
+            ]
+
+            fig_cmp.add_trace(go.Bar(
+                x=flujo["MES"], y=flujo["Gastos"], name="Gastos",
+                marker=dict(
+                    color=colores_gastos,
+                    line=dict(color=colores_gastos, width=1.5)
+                ),
+                customdata=flujo[["Ingresos", "Presupuesto mensual", "Balance"]],
+                text=flujo["Gastos"], texttemplate="$%{text:,.0f}", textposition="outside",
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "Gastos: $%{y:,.0f}<br>"
+                    "Ingresos: $%{customdata[0]:,.0f}<br>"
+                    "Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "Balance: $%{customdata[2]:,.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_cmp.add_trace(go.Scatter(
+                x=flujo["MES"], y=flujo["Ingresos"], name="Ingresos",
+                mode="lines+markers+text", line=dict(color=COLOR_INGRESOS, width=4, shape="spline"),
+                marker=dict(size=10, color=COLOR_INGRESOS), text=flujo["Ingresos"],
+                texttemplate="$%{text:,.0f}", textposition="top center",
+                customdata=flujo[["Gastos", "Presupuesto mensual", "Balance"]],
+                hovertemplate=(
+                    "<b>📅 %{x}</b><br><br>"
+                    "💵 Ingresos: <b>$%{y:,.0f}</b><br>"
+                    "🧾 Gastos: $%{customdata[0]:,.0f}<br>"
+                    "🎯 Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "⚖️ Balance: $%{customdata[2]:,.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_cmp.add_trace(go.Scatter(
+                x=flujo["MES"], y=flujo["Presupuesto mensual"], name="Presupuesto mensual",
+                mode="lines+markers", line=dict(color=COLOR_PRESUPUESTO, width=3, dash="dash"),
+                marker=dict(size=8, color=COLOR_PRESUPUESTO),
+                hovertemplate="🎯 <b>%{x}</b><br>Meta presupuestal: <b>$%{y:,.0f}</b><br>Esta línea representa el límite planificado para el mes.<extra></extra>",
+            ))
+            fig_cmp.add_trace(go.Scatter(
+                x=flujo["MES"], y=flujo["Balance"], name="Balance",
+                mode="lines+markers", line=dict(color="#B026FF", width=2.4),
+                marker=dict(size=7, color="#B026FF"),
+                customdata=flujo[["Ingresos", "Gastos"]],
+                hovertemplate=(
+                    "<b>⚖️ Balance de %{x}</b><br><br>"
+                    "💵 Ingresos: $%{customdata[0]:,.0f}<br>"
+                    "🧾 Gastos: $%{customdata[1]:,.0f}<br>"
+                    "💰 Resultado neto: <b>$%{y:,.0f}</b>"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_cmp.update_layout(
+                hovermode="x unified",
+                xaxis=dict(title="Mes", categoryorder="array", categoryarray=MESES_ORDEN),
+                yaxis=dict(title="Valor", tickformat=",.0f"),
+                bargap=0.28,
+            )
+            st.plotly_chart(estilo_grafico(fig_cmp, "Ejecutivo mensual: gastos, ingresos, presupuesto y balance"), use_container_width=True)
+        with col2:
+            st.plotly_chart(crear_gauge_salud(balance, total_ingresos), use_container_width=True)
+
+        alto_graficos_comparados = 460
+        st.markdown("""
+        <style>
+        .st-key-mapa_voronoi_resumen_v22 {width:100%;max-width:none;margin:0;}
+        .st-key-mapa_voronoi_resumen_v22 iframe {display:block;width:100% !important;height:460px !important;aspect-ratio:auto;border:0;}
+        .st-key-mapa_voronoi_resumen_v22 [data-testid="stElementContainer"]:has(iframe) {height:460px !important;min-height:0 !important;}
+        </style>
+        """, unsafe_allow_html=True)
+        col3, col4 = st.columns(2, gap="large")
+        with col3:
+            flujo_diario_resumen, eventos_flujo_resumen = construir_flujo_caja_diario(
+                df, ingresos_filtrados, fecha_desde, fecha_hasta,
+            )
+            fig_acum = crear_figura_flujo_caja_diario(flujo_diario_resumen, eventos_flujo_resumen)
+            fig_acum.update_layout(height=alto_graficos_comparados)
+            st.plotly_chart(fig_acum, use_container_width=True, key="flujo_caja_diario_resumen_v22")
+            st.caption("Acumulado desde cero al inicio del período seleccionado. Incluye los días sin movimientos; no representa el saldo bancario disponible.")
+        with col4:
+            import streamlit.components.v1 as componentes_mapa_voronoi
+            with st.container(key="mapa_voronoi_resumen_v22"):
+                try:
+                    html_voronoi_resumen, alto_voronoi_resumen, detalle_voronoi_resumen = crear_mapa_gastos_voronoi(df, fecha_desde, fecha_hasta, alto_panel=alto_graficos_comparados)
+                    if html_voronoi_resumen:
+                        componentes_mapa_voronoi.html(html_voronoi_resumen, height=alto_voronoi_resumen, scrolling=False)
+                        with st.expander("Ver detalle del mapa", expanded=False):
+                            st.dataframe(detalle_voronoi_resumen, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No hay categorías con gasto neto positivo para dibujar el mapa en este período.")
+                except ValueError as error_mapa_voronoi:
+                    st.info(str(error_mapa_voronoi))
+
+        st.markdown("#### Resumen mensual ejecutivo")
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(flujo, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("""<style>
+        .st-key-momentum_panel_v22 {background:radial-gradient(ellipse at 10% 0%,#35205A66,transparent 55%),linear-gradient(145deg,#111B30,#07111F 75%);border:1px solid #6B5CA3;border-radius:22px;padding:20px;box-shadow:0 0 24px #8650ED15,inset 0 1px 0 #BC9AFF22;}
+        .st-key-momentum_cabecera_v22 [data-testid="stHorizontalBlock"] {align-items:center;}
+        .st-key-momentum_cabecera_v22 [role="radiogroup"] {display:flex;flex-wrap:wrap;gap:6px 12px;}
+        .st-key-momentum_cabecera_v22 [role="radiogroup"] label {min-width:0;margin-right:0;}
+        .st-key-momentum_cabecera_v22 [role="radiogroup"] label p {font-size:12px;white-space:normal;}
+        .st-key-momentum_cabecera_v22 h3 {font-size:20px;line-height:1.25;padding:0;}
+        .st-key-momentum_panel_v22 [data-testid="stPlotlyChart"] {border-radius:16px;overflow:hidden;}
+        .st-key-momentum_panel_v22 .momentum-periodos {display:flex;flex-wrap:wrap;gap:12px;margin:14px 0;}
+        .st-key-momentum_panel_v22 .momentum-periodo {flex:1;min-width:210px;padding:12px 16px;background:#111F33;border:1px solid #213C58;border-radius:12px;color:#E2E8F0;}
+        .st-key-momentum_panel_v22 .momentum-periodo small {display:block;color:#94A3B8;margin-bottom:5px;}
+        .st-key-momentum_panel_v22 .momentum-nuevos {padding:12px 16px;margin:8px 0;background:#111F33;border-left:3px solid #A78BFA;border-radius:10px;color:#E2E8F0;line-height:1.8;}
+        </style>""", unsafe_allow_html=True)
+        st.markdown("""<style>
+        .st-key-escudos_estado_v22 {background:radial-gradient(ellipse at 100% 0%,#1685FF22,transparent 55%),linear-gradient(145deg,#111B30,#07111F 75%);border:1px solid #52628E;border-radius:22px;padding:20px;box-shadow:0 0 24px #1685FF12,inset 0 1px 0 #BC9AFF22;}
+        .st-key-escudos_estado_v22 .escudos-fechas {padding:12px;background:#111F33;border:1px solid #213C58;border-radius:12px;color:#E2E8F0;text-align:center;font-weight:600;}
+        </style>""",unsafe_allow_html=True)
+        st.markdown("""<style>
+        .st-key-momentum_escudos_fila_v22 {container-type:inline-size;width:100%;max-width:100%;min-width:0;}
+        .st-key-momentum_escudos_fila_v22 [data-testid="stColumn"] {min-width:0;}
+        .st-key-momentum_panel_v22,.st-key-escudos_estado_v22 {box-sizing:border-box !important;width:100% !important;max-width:100%;min-width:0;padding:clamp(12px,1.5vw,20px);}
+        .st-key-momentum_escudos_fila_v22 [data-testid="stVerticalBlock"],
+        .st-key-momentum_escudos_fila_v22 [data-testid="stElementContainer"],
+        .st-key-momentum_escudos_fila_v22 [data-testid="stSelectbox"],
+        .st-key-momentum_escudos_fila_v22 [data-testid="stExpander"] {box-sizing:border-box;min-width:0;max-width:100%;}
+        .st-key-momentum_panel_v22 .momentum-periodos {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,210px),1fr));gap:10px;}
+        .st-key-momentum_panel_v22 .momentum-periodo {box-sizing:border-box;min-width:0;width:100%;padding:10px 12px;overflow-wrap:anywhere;}
+        .st-key-momentum_panel_v22 .momentum-nuevos,
+        .st-key-escudos_estado_v22 .escudos-fechas {box-sizing:border-box;max-width:100%;min-width:0;overflow-wrap:anywhere;}
+        .st-key-momentum_escudos_fila_v22 [data-testid="stMarkdownContainer"] {overflow-wrap:anywhere;}
+        .st-key-escudos_estado_v22 iframe {display:block;width:100% !important;max-width:100%;border:0;}
+        .st-key-escudos_estado_v22 {box-sizing:border-box !important;background:radial-gradient(ellipse at 90% 0%,#1262B833,transparent 60%),linear-gradient(145deg,#10192F,#07111F 75%);border:1px solid #546CA2;border-radius:22px;padding:16px !important;box-shadow:inset 0 1px 0 #B6CEFF22;}
+        .st-key-escudos_estado_v22 [data-testid="stExpander"] {box-sizing:border-box;width:100%;max-width:100%;min-width:0;border-radius:12px;background:#111F33;}
+        .st-key-escudos_estado_v22 [data-testid="stForm"] {box-sizing:border-box;max-width:100%;min-width:0;padding:0;}
+        .st-key-controles_porcentajes_escudo_v22 [data-testid="stHorizontalBlock"] {flex-wrap:nowrap !important;gap:8px !important;}
+        .st-key-controles_porcentajes_escudo_v22 [data-testid="stColumn"] {flex:1 1 0 !important;width:calc((100% - 16px)/3) !important;min-width:0 !important;}
+        .st-key-controles_porcentajes_escudo_v22 [data-testid="stNumberInput"] {min-width:0;max-width:100%;}
+        .st-key-controles_porcentajes_escudo_v22 input {text-align:center;min-width:0;font-weight:700;}
+
+        @container (max-width:1050px) {
+            .st-key-momentum_escudos_fila_v22 > [data-testid="stHorizontalBlock"],
+            .st-key-momentum_escudos_fila_v22 > [data-testid="stVerticalBlock"] > [data-testid="stHorizontalBlock"] {flex-direction:column !important;gap:20px !important;}
+            .st-key-momentum_escudos_fila_v22 > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"],
+            .st-key-momentum_escudos_fila_v22 > [data-testid="stVerticalBlock"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {width:100% !important;flex:1 1 100% !important;}
+        }
+        </style>""",unsafe_allow_html=True)
+        with st.container(key="momentum_escudos_fila_v22"):
+            columna_momentum, columna_escudos = st.columns([1.65,1],gap="large")
+            with columna_momentum:
+                with st.container(key="momentum_panel_v22"):
+                    with st.container(key="momentum_cabecera_v22"):
+                        momentum_titulo_col, momentum_opciones_col = st.columns([1,1.8],gap="small")
+                        with momentum_titulo_col:
+                            st.markdown("### 🎯 Momentum de gastos")
+                        with momentum_opciones_col:
+                            momentum_modo = st.radio(
+                                "Comparar", ["Último mes completo", "Mes en curso del filtro", "Período filtrado"],
+                                index=0, horizontal=True, label_visibility="collapsed",
+                                key="momentum_reglas_periodos_radio_v22",
+                            )
+                    try:
+                        ma,mb,pa,pb,momentum_regla = resolver_periodos_momentum(gastos,fecha_desde,fecha_hasta,momentum_modo)
+                        momentum_tabla, momentum_desde, momentum_hasta, momentum_historial = preparar_momentum_gastos(gastos,ma,mb,rango_anterior=(pa,pb))
+                        if not momentum_historial:
+                            ma,mb,pa,pb,momentum_regla = dividir_periodo_momentum(gastos,fecha_desde,fecha_hasta)
+                            momentum_tabla, momentum_desde, momentum_hasta, momentum_historial = preparar_momentum_gastos(gastos,ma,mb,rango_anterior=(pa,pb))
+                        st.markdown(f'<div style="font-size:11px;line-height:1.5;color:#94A3B8;margin:2px 0 8px;overflow-wrap:anywhere;">{ma:%d/%m/%Y}–{mb:%d/%m/%Y} vs. {pa:%d/%m/%Y}–{pb:%d/%m/%Y}</div>', unsafe_allow_html=True)
+                        momentum_fig, momentum_umbral = crear_figura_momentum_gastos(momentum_tabla, periodos=(ma,mb,pa,pb))
+                        if momentum_fig is not None:
+                            st.plotly_chart(momentum_fig, use_container_width=True, key="momentum_gastos_resumen_v22", config={"displayModeBar": False, "responsive": True})
+                        else:
+                            st.info("No hay categorías con base anterior positiva para calcular la variación.")
+                    except ValueError as error_momentum:
+                        st.info(str(error_momentum))
+
+            with columna_escudos:
+                with st.container(key="escudos_estado_v22"):
+                    import streamlit.components.v1 as componentes_escudos
+                    metas_escudo = st.session_state.get("metas_escudo_v22", metas_escudo_excel)
+                    escudos_registros = preparar_escudos_estado(montos_regla,total_ingresos,objetivos=metas_escudo)
+                    componentes_escudos.html(crear_escudos_estado_html(escudos_registros,periodos=(fecha_desde,fecha_hasta)),height=550,scrolling=False)
+                    with st.container(key="controles_porcentajes_escudo_v22"):
+                        def _restablecer_metas_escudo():
+                            st.session_state['metas_escudo_v22'] = dict(metas_escudo_excel)
+                            for nombre,valor in [('necesidades',metas_escudo_excel['Necesidades']),('gustos',metas_escudo_excel['Gustos']),('ahorro',metas_escudo_excel['Ahorro'])]:
+                                st.session_state['meta_escudo_'+nombre+'_v22'] = valor
+                        with st.form("form_metas_escudo_v22", border=False):
+                            control_necesidades, control_gustos, control_ahorro = st.columns(3, gap="small")
+                            with control_necesidades:
+                                meta_necesidades = st.number_input("Necesidades (%)", min_value=0.0, max_value=100.0, value=float(metas_escudo['Necesidades']), step=1.0, key="meta_escudo_necesidades_v22", label_visibility="collapsed")
+                            with control_gustos:
+                                meta_gustos = st.number_input("Gustos (%)", min_value=0.0, max_value=100.0, value=float(metas_escudo['Gustos']), step=1.0, key="meta_escudo_gustos_v22", label_visibility="collapsed")
+                            with control_ahorro:
+                                meta_ahorro = st.number_input("Ahorro (%)", min_value=0.0, max_value=100.0, value=float(metas_escudo['Ahorro']), step=1.0, key="meta_escudo_ahorro_v22", label_visibility="collapsed")
+                            boton_aplicar_col, boton_restablecer_col = st.columns(2, gap="small")
+                            with boton_aplicar_col:
+                                aplicar_metas_escudo = st.form_submit_button("Aplicar porcentajes", use_container_width=True)
+                            with boton_restablecer_col:
+                                st.form_submit_button("Restablecer valores del Excel", on_click=_restablecer_metas_escudo, use_container_width=True)
+                            if aplicar_metas_escudo:
+                                if abs(meta_necesidades+meta_gustos+meta_ahorro-100.0) > 1e-9:
+                                    st.error("Los tres porcentajes deben sumar 100 %. Se mantienen las últimas metas válidas.")
+                                else:
+                                    st.session_state['metas_escudo_v22'] = {'Necesidades':meta_necesidades,'Gustos':meta_gustos,'Ahorro':meta_ahorro}
+                                    st.rerun()
+                    if total_ingresos <= 0:
+                        st.info("Sin ingresos positivos no se pueden calcular los porcentajes de los escudos.")
+
+        with st.expander("Distribución por días", expanded=False):
+            st.caption("Cada anillo es una semana de lunes a domingo y cada posición angular un día de la semana. Los anillos se identifican como S01, S02…; a la derecha aparecen las fechas completas incluidas de cada semana. La más antigua está dentro y la más reciente fuera. Escala: $0 en verde, el promedio diario del periodo en amarillo y los importes superiores en rojo. El rojo alcanza su máxima intensidad al doble del promedio. El promedio incluye días sin movimientos como cero. Los ajustes negativos quedan en el extremo verde y las fechas fuera del filtro no se dibujan.")
+            from modules.polar_noche import crear_polar_noche
+            import streamlit.components.v1 as componentes_polar
+            contenido_polar, altura_polar = crear_polar_noche(df, fecha_desde, fecha_hasta)
+            st.markdown(
+                f'<style>.st-key-polar_noche_resumen_v20 iframe {{width:100% !important;'
+                f'height:auto !important;aspect-ratio:1200 / {altura_polar};'
+                f'display:block;border:0;max-height:none !important;}}</style>',
+                unsafe_allow_html=True,
+            )
+            with st.container(key="polar_noche_resumen_v20"):
+                componentes_polar.html(contenido_polar, height=altura_polar, scrolling=False)
+
+
+    if pestana_activa == etiquetas_pestanas[1]:
+        # Corrige el marco existente: sin padding externo y con el borde delante del lienzo.
+        st.markdown("""<style>
+        [data-testid="stPlotlyChart"] {
+            position:relative;
+            box-sizing:border-box !important;
+            padding:0 !important;
+            border:0 !important;
+            width:100%;max-width:100%;min-width:0;
+            border-radius:18px;
+            overflow:hidden;
+            isolation:isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content:"";position:absolute;inset:0;
+            box-sizing:border-box;
+            border:1px solid rgba(0,240,255,.55);
+            border-radius:18px;
+            pointer-events:none;
+            z-index:10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing:border-box;
+            width:100% !important;max-width:100%;min-width:0;
+        }
+        </style>""", unsafe_allow_html=True)
+        contexto_pestana("¿En qué se me va el dinero?", "Organiza todos los gastos por categoría, subcategoría, naturaleza y transacciones para identificar qué movimientos explican el uso del dinero.")
+
+        # ======================================================
+        # 1. PANORAMA GENERAL DEL GASTO
+        # ======================================================
+        st.markdown("## 1. Panorama general del gasto")
+        st.caption("Respuesta rápida antes de entrar en categorías, subcategorías y movimientos individuales.")
+
+        gastos_panorama = agregar_tipo_gasto(df)
+        resumen_cat_panorama = (
+            df.groupby("GASTOS_CATEGORIA", dropna=False)["GASTOS_CANTIDAD"]
+            .sum().sort_values(ascending=False)
+        ) if not df.empty else pd.Series(dtype=float)
+        resumen_sub_panorama = (
+            df.groupby("GASTOS_SUBCATEGORIA", dropna=False)["GASTOS_CANTIDAD"]
+            .sum().sort_values(ascending=False)
+        ) if not df.empty else pd.Series(dtype=float)
+
+        categoria_principal = str(resumen_cat_panorama.index[0]) if not resumen_cat_panorama.empty else "Sin datos"
+        subcategoria_principal = str(resumen_sub_panorama.index[0]) if not resumen_sub_panorama.empty else "Sin datos"
+        total_panorama = float(df["GASTOS_CANTIDAD"].sum()) if not df.empty else 0.0
+        fijo_panorama = float(gastos_panorama.loc[gastos_panorama["TIPO_GASTO"].eq("Fijo"), "GASTOS_CANTIDAD"].sum()) if not gastos_panorama.empty else 0.0
+        variable_panorama = float(gastos_panorama.loc[gastos_panorama["TIPO_GASTO"].eq("Variable"), "GASTOS_CANTIDAD"].sum()) if not gastos_panorama.empty else 0.0
+        pct_fijo_panorama = fijo_panorama / total_panorama * 100 if total_panorama else 0.0
+        pct_variable_panorama = variable_panorama / total_panorama * 100 if total_panorama else 0.0
+
+        gp1, gp2, gp3 = st.columns(3)
+        tarjeta_perfil_gastos(gp1, '💸 Gasto total', f"${total_panorama:,.0f}")
+        tarjeta_perfil_gastos(gp2, '🧾 Transacciones', f"{len(df):,}")
+        tarjeta_perfil_gastos(gp3, '🏷️ Categoría principal', categoria_principal)
+        gp4, gp5, gp6 = st.columns(3)
+        tarjeta_perfil_gastos(gp4, '📌 Subcategoría principal', subcategoria_principal)
+        tarjeta_perfil_gastos(gp5, '🔒 Gasto fijo', f"{pct_fijo_panorama:.1f}%")
+        tarjeta_perfil_gastos(gp6, '🎚️ Gasto variable', f"{pct_variable_panorama:.1f}%")
+
+        # ======================================================
+        # 2. CONCENTRACIÓN Y NATURALEZA DEL GASTO
+        # ======================================================
+        st.markdown("## 2. Concentración y naturaleza del gasto")
+        st.caption("Identifica si el gasto está concentrado en pocas categorías o en movimientos excepcionales.")
+
+        top3_monto = float(resumen_cat_panorama.head(3).sum()) if not resumen_cat_panorama.empty else 0.0
+        top3_pct = top3_monto / total_panorama * 100 if total_panorama else 0.0
+        top10_tx_monto = float(df.nlargest(min(10, len(df)), "GASTOS_CANTIDAD")["GASTOS_CANTIDAD"].sum()) if not df.empty else 0.0
+        top10_tx_pct = top10_tx_monto / total_panorama * 100 if total_panorama else 0.0
+        extraordinario_panorama = float(
+            gastos_panorama.loc[gastos_panorama["TIPO_GASTO"].eq("Extraordinario"), "GASTOS_CANTIDAD"].sum()
+        ) if not gastos_panorama.empty else 0.0
+        gasto_habitual = max(total_panorama - extraordinario_panorama, 0.0)
+        pct_extraordinario_panorama = extraordinario_panorama / total_panorama * 100 if total_panorama else 0.0
+
+        cg1, cg2, cg3, cg4 = st.columns(4)
+        tarjeta_perfil_gastos(cg1, '🏆 Top 3 categorías', f"{top3_pct:.1f}%", f"${top3_monto:,.0f}")
+        tarjeta_perfil_gastos(cg2, '🔝 Top 10 movimientos', f"{top10_tx_pct:.1f}%", f"${top10_tx_monto:,.0f}")
+        tarjeta_perfil_gastos(cg3, '🏠 Gasto habitual', f"${gasto_habitual:,.0f}")
+        tarjeta_perfil_gastos(cg4, '⚡ Extraordinario', f"{pct_extraordinario_panorama:.1f}%", f"${extraordinario_panorama:,.0f}")
+
+        if top3_pct >= 70:
+            st.warning(f"El gasto está muy concentrado: las tres categorías principales explican el {top3_pct:.1f}% del total.")
+        elif top3_pct >= 50:
+            st.info(f"Las tres categorías principales explican el {top3_pct:.1f}% del gasto.")
+        else:
+            st.success(f"El gasto está relativamente distribuido: las tres categorías principales representan el {top3_pct:.1f}%.")
+
+        st.divider()
+        from modules.categorias_tarjetas import crear_mapa_tarjetas
+        import streamlit.components.v1 as componentes_categorias
+        html_categorias, alto_categorias = crear_mapa_tarjetas(
+            fig_jerarquia_categorias(df, presupuesto_cat, presupuesto_sub, tipo="treemap")
+        )
+        if html_categorias:
+            st.markdown(
+                f'<style>.st-key-mapa_categorias_noche_v20 iframe {{width:100% !important;'
+                f'height:auto !important;aspect-ratio:1200 / {alto_categorias};'
+                f'display:block;border:0;max-height:none !important;}}</style>',
+                unsafe_allow_html=True,
+            )
+            with st.container(key="mapa_categorias_noche_v20"):
+                componentes_categorias.html(html_categorias, height=alto_categorias, scrolling=False)
+        else:
+            st.info("No hay importes positivos para mostrar el mapa de categorías.")
+        from modules.sunburst_noche import aplicar_sunburst_noche
+        if st.button("↩ VER TODAS LAS CATEGORÍAS", key="volver_sunburst_categorias_v20",
+                     help="Vuelve al gráfico completo después de entrar en una categoría."):
+            st.session_state["sunburst_categorias_reinicio_v20"] = st.session_state.get("sunburst_categorias_reinicio_v20", 0) + 1
+        st.plotly_chart(
+            aplicar_sunburst_noche(
+                fig_jerarquia_categorias(df, presupuesto_cat, presupuesto_sub, tipo="sunburst")
+            ),
+            use_container_width=True,
+            config={"displaylogo": False, "toImageButtonOptions": {"filename": "Altium_Noche_anillos", "scale": 2}},
+            key=f"categorias_sunburst_noche_v20_{st.session_state.get('sunburst_categorias_reinicio_v20', 0)}",
+        )
+
+        # ======================================================
+        st.divider()
+        st.markdown("## 4. ¿En qué subcategorías gasto?")
+        st.subheader("📂 Análisis por subcategorías")
+        st.caption(
+            "Pasa el mouse sobre cualquier barra, porción, bloque o celda para ver el detalle completo: "
+            "gasto, presupuesto, diferencia, % del total y número de transacciones."
+        )
+        sub_df = df.copy()
+        sub_df["GASTOS_SUBCATEGORIA"] = sub_df["GASTOS_SUBCATEGORIA"].fillna("Sin subcategoría")
+        sub_df["GASTOS_SUBCATEGORIA_2"] = sub_df["GASTOS_SUBCATEGORIA_2"].fillna("Sin detalle")
+
+        total_sub = float(sub_df["GASTOS_CANTIDAD"].sum()) or 1.0
+
+        # Presupuesto por subcategoría (toma el mayor valor si el nombre se repite entre categorías)
+        lookup_sub = {}
+        for cat, sub in sub_df[["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"]].drop_duplicates().itertuples(index=False):
+            pres = buscar_presupuesto_sub(cat, sub, presupuesto_sub)
+            lookup_sub[sub] = max(lookup_sub.get(sub, 0), pres)
+
+        resumen_corto = (
+            sub_df.groupby("GASTOS_SUBCATEGORIA")
+            .agg(monto=("GASTOS_CANTIDAD", "sum"), transacciones=("GASTOS_CANTIDAD", "count"))
+            .reset_index()
+            .sort_values("monto", ascending=False)
+        )
+        resumen_corto["presupuesto"] = resumen_corto["GASTOS_SUBCATEGORIA"].map(lambda s: lookup_sub.get(s, 0))
+        resumen_corto["pct_total"] = resumen_corto["monto"] / total_sub * 100
+        resumen_corto["hover"] = [
+            tooltip_jerarquia("", r.GASTOS_SUBCATEGORIA, r.monto, r.presupuesto, r.transacciones, r.pct_total)
+            for r in resumen_corto.itertuples()
+        ]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_bar_sub = go.Figure(
+                go.Bar(
+                    x=resumen_corto["monto"],
+                    y=resumen_corto["GASTOS_SUBCATEGORIA"],
+                    orientation="h",
+                    marker=dict(
+                        color=resumen_corto["monto"],
+                        colorscale=COLORSCALE_SUBCATEGORIAS,
+                        line=dict(color="rgba(196,181,253,0.6)", width=1),
+                    ),
+                    customdata=resumen_corto["hover"],
+                    hovertemplate="%{customdata}<extra></extra>",
+                )
+            )
+            fig_bar_sub.update_layout(
+                xaxis_title="Monto",
+                yaxis_title="Subcategoría",
+                yaxis=dict(autorange="reversed"),
+                hoverlabel=dict(bgcolor="#0a0a0a", bordercolor="#6366f1", font=dict(size=13, color="#f8fafc")),
+            )
+            st.plotly_chart(
+                estilo_grafico(fig_bar_sub, titulo="Gasto total por subcategoría"),
+                use_container_width=True,
+            )
+        with col2:
+            top10 = resumen_corto.head(10)
+            fig_pie_sub = go.Figure(
+                go.Pie(
+                    labels=top10["GASTOS_SUBCATEGORIA"],
+                    values=top10["monto"],
+                    hole=0.4,
+                    marker=dict(colors=PALETA_SUBCATEGORIAS, line=dict(color="#000000", width=2)),
+                    textposition="inside",
+                    textinfo="percent+label",
+                    textfont=dict(color="#ffffff", size=11),
+                    customdata=top10["hover"],
+                    hovertemplate="%{customdata}<extra></extra>",
+                )
+            )
+            fig_pie_sub.update_layout(
+                hoverlabel=dict(bgcolor="#0a0a0a", bordercolor="#6366f1", font=dict(size=13, color="#f8fafc")),
+            )
+            st.plotly_chart(
+                estilo_grafico(fig_pie_sub, titulo="Top 10 subcategorías"),
+                use_container_width=True,
+            )
+
+        st.markdown("#### Jerarquía: categoría → subcategoría → detalle")
+
+    if pestana_activa == etiquetas_pestanas[1]:
+        st.divider()
+        # ======================================================
+        # 4. TRANSACCIONES QUE EXPLICAN EL GASTO
+        # ======================================================
+        st.markdown("## 5. ¿Qué movimientos explican el gasto?")
+        st.caption("Identifica las operaciones individuales de mayor valor y las descripciones que más se repiten.")
+
+        if df.empty:
+            st.info("No hay transacciones para mostrar con los filtros actuales.")
+        else:
+            columnas_top = [c for c in [
+                "GASTOS_FECHA", "GASTOS_DESCRIPCION", "GASTOS_CATEGORIA",
+                "GASTOS_SUBCATEGORIA", "GASTOS_SUBCATEGORIA_2", "GASTOS_CANTIDAD"
+            ] if c in df.columns]
+            top_movimientos = df[columnas_top].sort_values("GASTOS_CANTIDAD", ascending=False).head(20).copy()
+            if "GASTOS_FECHA" in top_movimientos.columns:
+                top_movimientos["GASTOS_FECHA"] = pd.to_datetime(top_movimientos["GASTOS_FECHA"], errors="coerce").dt.strftime("%d/%m/%Y")
+
+            tm1, tm2 = st.columns([1.35, 1])
+            with tm1:
+                st.markdown("#### Top 20 transacciones")
+                with st.expander("Ver tabla", expanded=False):
+                    st.dataframe(top_movimientos, use_container_width=True, hide_index=True)
+            with tm2:
+                if "GASTOS_DESCRIPCION" in df.columns:
+                    descripcion_resumen = (
+                        df.assign(GASTOS_DESCRIPCION=df["GASTOS_DESCRIPCION"].fillna("Sin descripción"))
+                        .groupby("GASTOS_DESCRIPCION", as_index=False)
+                        .agg(Monto=("GASTOS_CANTIDAD", "sum"), Transacciones=("GASTOS_CANTIDAD", "count"))
+                        .sort_values("Monto", ascending=False).head(12)
+                    )
+                    descripcion_resumen["Promedio"] = (
+                        descripcion_resumen["Monto"] / descripcion_resumen["Transacciones"]
+                    )
+                    fig_desc = px.bar(
+                        descripcion_resumen.sort_values("Monto"), x="Monto", y="GASTOS_DESCRIPCION",
+                        orientation="h", text="Monto", color="Monto", color_continuous_scale="Turbo",
+                        custom_data=["Transacciones", "Promedio"],
+                    )
+                    fig_desc.update_traces(
+                        texttemplate="$%{text:,.0f}",
+                        textposition="outside",
+                        hovertemplate=(
+                            "<b>🧾 %{y}</b><br><br>"
+                            "💰 Gasto acumulado: <b>$%{x:,.0f}</b><br>"
+                            "🔁 Número de movimientos: %{customdata[0]}<br>"
+                            "📊 Promedio por movimiento: $%{customdata[1]:,.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                    st.plotly_chart(estilo_grafico(fig_desc, "Descripciones con mayor gasto acumulado"), use_container_width=True)
+
+        st.divider()
+        mostrar_swarm_gastos(df)
+
+        st.markdown("## 6. Recurrencia, frecuencia y monto")
+        st.caption("Distingue cobros repetitivos, gastos hormiga y compras de alto impacto.")
+
+        analisis_mov = df.copy()
+        analisis_mov["DESCRIPCION_ANALISIS"] = analisis_mov.get(
+            "GASTOS_DESCRIPCION", pd.Series(index=analisis_mov.index, dtype=str)
+        ).fillna("Sin descripción").astype(str).str.strip()
+
+        recurrentes = (
+            analisis_mov.groupby("DESCRIPCION_ANALISIS", dropna=False)
+            .agg(Monto=("GASTOS_CANTIDAD", "sum"), Frecuencia=("GASTOS_CANTIDAD", "count"))
+            .reset_index()
+        ) if not analisis_mov.empty else pd.DataFrame(columns=["DESCRIPCION_ANALISIS", "Monto", "Frecuencia"])
+        recurrentes = recurrentes[recurrentes["Frecuencia"] >= 2].sort_values("Monto", ascending=False)
+        monto_recurrente = float(recurrentes["Monto"].sum()) if not recurrentes.empty else 0.0
+        pct_recurrente = monto_recurrente / total_panorama * 100 if total_panorama else 0.0
+
+        umbral_hormiga = st.number_input(
+            "Umbral para gasto pequeño",
+            min_value=0,
+            value=30000,
+            step=5000,
+            help="Los movimientos iguales o inferiores a este valor se analizan como gastos pequeños acumulados.",
+            key="umbral_gasto_hormiga_v913",
+        )
+        gastos_pequenos = analisis_mov[analisis_mov["GASTOS_CANTIDAD"] <= umbral_hormiga] if not analisis_mov.empty else analisis_mov
+        monto_pequeno = float(gastos_pequenos["GASTOS_CANTIDAD"].sum()) if not gastos_pequenos.empty else 0.0
+        pct_pequeno = monto_pequeno / total_panorama * 100 if total_panorama else 0.0
+
+        rr1, rr2, rr3, rr4 = st.columns(4)
+        tarjeta_perfil_gastos(rr1, '🔁 Descripciones recurrentes', len(recurrentes))
+        tarjeta_perfil_gastos(rr2, '🔄 Monto recurrente', f"${monto_recurrente:,.0f}", f"{pct_recurrente:.1f}%")
+        tarjeta_perfil_gastos(rr3, '🪙 Movimientos pequeños', len(gastos_pequenos))
+        tarjeta_perfil_gastos(rr4, '🐜 Acumulado pequeño', f"${monto_pequeno:,.0f}", f"{pct_pequeno:.1f}%")
+
+        frecuencia_sub = (
+            analisis_mov.groupby("GASTOS_SUBCATEGORIA", dropna=False)
+            .agg(Monto=("GASTOS_CANTIDAD", "sum"), Frecuencia=("GASTOS_CANTIDAD", "count"), Promedio=("GASTOS_CANTIDAD", "mean"))
+            .reset_index()
+            .rename(columns={"GASTOS_SUBCATEGORIA": "Subcategoría"})
+        ) if not analisis_mov.empty else pd.DataFrame(columns=["Subcategoría", "Monto", "Frecuencia", "Promedio"])
+
+        for columna_frecuencia in ["Monto", "Frecuencia", "Promedio"]:
+            frecuencia_sub[columna_frecuencia] = pd.to_numeric(frecuencia_sub[columna_frecuencia], errors="coerce").fillna(0)
+        frecuencia_sub["Subcategoría"] = frecuencia_sub["Subcategoría"].fillna(
+            "Sin subcategoría"
+        )
+        excluidas_frecuencia = int((frecuencia_sub["Monto"].le(0) | frecuencia_sub["Frecuencia"].le(0)).sum())
+        frecuencia_sub = frecuencia_sub.loc[
+            frecuencia_sub["Monto"].gt(0) & frecuencia_sub["Frecuencia"].gt(0)
+        ].copy()
+        frecuencia_sub["Color logarítmico"] = np.log10(frecuencia_sub["Monto"])
+        frecuencia_sub["Etiqueta"] = ""
+        frecuencia_sub["Posición etiqueta"] = "top center"
+        posiciones_etiqueta = [
+            "top center", "bottom center", "top left", "top right",
+            "bottom left", "bottom right", "middle left", "middle right",
+        ]
+        frecuencia_sub["Etiqueta"] = frecuencia_sub["Subcategoría"].astype(str)
+        frecuencia_sub["Posición etiqueta"] = [
+            posiciones_etiqueta[i % len(posiciones_etiqueta)]
+            for i in range(len(frecuencia_sub))
+        ]
+
+        fig_frecuencia = px.scatter(
+            frecuencia_sub,
+            x="Frecuencia",
+            y="Monto",
+            size="Monto",
+            size_max=27,
+            color="Color logarítmico",
+            log_x=True,
+            log_y=True,
+            color_continuous_scale=["#075985", "#00E5FF", "#00FF88", "#FFEE00"],
+            hover_name="Subcategoría",
+            text="Etiqueta",
+            custom_data=["Promedio"],
+            title="Frecuencia frente a monto por subcategoría",
+        )
+        fig_frecuencia.update_traces(
+            textposition=frecuencia_sub["Posición etiqueta"].tolist(),
+            textfont=dict(color="#F8FAFC", size=10),
+            marker=dict(
+                opacity=0.82,
+                line=dict(color="rgba(255,255,255,0.58)", width=1),
+            ),
+            hovertemplate=(
+                "<b>🏷️ %{hovertext}</b><br><br>"
+                "🧾 Transacciones: %{x:.0f}<br>"
+                "💰 Monto acumulado: <b>$%{y:,.0f}</b><br>"
+                "📊 Promedio por movimiento: $%{customdata[0]:,.0f}"
+                "<extra></extra>"
+            ),
+        )
+        fig_frecuencia.update_layout(
+            height=650,
+            margin=dict(l=85, r=85, t=85, b=75),
+            coloraxis_colorbar=dict(
+                title="Monto (COP)",
+                tickvals=list(range(int(np.floor(frecuencia_sub["Color logarítmico"].min())), int(np.ceil(frecuencia_sub["Color logarítmico"].max()))+1)) if not frecuencia_sub.empty else [],
+                ticktext=[f"${10.**p:,.0f}".replace(",", ".") for p in range(int(np.floor(frecuencia_sub["Color logarítmico"].min())), int(np.ceil(frecuencia_sub["Color logarítmico"].max()))+1)] if not frecuencia_sub.empty else [],
+                thickness=14,
+            ),
+            hoverlabel=dict(
+                bgcolor="#07111F",
+                bordercolor="#00E5FF",
+                font=dict(color="#F8FAFC", size=13),
+            ),
+        )
+        fig_frecuencia.update_xaxes(
+            title="Número de transacciones · escala logarítmica",
+            tickformat=",.0f",
+            automargin=True,
+        )
+        fig_frecuencia.update_yaxes(
+            title="Monto acumulado (COP) · escala logarítmica",
+            tickprefix="$",
+            tickformat=",.0f",
+            automargin=True,
+        )
+        st.caption(
+            "Ambos ejes usan escala logarítmica: las distancias representan proporciones. "
+            "El tamaño y el color indican el monto acumulado, sin dividirlo entre las transacciones. "
+            "Cada burbuja muestra el nombre de su subcategoría; el detalle completo aparece al pasar el cursor. "
+            + (f"Se excluyen {excluidas_frecuencia} subcategorías con monto neto no positivo. " if excluidas_frecuencia else "")
+        )
+        fig_frecuencia = estilo_grafico(
+            fig_frecuencia,
+            "Frecuencia frente a monto por subcategoría",
+        )
+        fig_frecuencia.update_layout(separators=",.",margin=dict(l=95, r=120, t=85, b=85))
+        fig_frecuencia.update_xaxes(
+            type="log", title="Cantidad de eventos · escala logarítmica",
+            tickformat=",.0f", automargin=True,
+        )
+
+        st.plotly_chart(
+            fig_frecuencia,
+            use_container_width=True,
+        )
+
+        st.markdown("#### Cobros y descripciones recurrentes")
+        st.caption(
+            "Listado de descripciones que aparecen dos o más veces en el período filtrado, "
+            "ordenadas por su monto acumulado."
+        )
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(recurrentes.head(15), use_container_width=True, hide_index=True)
+
+        st.divider()
+        mostrar_pareto(df)
+        st.divider()
+        st.markdown("## 7. ¿Qué gastos son fijos, variables o extraordinarios?")
+        st.markdown("## Clasificación: fijos, variables y otros tipos")
+        st.subheader("🔁 Gastos por tipo")
+        st.caption(
+            "El dashboard respeta la columna Fijo/Variable de la hoja Gastos. "
+            "Acepta Fijo, Variable, Extraordinario y Prescindible; si la celda está vacía, clasifica automáticamente."
+        )
+
+        df_tipo = agregar_tipo_gasto(df)
+
+        if df_tipo.empty:
+            st.warning("No hay gastos para clasificar con los filtros seleccionados.")
+        else:
+            tipo_resumen = (
+                df_tipo.groupby("TIPO_GASTO", as_index=False)["GASTOS_CANTIDAD"]
+                .sum()
+                .sort_values("GASTOS_CANTIDAD", ascending=False)
+            )
+            total_tipo = float(tipo_resumen["GASTOS_CANTIDAD"].sum()) or 1.0
+            tipo_resumen["PARTICIPACION"] = tipo_resumen["GASTOS_CANTIDAD"] / total_tipo * 100
+
+            fijo_total = float(tipo_resumen.loc[tipo_resumen["TIPO_GASTO"] == "Fijo", "GASTOS_CANTIDAD"].sum())
+            variable_total = float(tipo_resumen.loc[tipo_resumen["TIPO_GASTO"] == "Variable", "GASTOS_CANTIDAD"].sum())
+            extraordinario_total = float(tipo_resumen.loc[tipo_resumen["TIPO_GASTO"] == "Extraordinario", "GASTOS_CANTIDAD"].sum())
+            prescindible_total = float(tipo_resumen.loc[tipo_resumen["TIPO_GASTO"] == "Prescindible", "GASTOS_CANTIDAD"].sum())
+            pct_fijo = fijo_total / total_tipo * 100
+            pct_variable = variable_total / total_tipo * 100
+            pct_extraordinario = extraordinario_total / total_tipo * 100
+            pct_prescindible = prescindible_total / total_tipo * 100
+
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            tarjeta_perfil_gastos(k1, '🔒 Fijos', f"${fijo_total:,.0f}", f"{pct_fijo:.1f}%")
+            tarjeta_perfil_gastos(k2, '🎚️ Variables', f"${variable_total:,.0f}", f"{pct_variable:.1f}%")
+            tarjeta_perfil_gastos(k3, '⚡ Extraordinarios', f"${extraordinario_total:,.0f}", f"{pct_extraordinario:.1f}%")
+            tarjeta_perfil_gastos(k4, '✂️ Prescindibles', f"${prescindible_total:,.0f}", f"{pct_prescindible:.1f}%")
+            tarjeta_perfil_gastos(k5, '✅ Total clasificado', f"${total_tipo:,.0f}")
+            tarjeta_perfil_gastos(k6, '🧾 Transacciones', len(df_tipo))
+
+            st.markdown("""
+            <style>
+            .st-key-gastos_tipo_mensual_noche_v20 {
+                position:relative;box-sizing:border-box !important;
+                padding:0 !important;border:0 !important;
+                min-width:0;max-width:100%;width:100%;
+                border-radius:18px;overflow:hidden;background:#07152E;
+                display:flex;flex-direction:column;justify-content:center;
+            }
+            .st-key-gastos_tipo_mensual_noche_v20 [data-testid="stPlotlyChart"] {
+                margin:0 !important;border:0 !important;padding:0 !important;
+                box-shadow:none !important;border-radius:0;
+            }
+            .st-key-gastos_tipo_mensual_noche_v20 [data-testid="stPlotlyChart"]::after {
+                display:none;
+            }
+            .st-key-gastos_tipo_mensual_noche_v20::after {
+                content:"";position:absolute;inset:0;
+                border:1px solid rgba(0,240,255,.55);border-radius:18px;
+                pointer-events:none;z-index:10;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            col1, col2 = st.columns(2, vertical_alignment="center", gap="medium")
+            with col1:
+                from modules.anillos_neon import mostrar_anillo_neon
+                mostrar_anillo_neon(
+                    fig_fijos_variables_pie(tipo_resumen),
+                    float(tipo_resumen["GASTOS_CANTIDAD"].sum()),
+                    "Participación de gastos por tipo", "gastos_tipos_neon_v20",
+                )
+            with col2:
+                tipo_mes = (
+                    df_tipo.groupby(["MES", "TIPO_GASTO"], as_index=False)["GASTOS_CANTIDAD"]
+                    .sum()
+                )
+                tipo_mes = ordenar_por_mes(tipo_mes)
+                from modules.gastos_noche import modernizar_gastos_tipo
+                fig_tipo_comparacion = modernizar_gastos_tipo(fig_fijos_variables_mensual(tipo_mes), tipo_mes)
+                # El marco conserva el tamaño de la dona y centra el lienzo, sin estirarlo.
+                alto_dona_tipos = max(510, 166 + len(tipo_resumen)*39)
+                fig_tipo_comparacion.update_layout(height=alto_dona_tipos)
+                st.markdown(
+                    f'<style>.st-key-gastos_tipo_mensual_noche_v20 {{'
+                    f'height:auto !important;min-height:{alto_dona_tipos}px;'
+                    f'aspect-ratio:640 / {alto_dona_tipos};}}</style>',
+                    unsafe_allow_html=True,
+                )
+                with st.container(key="gastos_tipo_mensual_noche_v20"):
+                    st.plotly_chart(
+                        fig_tipo_comparacion,
+                        use_container_width=True, key="gastos_tipo_mensual_grafico_v21",
+                        config={"displaylogo": False},
+                    )
+
+            st.markdown("#### Detalle por categoría")
+            detalle_categoria = (
+                df_tipo.groupby(["TIPO_GASTO", "GASTOS_CATEGORIA"], as_index=False)
+                .agg(
+                    MONTO=("GASTOS_CANTIDAD", "sum"),
+                    TRANSACCIONES=("GASTOS_CANTIDAD", "count"),
+                )
+                .sort_values(["TIPO_GASTO", "MONTO"], ascending=[True, False])
+            )
+            detalle_categoria["PARTICIPACION_%"] = detalle_categoria["MONTO"] / total_tipo * 100
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(detalle_categoria, use_container_width=True, hide_index=True)
+
+            st.markdown("#### Auditoría de clasificación")
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(
+                    df_tipo[[
+                        "TIPO_GASTO", "MES", "GASTOS_FECHA", "GASTOS_CANTIDAD",
+                        "GASTOS_DESCRIPCION", "GASTOS_CATEGORIA",
+                        "GASTOS_SUBCATEGORIA", "GASTOS_SUBCATEGORIA_2"
+                    ]].sort_values(["TIPO_GASTO", "MES", "GASTOS_CANTIDAD"], ascending=[True, True, False]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            csv_tipo = df_tipo.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Descargar gastos clasificados (CSV)",
+                csv_tipo,
+                "gastos_por_tipo.csv",
+                "text/csv",
+            )
+
+    if pestana_activa == etiquetas_pestanas[2]:
+        # El marco existente se pinta delante del gráfico, sin crear otro contenedor.
+        st.markdown("""<style>
+        [data-testid="stPlotlyChart"] {
+            position:relative;
+            box-sizing:border-box !important;
+            padding:0 !important;border:0 !important;
+            width:100%;max-width:100%;min-width:0;
+            border-radius:18px;overflow:hidden;isolation:isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content:"";position:absolute;inset:0;
+            box-sizing:border-box;
+            border:1px solid rgba(0,240,255,.55);
+            border-radius:18px;pointer-events:none;z-index:10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing:border-box;
+            width:100% !important;max-width:100%;min-width:0;
+        }
+        </style>""", unsafe_allow_html=True)
+        contexto_pestana("¿Cómo he evolucionado?", "Compara el comportamiento mensual de ingresos, gastos, balance y desviaciones para reconocer mejoras o deterioros.")
+        st.markdown("## Evolución mensual")
+        st.subheader("📅 Tendencias mensuales")
+        dias_con_gasto_tendencias = max(df["GASTOS_FECHA"].dropna().dt.normalize().nunique(), 1) if not df.empty else 1
+        gasto_promedio_diario = total_gastos / dias_con_gasto_tendencias
+        st.caption(
+            "Barras = gastos mensuales filtrados · Línea verde = ingresos mensuales · "
+            "la línea del balance permite reconocer mejoras o deterioros. El cumplimiento presupuestal se analiza en Presupuesto."
+        )
+
+        # ======================================================
+        # BASE MENSUAL ÚNICA: INGRESOS + GASTOS + PRESUPUESTO
+        # ======================================================
+        tendencia = construir_flujo_mensual(
+            gastos_df=df,
+            ingresos_df=ingresos_filtrados,
+            meses_sel=meses_sel,
+            presupuesto_mensual=presupuesto_mensual_por_periodo or presupuesto_mensual_general,
+            periodos_sel=periodos_sel,
+        )
+
+        # ======================================================
+        # 1. RESUMEN DE LA EVOLUCIÓN
+        # ======================================================
+        tendencia = tendencia.copy()
+        tendencia["Ingresos"] = pd.to_numeric(tendencia["Ingresos"], errors="coerce").fillna(0.0)
+        tendencia["Gastos"] = pd.to_numeric(tendencia["Gastos"], errors="coerce").fillna(0.0)
+        tendencia["Balance"] = pd.to_numeric(tendencia["Balance"], errors="coerce").fillna(0.0)
+
+        meses_movimiento = tendencia[(tendencia["Ingresos"] != 0) | (tendencia["Gastos"] != 0)].copy()
+        if meses_movimiento.empty:
+            meses_movimiento = tendencia.copy()
+
+        mes_mayor_ingreso = (
+            str(meses_movimiento.loc[meses_movimiento["Ingresos"].idxmax(), "MES"])
+            if not meses_movimiento.empty else "Sin datos"
+        )
+        mes_mayor_gasto = (
+            str(meses_movimiento.loc[meses_movimiento["Gastos"].idxmax(), "MES"])
+            if not meses_movimiento.empty else "Sin datos"
+        )
+        mejor_mes = (
+            str(meses_movimiento.loc[meses_movimiento["Balance"].idxmax(), "MES"])
+            if not meses_movimiento.empty else "Sin datos"
+        )
+        peor_mes = (
+            str(meses_movimiento.loc[meses_movimiento["Balance"].idxmin(), "MES"])
+            if not meses_movimiento.empty else "Sin datos"
+        )
+        tendencia_actual = "Sin comparación"
+        if len(meses_movimiento) >= 2:
+            cambio_balance = float(meses_movimiento.iloc[-1]["Balance"] - meses_movimiento.iloc[-2]["Balance"])
+            tendencia_actual = "Mejorando" if cambio_balance > 0 else "Deteriorándose" if cambio_balance < 0 else "Estable"
+
+        st.markdown("### 1. Resumen de la evolución")
+        tr1, tr2, tr3, tr4, tr5 = st.columns(5)
+        tarjeta_perfil_panel(tr1, '📊 Periodo analizado', f"{len(meses_movimiento)} mes(es)")
+        tarjeta_perfil_panel(tr2, '💰 Mayor ingreso', mes_mayor_ingreso)
+        tarjeta_perfil_panel(tr3, '💸 Mayor gasto', mes_mayor_gasto)
+        tarjeta_perfil_panel(tr4, '⚖️ Mejor balance', mejor_mes)
+        tarjeta_perfil_panel(tr5, '📊 Tendencia actual', tendencia_actual)
+
+        # ======================================================
+        # 2. CAMBIO FRENTE AL MES ANTERIOR
+        # ======================================================
+        st.markdown("### 2. Cambios frente al mes anterior")
+        if len(meses_movimiento) >= 2:
+            anterior = meses_movimiento.iloc[-2]
+            actual = meses_movimiento.iloc[-1]
+
+            def variacion_pct(actual_val, anterior_val):
+                return ((actual_val - anterior_val) / abs(anterior_val) * 100) if anterior_val else 0.0
+
+            ci = variacion_pct(float(actual["Ingresos"]), float(anterior["Ingresos"]))
+            cg = variacion_pct(float(actual["Gastos"]), float(anterior["Gastos"]))
+            cb = float(actual["Balance"] - anterior["Balance"])
+            c21, c22, c23, c24 = st.columns(4)
+            tarjeta_perfil_panel(c21, '📅 Mes comparado', f"{anterior['MES']} → {actual['MES']}")
+            tarjeta_perfil_panel(c22, '💰 Cambio ingresos', f"{ci:+.1f}%", delta=f"${actual['Ingresos']-anterior['Ingresos']:,.0f}")
+            tarjeta_perfil_panel(c23, '💸 Cambio gastos', f"{cg:+.1f}%", delta=f"${actual['Gastos']-anterior['Gastos']:,.0f}", delta_color="inverse")
+            tarjeta_perfil_panel(c24, '⚖️ Cambio del balance', f"${cb:,.0f}", delta=f"{cb:+,.0f}")
+        else:
+            st.info("Se necesitan al menos dos meses con movimiento para calcular la variación mensual.")
+
+        # ======================================================
+        # GRÁFICO PRINCIPAL: GASTOS + INGRESOS + BALANCE
+        # ======================================================
+        fig_tend = go.Figure()
+
+        fig_tend.add_trace(go.Bar(
+            x=tendencia["MES"],
+            y=tendencia["Gastos"],
+            name="Gastos",
+            marker=dict(
+                color="rgba(96,165,250,0.78)",
+                line=dict(color="rgba(147,197,253,1)", width=1.5),
+            ),
+            text=tendencia["Gastos"],
+            texttemplate="$%{text:,.0f}",
+            textposition="outside",
+            customdata=tendencia[["Ingresos", "Balance", "Estado balance", "Presupuesto mensual", "Diferencia vs presupuesto", "Estado presupuesto"]],
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Gastos: $%{y:,.0f}<br>"
+                "Ingresos: $%{customdata[0]:,.0f}<br>"
+                "Balance: $%{customdata[1]:,.0f}<br>"
+                "%{customdata[2]}<br><br>"
+                "Presupuesto: $%{customdata[3]:,.0f}<br>"
+                "Dif. vs presupuesto: $%{customdata[4]:,.0f}<br>"
+                "%{customdata[5]}<extra></extra>"
+            ),
+        ))
+
+        fig_tend.add_trace(go.Scatter(
+            x=tendencia["MES"],
+            y=tendencia["Ingresos"],
+            name="Ingresos",
+            mode="lines+markers+text",
+            line=dict(color=COLOR_INGRESOS, width=4, shape="spline"),
+            marker=dict(size=11, color=COLOR_INGRESOS, line=dict(color="#052e16", width=1.6)),
+            text=tendencia["Ingresos"],
+            texttemplate="$%{text:,.0f}",
+            textposition="top center",
+            customdata=tendencia[["Gastos", "Balance", "Presupuesto mensual"]],
+            hovertemplate=(
+                "<b>📅 %{x}</b><br><br>"
+                "💵 Ingresos: <b>$%{y:,.0f}</b><br>"
+                "🧾 Gastos: $%{customdata[0]:,.0f}<br>"
+                "⚖️ Balance: $%{customdata[1]:,.0f}<br>"
+                "🎯 Presupuesto: $%{customdata[2]:,.0f}"
+                "<extra></extra>"
+            ),
+        ))
+
+        fig_tend.update_layout(
+            template="plotly_dark",
+            height=620,
+            paper_bgcolor="#000000",
+            plot_bgcolor="#000000",
+            font=dict(color="#E2E8F0"),
+            title=dict(text="Evolución mensual de ingresos y gastos", font=dict(color="#F8FAFC")),
+            xaxis=dict(
+                title="Mes",
+                categoryorder="array",
+                categoryarray=MESES_ORDEN,
+                gridcolor="rgba(148,163,184,0.12)",
+            ),
+            yaxis=dict(title="Valor", tickformat=",.0f", gridcolor="rgba(148,163,184,0.14)"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            margin=dict(t=90, b=45, l=55, r=40),
+            hoverlabel=dict(bgcolor="#0F172A", bordercolor="#38BDF8", font=dict(color="#F8FAFC")),
+            bargap=0.28,
+        )
+        st.plotly_chart(fig_tend, use_container_width=True)
+
+        # ======================================================
+        # BARRAS DE BALANCE SEPARADAS PARA NO CONFUNDIR EL GRÁFICO PRINCIPAL
+        # ======================================================
+        tendencia["Color balance"] = tendencia["Balance"].apply(lambda x: COLOR_INGRESOS if x >= 0 else COLOR_GASTOS)
+        fig_balance = go.Figure(go.Bar(
+            x=tendencia["MES"],
+            y=tendencia["Balance"],
+            name="Balance",
+            marker=dict(color=tendencia["Color balance"], opacity=0.82),
+            text=tendencia["Balance"],
+            texttemplate="$%{text:,.0f}",
+            textposition="outside",
+            customdata=tendencia[["Estado balance"]],
+            hovertemplate=(
+                "<b>⚖️ Balance de %{x}</b><br><br>"
+                "💰 Resultado neto: <b>$%{y:,.0f}</b><br>"
+                "📌 %{customdata[0]}"
+                "<extra></extra>"
+            ),
+        ))
+        fig_balance.add_hline(y=0, line_width=1, line_dash="dot", line_color="rgba(226,232,240,0.5)")
+        fig_balance.update_layout(
+            template="plotly_dark",
+            height=360,
+            paper_bgcolor="#000000",
+            plot_bgcolor="#000000",
+            title=dict(text="Balance mensual: ingresos - gastos", font=dict(color="#F8FAFC")),
+            xaxis=dict(title="Mes", categoryorder="array", categoryarray=MESES_ORDEN),
+            yaxis=dict(title="Balance", tickformat=",.0f"),
+            showlegend=False,
+            margin=dict(t=70, b=35, l=55, r=35),
+        )
+        st.plotly_chart(fig_balance, use_container_width=True)
+
+        # ==============================
+        # RESUMEN EJECUTIVO MENSUAL
+        # ==============================
+        cta, ctb, ctc, ctd = st.columns(4)
+        meses_superavit = int((tendencia["Balance"] > 0).sum())
+        meses_deficit = int((tendencia["Balance"] < 0).sum())
+        ahorro_pct = (tendencia["Balance"].sum() / tendencia["Ingresos"].sum() * 100) if tendencia["Ingresos"].sum() else 0
+        gasto_vs_ingreso_pct = (tendencia["Gastos"].sum() / tendencia["Ingresos"].sum() * 100) if tendencia["Ingresos"].sum() else 0
+
+        tarjeta_perfil_panel(cta, '📅 Meses con superávit', meses_superavit)
+        tarjeta_perfil_panel(ctb, '📅 Meses con déficit', meses_deficit)
+        tarjeta_perfil_panel(ctc, '🐷 Ahorro acumulado', f"{ahorro_pct:.1f}%")
+        tarjeta_perfil_panel(ctd, '💰 Gasto / ingreso', f"{gasto_vs_ingreso_pct:.1f}%")
+
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(
+                tendencia[[
+                    "MES", "Ingresos", "Gastos", "Balance",
+                    "Estado balance"
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ======================================================
+        # 3. RANKING DE CAMBIOS POR CATEGORÍA
+        # ======================================================
+        st.divider()
+        st.markdown("## Ranking de cambios")
+        st.caption("Compara cuánto subió o bajó el gasto de cada categoría frente al mes anterior.")
+        datos_cambio = df.copy()
+        clave_mes_ant = None
+        clave_mes_act = None
+        if not datos_cambio.empty and "GASTOS_FECHA" in datos_cambio.columns:
+            datos_cambio["_PERIODO_CAMBIO"] = pd.to_datetime(
+                datos_cambio["GASTOS_FECHA"], errors="coerce"
+            ).dt.to_period("M").astype(str)
+            datos_cambio = datos_cambio[
+                datos_cambio["_PERIODO_CAMBIO"].ne("NaT")
+            ].copy()
+            periodos_cambio = sorted(datos_cambio["_PERIODO_CAMBIO"].unique())
+
+            if len(periodos_cambio) >= 2:
+                clave_mes_ant, clave_mes_act = periodos_cambio[-2:]
+                datos_cambio = datos_cambio[
+                    datos_cambio["_PERIODO_CAMBIO"].isin([clave_mes_ant, clave_mes_act])
+                ].copy()
+            elif len(periodos_cambio) == 1:
+                clave_mes_act = periodos_cambio[0]
+                clave_mes_ant = str(pd.Period(clave_mes_act, freq="M") - 1)
+
+                # Recupera el mes calendario anterior desde todo el historial,
+                # respetando los filtros actuales de categoría y subcategoría.
+                gastos_mes_anterior = gastos.copy()
+                gastos_mes_anterior["_PERIODO_CAMBIO"] = pd.to_datetime(
+                    gastos_mes_anterior["GASTOS_FECHA"], errors="coerce"
+                ).dt.to_period("M").astype(str)
+                gastos_mes_anterior = gastos_mes_anterior[
+                    gastos_mes_anterior["_PERIODO_CAMBIO"].eq(clave_mes_ant)
+                ].copy()
+                if set(categorias_sel) != set(categorias):
+                    gastos_mes_anterior = gastos_mes_anterior[
+                        gastos_mes_anterior["GASTOS_CATEGORIA"].isin(categorias_sel)
+                    ]
+                if set(subcategorias_sel) != set(subcategorias):
+                    gastos_mes_anterior = gastos_mes_anterior[
+                        gastos_mes_anterior["GASTOS_SUBCATEGORIA"].isin(subcategorias_sel)
+                    ]
+                datos_cambio = pd.concat(
+                    [gastos_mes_anterior, datos_cambio], ignore_index=True
+                )
+
+        if clave_mes_ant and clave_mes_act and not datos_cambio.empty:
+            periodo_ant = pd.Period(clave_mes_ant, freq="M")
+            periodo_act = pd.Period(clave_mes_act, freq="M")
+            mes_ant = f"{MESES_ORDEN[periodo_ant.month - 1].title()} {periodo_ant.year}"
+            mes_act = f"{MESES_ORDEN[periodo_act.month - 1].title()} {periodo_act.year}"
+
+            def nombre_ranking(valor, reemplazo):
+                texto = limpiar_undefined_texto(valor, "").strip()
+                return texto if texto else reemplazo
+
+            datos_cambio["GASTOS_CATEGORIA"] = datos_cambio[
+                "GASTOS_CATEGORIA"
+            ].map(lambda valor: nombre_ranking(valor, "Sin categoría"))
+            datos_cambio["GASTOS_SUBCATEGORIA"] = datos_cambio[
+                "GASTOS_SUBCATEGORIA"
+            ].map(lambda valor: nombre_ranking(valor, "Sin subcategoría"))
+
+            comp_categorias = (
+                datos_cambio.pivot_table(
+                    index="GASTOS_CATEGORIA",
+                    columns="_PERIODO_CAMBIO",
+                    values="GASTOS_CANTIDAD",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            if clave_mes_ant not in comp_categorias.columns:
+                comp_categorias[clave_mes_ant] = 0.0
+            if clave_mes_act not in comp_categorias.columns:
+                comp_categorias[clave_mes_act] = 0.0
+            comp_categorias["GASTOS_CATEGORIA"] = comp_categorias["GASTOS_CATEGORIA"].apply(
+                lambda categoria: nombre_ranking(categoria, "Sin categoría")
+            )
+            comp_categorias["Cambio"] = (
+                comp_categorias[clave_mes_act] - comp_categorias[clave_mes_ant]
+            )
+            comp_categorias["Cambio %"] = comp_categorias.apply(
+                lambda r: (
+                    r["Cambio"] / abs(r[clave_mes_ant]) * 100
+                    if r[clave_mes_ant] else 0.0
+                ),
+                axis=1,
+            )
+
+            col_suben, col_bajan = st.columns(2)
+            with col_suben:
+                top_suben = comp_categorias[
+                    comp_categorias["Cambio"] > 0
+                ].nlargest(8, "Cambio").copy()
+                if not top_suben.empty:
+                    fig_suben = px.bar(
+                        top_suben,
+                        x="Cambio",
+                        y="GASTOS_CATEGORIA",
+                        orientation="h",
+                        text="Cambio",
+                        title=f"Categorías donde aumentó el gasto · {mes_act} vs {mes_ant}",
+                        labels={
+                            "Cambio": "Aumento del gasto",
+                            "GASTOS_CATEGORIA": "Categoría",
+                        },
+                    )
+                    fig_suben.update_layout(barcornerradius="50%", bargap=0.3)
+                    fig_suben.update_traces(
+                        name="Categorías con aumento",
+                        texttemplate="$%{text:,.0f}",
+                        textposition="outside",
+                        marker_color="#FF1A1A",
+                        customdata=top_suben[[clave_mes_ant, clave_mes_act, "Cambio %"]],
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            f"Gasto en {mes_ant}: $%{{customdata[0]:,.0f}}<br>"
+                            f"Gasto en {mes_act}: $%{{customdata[1]:,.0f}}<br>"
+                            "Aumento: <b>$%{x:,.0f}</b><br>"
+                            "Variación: %{customdata[2]:+.1f}%<extra></extra>"
+                        ),
+                    )
+                    fig_suben.update_layout(
+                        xaxis_title="Aumento del gasto",
+                        yaxis_title="Categoría",
+                        yaxis=dict(autorange="reversed"),
+                        showlegend=False,
+                        height=390,
+                    )
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_suben,
+                            f"Categorías donde aumentó el gasto · {mes_act} vs {mes_ant}",
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.success(f"Ninguna categoría aumentó su gasto en {mes_act} frente a {mes_ant}.")
+            with col_bajan:
+                top_bajan = comp_categorias[
+                    comp_categorias["Cambio"] < 0
+                ].nsmallest(8, "Cambio").copy()
+                if not top_bajan.empty:
+                    top_bajan["Reducción"] = -top_bajan["Cambio"]
+                    fig_bajan = px.bar(
+                        top_bajan,
+                        x="Reducción",
+                        y="GASTOS_CATEGORIA",
+                        orientation="h",
+                        text="Reducción",
+                        title=f"Categorías donde bajó el gasto · {mes_act} vs {mes_ant}",
+                        labels={
+                            "Reducción": "Reducción del gasto",
+                            "GASTOS_CATEGORIA": "Categoría",
+                        },
+                    )
+                    fig_bajan.update_layout(barcornerradius="50%", bargap=0.3)
+                    fig_bajan.update_traces(
+                        name="Categorías con reducción",
+                        texttemplate="$%{text:,.0f}",
+                        textposition="outside",
+                        marker_color="#00FF9C",
+                        customdata=top_bajan[[clave_mes_ant, clave_mes_act, "Cambio %"]],
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            f"Gasto en {mes_ant}: $%{{customdata[0]:,.0f}}<br>"
+                            f"Gasto en {mes_act}: $%{{customdata[1]:,.0f}}<br>"
+                            "Reducción: <b>$%{x:,.0f}</b><br>"
+                            "Variación: %{customdata[2]:+.1f}%<extra></extra>"
+                        ),
+                    )
+                    fig_bajan.update_layout(
+                        xaxis_title="Reducción del gasto",
+                        yaxis_title="Categoría",
+                        yaxis=dict(autorange="reversed"),
+                        showlegend=False,
+                        height=390,
+                    )
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_bajan,
+                            f"Categorías donde bajó el gasto · {mes_act} vs {mes_ant}",
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info(f"Ninguna categoría redujo su gasto en {mes_act} frente a {mes_ant}.")
+
+            st.markdown("### Ranking de cambios por subcategoría")
+            st.caption(
+                "Muestra los conceptos específicos que explican el aumento o la reducción "
+                f"del gasto entre {mes_ant} y {mes_act}."
+            )
+            comp_subcategorias = (
+                datos_cambio.pivot_table(
+                    index=["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"],
+                    columns="_PERIODO_CAMBIO",
+                    values="GASTOS_CANTIDAD",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            if clave_mes_ant not in comp_subcategorias.columns:
+                comp_subcategorias[clave_mes_ant] = 0.0
+            if clave_mes_act not in comp_subcategorias.columns:
+                comp_subcategorias[clave_mes_act] = 0.0
+            comp_subcategorias["Concepto"] = (
+                comp_subcategorias["GASTOS_CATEGORIA"].map(
+                    lambda valor: nombre_ranking(valor, "Sin categoría")
+                )
+                + " › "
+                + comp_subcategorias["GASTOS_SUBCATEGORIA"].map(
+                    lambda valor: nombre_ranking(valor, "Sin subcategoría")
+                )
+            )
+            comp_subcategorias["Cambio"] = (
+                comp_subcategorias[clave_mes_act] - comp_subcategorias[clave_mes_ant]
+            )
+            comp_subcategorias["Cambio %"] = comp_subcategorias.apply(
+                lambda fila: (
+                    fila["Cambio"] / abs(fila[clave_mes_ant]) * 100
+                    if fila[clave_mes_ant] else 0.0
+                ),
+                axis=1,
+            )
+            comp_subcategorias["Variación"] = comp_subcategorias.apply(
+                lambda fila: (
+                    f"{fila['Cambio %']:+.1f}%"
+                    if fila[clave_mes_ant] else "Nuevo gasto en el mes"
+                ),
+                axis=1,
+            )
+
+            col_subcat_suben, col_subcat_bajan = st.columns(2)
+            with col_subcat_suben:
+                subcat_suben = comp_subcategorias[
+                    comp_subcategorias["Cambio"] > 0
+                ].nlargest(8, "Cambio").copy()
+                if not subcat_suben.empty:
+                    fig_subcat_suben = px.bar(
+                        subcat_suben,
+                        x="Cambio",
+                        y="Concepto",
+                        orientation="h",
+                        text="Cambio",
+                        labels={
+                            "Cambio": "Aumento del gasto",
+                            "Concepto": "Subcategoría",
+                        },
+                    )
+                    fig_subcat_suben.update_layout(barcornerradius="50%", bargap=0.3)
+                    fig_subcat_suben.update_traces(
+                        name="Subcategorías con aumento",
+                        texttemplate="$%{text:,.0f}",
+                        textposition="outside",
+                        marker_color="#FF1A1A",
+                        customdata=subcat_suben[
+                            [clave_mes_ant, clave_mes_act, "Variación"]
+                        ],
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            f"Gasto en {mes_ant}: $%{{customdata[0]:,.0f}}<br>"
+                            f"Gasto en {mes_act}: $%{{customdata[1]:,.0f}}<br>"
+                            "Aumento: <b>$%{x:,.0f}</b><br>"
+                            "Variación: %{customdata[2]}<extra></extra>"
+                        ),
+                    )
+                    fig_subcat_suben.update_layout(
+                        xaxis_title="Aumento del gasto",
+                        yaxis_title="Subcategoría",
+                        yaxis=dict(autorange="reversed"),
+                        showlegend=False,
+                        height=430,
+                    )
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_subcat_suben,
+                            f"Subcategorías donde aumentó el gasto · {mes_act} vs {mes_ant}",
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.success(
+                        f"Ninguna subcategoría aumentó su gasto en {mes_act} frente a {mes_ant}."
+                    )
+
+            with col_subcat_bajan:
+                subcat_bajan = comp_subcategorias[
+                    comp_subcategorias["Cambio"] < 0
+                ].nsmallest(8, "Cambio").copy()
+                if not subcat_bajan.empty:
+                    subcat_bajan["Reducción"] = -subcat_bajan["Cambio"]
+                    fig_subcat_bajan = px.bar(
+                        subcat_bajan,
+                        x="Reducción",
+                        y="Concepto",
+                        orientation="h",
+                        text="Reducción",
+                        labels={
+                            "Reducción": "Reducción del gasto",
+                            "Concepto": "Subcategoría",
+                        },
+                    )
+                    fig_subcat_bajan.update_layout(barcornerradius="50%", bargap=0.3)
+                    fig_subcat_bajan.update_traces(
+                        name="Subcategorías con reducción",
+                        texttemplate="$%{text:,.0f}",
+                        textposition="outside",
+                        marker_color="#00FF9C",
+                        customdata=subcat_bajan[
+                            [clave_mes_ant, clave_mes_act, "Variación"]
+                        ],
+                        hovertemplate=(
+                            "<b>%{y}</b><br>"
+                            f"Gasto en {mes_ant}: $%{{customdata[0]:,.0f}}<br>"
+                            f"Gasto en {mes_act}: $%{{customdata[1]:,.0f}}<br>"
+                            "Reducción: <b>$%{x:,.0f}</b><br>"
+                            "Variación: %{customdata[2]}<extra></extra>"
+                        ),
+                    )
+                    fig_subcat_bajan.update_layout(
+                        xaxis_title="Reducción del gasto",
+                        yaxis_title="Subcategoría",
+                        yaxis=dict(autorange="reversed"),
+                        showlegend=False,
+                        height=430,
+                    )
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_subcat_bajan,
+                            f"Subcategorías donde bajó el gasto · {mes_act} vs {mes_ant}",
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info(
+                        f"Ninguna subcategoría redujo su gasto en {mes_act} frente a {mes_ant}."
+                    )
+        else:
+            st.info("Selecciona al menos un mes con gastos para calcular el cambio frente al mes anterior.")
+
+        # ======================================================
+        # 4. EVOLUCIÓN DEL AHORRO Y COMPARACIÓN CON PROMEDIO
+        # ======================================================
+        st.divider()
+        st.markdown("## Evolución del ahorro")
+        tendencia["Ahorro %"] = tendencia.apply(
+            lambda r: (r["Balance"] / r["Ingresos"] * 100) if r["Ingresos"] else 0.0, axis=1
+        )
+        ahorro_cols = st.columns(2)
+        with ahorro_cols[0]:
+            fig_ahorro_t = go.Figure(go.Bar(
+                x=tendencia["MES"], y=tendencia["Balance"],
+                marker_color=[COLOR_INGRESOS if v >= 0 else COLOR_GASTOS for v in tendencia["Balance"]],
+                text=tendencia["Balance"], texttemplate="$%{text:,.0f}", textposition="outside",
+                customdata=tendencia[["Ingresos", "Gastos", "Ahorro %"]],
+                hovertemplate=(
+                    "<b>🏦 Ahorro mensual · %{x}</b><br><br>"
+                    "💵 Ingresos: $%{customdata[0]:,.0f}<br>"
+                    "🧾 Gastos: $%{customdata[1]:,.0f}<br>"
+                    "💰 Ahorro neto: <b>$%{y:,.0f}</b><br>"
+                    "📊 Capacidad de ahorro: %{customdata[2]:.1f}%"
+                    "<extra></extra>"
+                )
+            ))
+            fig_ahorro_t.update_layout(height=390, showlegend=False, xaxis=dict(categoryorder="array", categoryarray=MESES_ORDEN))
+            st.plotly_chart(estilo_grafico(fig_ahorro_t, "Ahorro mensual en pesos"), use_container_width=True)
+        with ahorro_cols[1]:
+            fig_ahorro_pct_t = go.Figure(go.Scatter(
+                x=tendencia["MES"], y=tendencia["Ahorro %"], mode="lines+markers+text",
+                line=dict(color="#2DD4BF", width=4, shape="spline"), marker=dict(size=10),
+                text=tendencia["Ahorro %"], texttemplate="%{text:.1f}%", textposition="top center",
+                customdata=tendencia[["Balance", "Ingresos", "Gastos"]],
+                hovertemplate=(
+                    "<b>📊 Capacidad de ahorro · %{x}</b><br><br>"
+                    "🏦 Porcentaje ahorrado: <b>%{y:.1f}%</b><br>"
+                    "⚖️ Balance: $%{customdata[0]:,.0f}<br>"
+                    "💵 Ingresos: $%{customdata[1]:,.0f}<br>"
+                    "🧾 Gastos: $%{customdata[2]:,.0f}<br>"
+                    "🎯 Referencia: 20%"
+                    "<extra></extra>"
+                )
+            ))
+            fig_ahorro_pct_t.add_hline(y=20, line_dash="dot", line_color="#FFEE00", annotation_text="Referencia 20%")
+            fig_ahorro_pct_t.update_layout(height=390, showlegend=False, xaxis=dict(categoryorder="array", categoryarray=MESES_ORDEN))
+            st.plotly_chart(estilo_grafico(fig_ahorro_pct_t, "Ahorro como porcentaje del ingreso"), use_container_width=True)
+
+        promedio_ingresos = float(meses_movimiento["Ingresos"].mean()) if not meses_movimiento.empty else 0.0
+        promedio_gastos = float(meses_movimiento["Gastos"].mean()) if not meses_movimiento.empty else 0.0
+        promedio_balance = float(meses_movimiento["Balance"].mean()) if not meses_movimiento.empty else 0.0
+        ultimo = meses_movimiento.iloc[-1] if not meses_movimiento.empty else None
+        if ultimo is not None:
+            cp1, cp2, cp3 = st.columns(3)
+            diferencia_ingreso_promedio = float(ultimo["Ingresos"] - promedio_ingresos)
+            if promedio_ingresos:
+                porcentaje_ingreso_promedio = diferencia_ingreso_promedio / promedio_ingresos * 100
+                comparacion_ingreso_texto = (
+                    f"{'▲' if diferencia_ingreso_promedio > 0 else '▼' if diferencia_ingreso_promedio < 0 else '='} "
+                    f"{abs(porcentaje_ingreso_promedio):.1f}% "
+                    f"{'por encima' if diferencia_ingreso_promedio > 0 else 'por debajo' if diferencia_ingreso_promedio < 0 else 'igual al promedio'}"
+                    + (" del promedio" if diferencia_ingreso_promedio else "")
+                )
+            else:
+                comparacion_ingreso_texto = "Sin promedio distinto de cero para comparar el porcentaje"
+            tarjeta_comparacion_panel(
+                cp1, "Ingreso actual vs promedio", f"${ultimo['Ingresos']:,.0f}",
+                comparacion_ingreso_texto,
+                "#52e0a4", "💰",
+                tono_comparacion=(
+                    "negativo" if promedio_ingresos and diferencia_ingreso_promedio < 0
+                    else "positivo" if promedio_ingresos and diferencia_ingreso_promedio > 0
+                    else "neutro"
+                ),
+            )
+            cp1.caption(f"Promedio mensual: ${promedio_ingresos:,.0f} · Diferencia: ${diferencia_ingreso_promedio:+,.0f}")
+            diferencia_gasto_promedio = float(ultimo["Gastos"] - promedio_gastos)
+            if promedio_gastos:
+                porcentaje_gasto_promedio = diferencia_gasto_promedio / promedio_gastos * 100
+                comparacion_gasto_texto = (
+                    f"{'▲' if diferencia_gasto_promedio > 0 else '▼' if diferencia_gasto_promedio < 0 else '='} "
+                    f"{abs(porcentaje_gasto_promedio):.1f}% "
+                    f"{'por encima del promedio' if diferencia_gasto_promedio > 0 else 'por debajo del promedio' if diferencia_gasto_promedio < 0 else 'igual al promedio'}"
+                )
+            else:
+                comparacion_gasto_texto = "Sin promedio distinto de cero para comparar el porcentaje"
+            tarjeta_comparacion_panel(
+                cp2, "Gasto actual vs promedio", f"${ultimo['Gastos']:,.0f}",
+                comparacion_gasto_texto, "#ff526e", "💸",
+                tono_comparacion=(
+                    "negativo" if promedio_gastos and diferencia_gasto_promedio > 0
+                    else "positivo" if promedio_gastos and diferencia_gasto_promedio < 0
+                    else "neutro"
+                ),
+            )
+            cp2.caption(f"Promedio mensual: ${promedio_gastos:,.0f} · Diferencia: ${diferencia_gasto_promedio:+,.0f}")
+            diferencia_balance_promedio = float(ultimo["Balance"] - promedio_balance)
+            comparacion_balance_texto = (
+                f"{'▲' if diferencia_balance_promedio > 0 else '▼' if diferencia_balance_promedio < 0 else '='} "
+                f"${abs(diferencia_balance_promedio):,.0f} "
+                f"{'por encima del promedio' if diferencia_balance_promedio > 0 else 'por debajo del promedio' if diferencia_balance_promedio < 0 else 'igual al promedio'}"
+            )
+            tarjeta_comparacion_panel(
+                cp3, "Balance actual vs promedio", f"${ultimo['Balance']:,.0f}",
+                comparacion_balance_texto, "#39d7ff", "⚖️",
+                tono_comparacion=(
+                    "positivo" if diferencia_balance_promedio > 0
+                    else "negativo" if diferencia_balance_promedio < 0
+                    else "neutro"
+                ),
+            )
+            cp3.caption(f"Balance promedio mensual: ${promedio_balance:,.0f}")
+
+        # ======================================================
+        # 5. PREDICCIÓN SIMPLE DEL SIGUIENTE MES
+        # ======================================================
+        st.divider()
+        st.markdown("## Proyección simple del próximo mes")
+        ventana = meses_movimiento.tail(3)
+        ingreso_prox = float(ventana["Ingresos"].mean()) if not ventana.empty else 0.0
+        gasto_prox = float(ventana["Gastos"].mean()) if not ventana.empty else 0.0
+        balance_prox = ingreso_prox - gasto_prox
+        pr1, pr2, pr3 = st.columns(3)
+        tarjeta_perfil_panel(pr1, '💰 Ingreso estimado', f"${ingreso_prox:,.0f}")
+        tarjeta_perfil_panel(pr2, '💸 Gasto estimado', f"${gasto_prox:,.0f}")
+        tarjeta_perfil_panel(pr3, '⚖️ Balance estimado', f"${balance_prox:,.0f}")
+        st.caption("Estimación descriptiva basada en el promedio de los últimos tres meses disponibles; no es una predicción estadística ni una garantía.")
+
+        # ======================================================
+        # 6. CALENDARIO FINANCIERO
+        # ======================================================
+        st.divider()
+        st.markdown("## Calendario financiero por intensidad de gasto")
+        control_meses_cal, control_promedio_cal = st.columns([1, 1.6])
+        with control_meses_cal:
+            ventana_calendario = st.selectbox(
+                "Meses visibles",
+                ["Últimos 3 meses", "Últimos 12 meses", "Últimos 24 meses"],
+                index=1,
+                help="Limita la altura del mapa tomando los meses más recientes del período filtrado.",
+                key="calendario_ventana_meses_v13",
+            )
+        with control_promedio_cal:
+            modo_promedio_calendario = st.radio(
+                "Comparar cada día contra:",
+                ["Período filtrado", "Cada mes"],
+                horizontal=True,
+                index=0,
+                help=(
+                    "Período filtrado usa un único promedio para todas las celdas. "
+                    "Cada mes calcula un promedio diferente para cada fila."
+                ),
+                key="calendario_base_promedio_v13",
+            )
+        cantidad_meses_calendario = {
+            "Últimos 3 meses": 3,
+            "Últimos 12 meses": 12,
+            "Últimos 24 meses": 24,
+        }[ventana_calendario]
+        texto_base_promedio = (
+            "el promedio diario de todo el período filtrado"
+            if modo_promedio_calendario == "Período filtrado"
+            else "el promedio diario de cada mes"
+        )
+        st.caption(
+            f"🎨 El color muestra cuántas veces el gasto del día representa {texto_base_promedio}. "
+            "⚖️ La alerta se activa al superar 1,5 veces el presupuesto diario; si no hay presupuesto, "
+            f"se usa 1,5 veces {texto_base_promedio}. ⚠ identifica los días que excedieron ese límite."
+        )
+        if not df.empty and "GASTOS_FECHA" in df.columns:
+            calendario = df.dropna(subset=["GASTOS_FECHA"]).copy()
+            calendario["Fecha"] = pd.to_datetime(calendario["GASTOS_FECHA"], errors="coerce")
+            calendario = calendario.dropna(subset=["Fecha"])
+            calendario["Día"] = calendario["Fecha"].dt.day
+            calendario["Periodo calendario"] = calendario["Fecha"].dt.to_period("M").astype(str)
+            periodos_disponibles_calendario = sorted(
+                calendario["Periodo calendario"].dropna().unique()
+            )
+            periodos_visibles_calendario = set(
+                periodos_disponibles_calendario[-cantidad_meses_calendario:]
+            )
+            calendario = calendario[
+                calendario["Periodo calendario"].isin(periodos_visibles_calendario)
+            ].copy()
+
+            cal_tabla = calendario.pivot_table(
+                index="Periodo calendario",
+                columns="Día",
+                values="GASTOS_CANTIDAD",
+                aggfunc="sum",
+                fill_value=0,
+            ).reindex(columns=range(1, 32), fill_value=0)
+            if not cal_tabla.empty:
+                conteo_movimientos = calendario.groupby(
+                    ["Periodo calendario", "Día"]
+                ).size().to_dict()
+                gasto_categoria_dia = (
+                    calendario.groupby(
+                        ["Periodo calendario", "Día", "GASTOS_CATEGORIA"],
+                        dropna=False,
+                    )["GASTOS_CANTIDAD"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("GASTOS_CANTIDAD", ascending=False)
+                    .drop_duplicates(["Periodo calendario", "Día"])
+                )
+                categoria_principal_dia = {
+                    (fila["Periodo calendario"], int(fila["Día"])): (
+                        "Sin categoría"
+                        if str(fila["GASTOS_CATEGORIA"]).strip().lower()
+                        in {"", "undefined", "none", "nan"}
+                        else str(fila["GASTOS_CATEGORIA"])
+                    )
+                    for _, fila in gasto_categoria_dia.iterrows()
+                }
+                promedio_diario_mes = (
+                    calendario.groupby("Periodo calendario")["GASTOS_CANTIDAD"].sum()
+                    / calendario.groupby("Periodo calendario")["Día"].nunique().clip(lower=1)
+                ).to_dict()
+
+                filtros_clasificacion_activos = (
+                    set(categorias_sel) != set(categorias)
+                    or set(subcategorias_sel) != set(subcategorias)
+                )
+
+                etiquetas_meses = []
+                matriz_gasto = []
+                matriz_personalizada = []
+                mascara_sobre_promedio = []
+                mascara_bajo_promedio = []
+                alertas_x = []
+                alertas_y = []
+
+                for periodo_clave in cal_tabla.index:
+                    periodo = pd.Period(periodo_clave, freq="M")
+                    etiqueta_mes = f"{MESES_ORDEN[periodo.month - 1].title()} {periodo.year}"
+                    etiquetas_meses.append(etiqueta_mes)
+                    dias_del_mes = int(periodo.days_in_month)
+                    promedio_mes = float(promedio_diario_mes.get(periodo_clave, 0.0))
+                    promedio_referencia = (
+                        float(gasto_promedio_diario)
+                        if modo_promedio_calendario == "Período filtrado"
+                        else promedio_mes
+                    )
+
+                    presupuesto_mes = 0.0
+                    if not filtros_clasificacion_activos and isinstance(
+                        presupuesto_mensual_por_periodo, dict
+                    ):
+                        for (anio_pres, mes_pres), valor_pres in presupuesto_mensual_por_periodo.items():
+                            if (
+                                int(anio_pres) == int(periodo.year)
+                                and normalizar_mes(mes_pres)
+                                == normalizar_mes(MESES_ORDEN[periodo.month - 1])
+                            ):
+                                presupuesto_mes = float(valor_pres or 0.0)
+                                break
+                    if (
+                        presupuesto_mes <= 0
+                        and not filtros_clasificacion_activos
+                        and float(presupuesto_mensual_base or 0.0) > 0
+                    ):
+                        presupuesto_mes = float(presupuesto_mensual_base)
+
+                    if presupuesto_mes > 0:
+                        base_limite = presupuesto_mes / max(dias_del_mes, 1)
+                        fuente_limite = "Presupuesto diario"
+                    else:
+                        base_limite = promedio_referencia
+                        fuente_limite = (
+                            "Promedio diario del período filtrado"
+                            if modo_promedio_calendario == "Período filtrado"
+                            else "Promedio diario del mes"
+                        )
+                    limite_equilibrado = base_limite * 1.5
+
+                    fila_gasto = []
+                    fila_personalizada = []
+                    fila_sobre = []
+                    fila_bajo = []
+                    for dia in range(1, 32):
+                        fecha_celda_valida = dia <= dias_del_mes
+                        if fecha_celda_valida:
+                            fecha_celda = pd.Timestamp(periodo.year, periodo.month, dia)
+                            fecha_celda_valida = fecha_desde_ts.normalize() <= fecha_celda <= fecha_hasta_ts.normalize()
+
+                        if not fecha_celda_valida:
+                            fila_gasto.append(None)
+                            fila_personalizada.append([None] * 8)
+                            fila_sobre.append(None)
+                            fila_bajo.append(None)
+                            continue
+
+                        gasto_dia = float(cal_tabla.loc[periodo_clave, dia])
+                        movimientos_dia = int(conteo_movimientos.get((periodo_clave, dia), 0))
+                        categoria_principal = categoria_principal_dia.get(
+                            (periodo_clave, dia), "Sin movimientos"
+                        )
+                        diferencia_promedio_pct = (
+                            (gasto_dia - promedio_referencia) / promedio_referencia * 100
+                            if promedio_referencia > 0 else 0.0
+                        )
+                        veces_promedio = (
+                            gasto_dia / promedio_referencia
+                            if promedio_referencia > 0 else 0.0
+                        )
+                        if diferencia_promedio_pct > 0:
+                            lectura_promedio = f"{diferencia_promedio_pct:.1f}% por encima"
+                            sobre_promedio = True
+                        elif diferencia_promedio_pct < 0:
+                            lectura_promedio = f"{abs(diferencia_promedio_pct):.1f}% por debajo"
+                            sobre_promedio = False
+                        else:
+                            lectura_promedio = "Igual al promedio"
+                            sobre_promedio = False
+
+                        if limite_equilibrado > 0 and gasto_dia > limite_equilibrado:
+                            exceso_limite = gasto_dia - limite_equilibrado
+                            exceso_limite_pct = exceso_limite / limite_equilibrado * 100
+                            lectura_limite = (
+                                f"Excedido por ${exceso_limite:,.0f} ({exceso_limite_pct:.1f}%)"
+                            )
+                            alertas_x.append(dia)
+                            alertas_y.append(etiqueta_mes)
+                        else:
+                            margen_limite = max(limite_equilibrado - gasto_dia, 0.0)
+                            lectura_limite = f"Dentro del límite · margen ${margen_limite:,.0f}"
+
+                        datos_tooltip = [
+                            gasto_dia,
+                            promedio_referencia,
+                            lectura_promedio,
+                            limite_equilibrado,
+                            lectura_limite,
+                            movimientos_dia,
+                            categoria_principal,
+                            fuente_limite,
+                        ]
+                        # La intensidad se limita visualmente a 2x. Los valores
+                        # superiores conservan su dato real en el tooltip.
+                        fila_gasto.append(min(veces_promedio, 2.0))
+                        fila_personalizada.append(datos_tooltip)
+                        fila_sobre.append(1 if sobre_promedio else None)
+                        fila_bajo.append(1 if not sobre_promedio else None)
+
+                    matriz_gasto.append(fila_gasto)
+                    matriz_personalizada.append(fila_personalizada)
+                    mascara_sobre_promedio.append(fila_sobre)
+                    mascara_bajo_promedio.append(fila_bajo)
+
+                fig_cal = go.Figure()
+                fig_cal.add_trace(go.Heatmap(
+                    z=matriz_gasto,
+                    x=list(range(1, 32)),
+                    y=etiquetas_meses,
+                    zmin=0,
+                    zmax=2.0,
+                    colorscale="Turbo",
+                    colorbar=dict(
+                        title="Veces el<br>promedio diario",
+                        tickmode="array",
+                        tickvals=[0, 0.5, 1.0, 1.5, 2.0],
+                        ticktext=["0x", "0,5x", "1x", "1,5x", "2x+"],
+                        thickness=16,
+                    ),
+                    hoverinfo="skip",
+                    hoverongaps=False,
+                ))
+
+                if alertas_x:
+                    fig_cal.add_trace(go.Scatter(
+                        x=alertas_x,
+                        y=alertas_y,
+                        mode="text",
+                        text=["⚠"] * len(alertas_x),
+                        textfont=dict(color="#FFFFFF", size=15),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    ))
+
+                etiqueta_promedio_tooltip = (
+                    "Promedio diario del período filtrado"
+                    if modo_promedio_calendario == "Período filtrado"
+                    else "Promedio diario del mes"
+                )
+                tooltip_calendario = (
+                    "<b>%{y}</b><br>"
+                    "Día del mes: %{x}<br><br>"
+                    "Gasto del día: <b>$%{customdata[0]:,.0f}</b><br>"
+                    f"{etiqueta_promedio_tooltip}: $%{{customdata[1]:,.0f}}<br>"
+                    "Comparación: <b>%{customdata[2]}</b><br><br>"
+                    "Límite equilibrado: $%{customdata[3]:,.0f}<br>"
+                    "Estado: <b>%{customdata[4]}</b><br>"
+                    "Base aplicada: %{customdata[7]} × 1,5<br><br>"
+                    "Movimientos: %{customdata[5]}<br>"
+                    "Categoría principal: %{customdata[6]}"
+                    "<extra></extra>"
+                )
+                escala_transparente = [
+                    [0, "rgba(0,0,0,0)"],
+                    [1, "rgba(0,0,0,0)"],
+                ]
+                fig_cal.add_trace(go.Heatmap(
+                    z=mascara_sobre_promedio,
+                    x=list(range(1, 32)),
+                    y=etiquetas_meses,
+                    customdata=matriz_personalizada,
+                    colorscale=escala_transparente,
+                    showscale=False,
+                    hovertemplate=tooltip_calendario,
+                    hoverlabel=dict(
+                        bgcolor="#4A0713",
+                        bordercolor="#FF1744",
+                        font=dict(color="#FFFFFF", size=12),
+                    ),
+                    hoverongaps=False,
+                ))
+                fig_cal.add_trace(go.Heatmap(
+                    z=mascara_bajo_promedio,
+                    x=list(range(1, 32)),
+                    y=etiquetas_meses,
+                    customdata=matriz_personalizada,
+                    colorscale=escala_transparente,
+                    showscale=False,
+                    hovertemplate=tooltip_calendario,
+                    hoverlabel=dict(
+                        bgcolor="#06351D",
+                        bordercolor="#00E676",
+                        font=dict(color="#FFFFFF", size=12),
+                    ),
+                    hoverongaps=False,
+                ))
+                fig_cal.update_layout(
+                    height=max(340, 58 * len(cal_tabla) + 175),
+                    title="Intensidad diaria del gasto · ⚠ supera el límite equilibrado",
+                    xaxis_title="Día del mes",
+                    yaxis_title="Mes y año",
+                    showlegend=False,
+                )
+                st.plotly_chart(
+                    estilo_grafico(
+                        fig_cal,
+                        "Intensidad diaria del gasto · ⚠ supera el límite equilibrado",
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info("No hay fechas válidas para construir el calendario.")
+
+        # ======================================================
+        # 7. WATERFALL: QUÉ EXPLICA EL CAMBIO DEL GASTO
+        # ======================================================
+        st.divider()
+        st.markdown("## ¿Qué explica el cambio del gasto?")
+        if len(meses_movimiento) >= 2 and 'comp_categorias' in locals() and not comp_categorias.empty:
+            contrib = comp_categorias.sort_values("Cambio", key=lambda serie: serie.abs(), ascending=False).head(10)
+            total_anterior = float(meses_movimiento.iloc[-2]["Gastos"])
+            total_actual = float(meses_movimiento.iloc[-1]["Gastos"])
+            fig_water = go.Figure(go.Waterfall(
+                orientation="v",
+                measure=["absolute"] + ["relative"] * len(contrib) + ["total"],
+                x=[f"Gasto {meses_movimiento.iloc[-2]['MES']}"] + contrib["GASTOS_CATEGORIA"].astype(str).tolist() + [f"Gasto {meses_movimiento.iloc[-1]['MES']}"] ,
+                y=[total_anterior] + contrib["Cambio"].tolist() + [total_actual],
+                text=[f"${total_anterior:,.0f}"] + [f"${v:+,.0f}" for v in contrib["Cambio"]] + [f"${total_actual:,.0f}"],
+                textposition="outside",
+                increasing={"marker": {"color": "#FF2E6E"}},
+                decreasing={"marker": {"color": "#00FF9C"}},
+                totals={"marker": {"color": "#00E5FF"}},
+                connector={"line": {"color": "#94A3B8"}},
+            ))
+            fig_water.update_layout(height=500, xaxis_tickangle=-35, showlegend=False)
+            st.plotly_chart(estilo_grafico(fig_water, "Contribución de las categorías al cambio mensual"), use_container_width=True)
+        else:
+            st.info("Se necesitan dos meses para explicar el cambio mediante un gráfico waterfall.")
+
+    if pestana_activa == etiquetas_pestanas[2]:
+        st.divider()
+        ingresos_laborales_proyeccion = ingresos_filtrados.copy()
+        if not ingresos_laborales_proyeccion.empty:
+            ingresos_laborales_proyeccion["INGRESOS_FECHA"] = pd.to_datetime(
+                ingresos_laborales_proyeccion["INGRESOS_FECHA"], errors="coerce"
+            )
+            ingresos_laborales_proyeccion = ingresos_laborales_proyeccion.dropna(
+                subset=["INGRESOS_FECHA"]
+            )
+            ingresos_laborales_proyeccion["TIPO_PROYECCION"] = (
+                ingresos_laborales_proyeccion["INGRESOS_CATEGORIA"].map(etiqueta_tipo_ingreso)
+            )
+            ingresos_laborales_proyeccion = ingresos_laborales_proyeccion[
+                ingresos_laborales_proyeccion["TIPO_PROYECCION"].eq("Laborales")
+            ].copy()
+            ingresos_laborales_proyeccion["PERIODO_PROYECCION"] = (
+                ingresos_laborales_proyeccion["INGRESOS_FECHA"].dt.to_period("M")
+            )
+
+        gastos_proyeccion = df.copy()
+        if not gastos_proyeccion.empty:
+            gastos_proyeccion["GASTOS_FECHA"] = pd.to_datetime(
+                gastos_proyeccion["GASTOS_FECHA"], errors="coerce"
+            )
+            gastos_proyeccion = gastos_proyeccion.dropna(subset=["GASTOS_FECHA"])
+            gastos_proyeccion["PERIODO_PROYECCION"] = (
+                gastos_proyeccion["GASTOS_FECHA"].dt.to_period("M")
+            )
+
+        valor_real_inversion = float(
+            ingresos_laborales_proyeccion["INGRESOS_CANTIDAD"].sum()
+            if not ingresos_laborales_proyeccion.empty else 0.0
+        ) - float(
+            gastos_proyeccion["GASTOS_CANTIDAD"].sum()
+            if not gastos_proyeccion.empty else 0.0
+        )
+
+        salarios_mensuales_proyeccion = (
+            ingresos_laborales_proyeccion.groupby("PERIODO_PROYECCION")["INGRESOS_CANTIDAD"].sum()
+            if not ingresos_laborales_proyeccion.empty else pd.Series(dtype=float)
+        )
+        gastos_mensuales_proyeccion = (
+            gastos_proyeccion.groupby("PERIODO_PROYECCION")["GASTOS_CANTIDAD"].sum()
+            if not gastos_proyeccion.empty else pd.Series(dtype=float)
+        )
+        periodos_conocidos_proyeccion = sorted(
+            set(salarios_mensuales_proyeccion.index).union(gastos_mensuales_proyeccion.index)
+        )
+
+        if periodos_conocidos_proyeccion:
+            periodos_observados_proyeccion = pd.period_range(
+                start=periodos_conocidos_proyeccion[0],
+                end=periodos_conocidos_proyeccion[-1],
+                freq="M",
+            )
+            salarios_observados = salarios_mensuales_proyeccion.reindex(
+                periodos_observados_proyeccion, fill_value=0.0
+            ).astype(float).tolist()
+            gastos_observados = gastos_mensuales_proyeccion.reindex(
+                periodos_observados_proyeccion, fill_value=0.0
+            ).astype(float).tolist()
+
+            cantidad_observada = max(len(periodos_observados_proyeccion), 1)
+            salario_mensual_tendencia = sum(salarios_observados) / cantidad_observada
+            gasto_mensual_tendencia = sum(gastos_observados) / cantidad_observada
+            saldo_mensual_tendencia = (
+                salario_mensual_tendencia - gasto_mensual_tendencia
+            )
+
+            maximo_inversion_disponible = max(int(round(valor_real_inversion)), 0)
+            maximo_inversion_texto = f"${maximo_inversion_disponible:,.0f}".replace(",", ".")
+            clave_inversion_inicial = "tendencias_capital_inicial_proyeccion_v13"
+            if clave_inversion_inicial not in st.session_state:
+                st.session_state[clave_inversion_inicial] = maximo_inversion_disponible
+            else:
+                st.session_state[clave_inversion_inicial] = min(
+                    max(int(st.session_state[clave_inversion_inicial]), 0),
+                    maximo_inversion_disponible,
+                )
+
+            with st.expander("📈 Proyección de ahorro a 10, 20 y 30 años", expanded=False):
+                st.markdown(
+                    """
+                    <style>
+                    .st-key-tendencias_control_inversion,
+                    .st-key-tendencias_control_tasa {
+                        background:linear-gradient(145deg,rgba(0,230,118,.18),rgba(0,45,25,.76));
+                        border:1px solid rgba(0,255,136,.72) !important;
+                        border-radius:18px;
+                        box-shadow:0 0 24px rgba(0,255,136,.18);
+                        min-height:250px;
+                    }
+                    .st-key-tendencias_control_inversion [data-testid="stSlider"] > div,
+                    .st-key-tendencias_control_tasa [data-testid="stSlider"] > div {
+                        padding-top:.15rem;
+                    }
+                    .st-key-tendencias_control_inversion [data-testid="stSlider"],
+                    .st-key-tendencias_control_tasa [data-testid="stSlider"] {
+                        --primary-color:#00FF88;
+                        accent-color:#00FF88;
+                    }
+                    .st-key-tendencias_control_inversion div[data-baseweb="slider"] [role="slider"],
+                    .st-key-tendencias_control_tasa div[data-baseweb="slider"] [role="slider"] {
+                        background:#00FF88 !important;
+                        border-color:#B7FFD8 !important;
+                        box-shadow:0 0 0 4px rgba(0,255,136,.18),0 0 16px rgba(0,255,136,.72) !important;
+                    }
+                    .st-key-tendencias_control_inversion div[data-baseweb="slider"] > div > div,
+                    .st-key-tendencias_control_tasa div[data-baseweb="slider"] > div > div {
+                        background:linear-gradient(90deg,#064E3B,#00FF88) !important;
+                    }
+                    .st-key-tendencias_control_inversion [data-baseweb="slider"] *,
+                    .st-key-tendencias_control_tasa [data-baseweb="slider"] *,
+                    .st-key-tendencias_control_inversion [data-testid="stTickBar"] *,
+                    .st-key-tendencias_control_tasa [data-testid="stTickBar"] * {
+                        color:#B7FFD8 !important;
+                        border-color:#5EEBAD !important;
+                    }
+                    .st-key-tendencias_control_inversion [data-testid="stThumbValue"],
+                    .st-key-tendencias_control_tasa [data-testid="stThumbValue"],
+                    .st-key-tendencias_control_inversion [data-testid="stSliderThumbValue"],
+                    .st-key-tendencias_control_tasa [data-testid="stSliderThumbValue"] {
+                        background:#123D31 !important;
+                        color:#DFFFF0 !important;
+                        border:1px solid #5EEBAD !important;
+                    }
+                    .proyeccion-control-disponible {
+                        display:inline-block;
+                        margin-top:8px;
+                        padding:5px 10px;
+                        border-radius:999px;
+                        color:#CFFFE3;
+                        background:rgba(0,255,136,.10);
+                        border:1px solid rgba(94,235,173,.34);
+                        font-size:12px;
+                    }
+                    .proyeccion-control-numero {
+                        margin-top:5px;
+                        color:#8FFFC4;
+                        font-size:32px;
+                        line-height:1.05;
+                        font-weight:850;
+                        letter-spacing:-.035em;
+                        font-variant-numeric:tabular-nums;
+                        text-shadow:0 0 18px rgba(0,255,136,.34);
+                    }
+                    .proyeccion-control-detalle {
+                        margin-top:8px;
+                        color:#C8E8D5;
+                        font-size:12px;
+                        line-height:1.45;
+                    }
+                    </style>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                controles_proyeccion = st.columns(2)
+                with controles_proyeccion[0]:
+                    with st.container(border=True, key="tendencias_control_inversion"):
+                        st.markdown(
+                            f"""
+                            <div style="min-height:58px;">
+                                <div style="font-size:13px;color:#D8FBE6;font-weight:700;letter-spacing:.04em;">
+                                    💰 CAPITAL INICIAL PARA INVERTIR
+                                </div>
+                                <div class="proyeccion-control-disponible">
+                                    Máximo disponible · <b>{maximo_inversion_texto}</b>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        if maximo_inversion_disponible > 0:
+                            paso_inversion = max(1, int(maximo_inversion_disponible / 100))
+                            capital_inicial_proyeccion = st.slider(
+                                "Monto que se va a invertir",
+                                min_value=0,
+                                max_value=maximo_inversion_disponible,
+                                step=paso_inversion,
+                                key=clave_inversion_inicial,
+                                help=(
+                                    "Reduce la barra si deseas proyectar solamente una parte del capital "
+                                    "disponible. Las gráficas y las tarjetas se recalculan automáticamente."
+                                ),
+                            )
+                        else:
+                            capital_inicial_proyeccion = 0
+                            st.progress(0, text="No hay capital positivo disponible para invertir")
+                        porcentaje_invertido = (
+                            capital_inicial_proyeccion / maximo_inversion_disponible * 100
+                            if maximo_inversion_disponible else 0.0
+                        )
+                        proporcion_capital_elegida = (
+                            capital_inicial_proyeccion / maximo_inversion_disponible
+                            if maximo_inversion_disponible else 0.0
+                        )
+                        aporte_mensual_proyectado = (
+                            saldo_mensual_tendencia * proporcion_capital_elegida
+                        )
+                        capital_inicial_texto = f"${capital_inicial_proyeccion:,.0f}".replace(",", ".")
+                        aporte_mensual_texto = f"${aporte_mensual_proyectado:,.0f}".replace(",", ".")
+                        st.markdown(
+                            f"""
+                            <div class="proyeccion-control-numero">
+                                {capital_inicial_texto}
+                            </div>
+                            <div class="proyeccion-control-detalle">
+                                {porcentaje_invertido:.0f}% del capital disponible · aporte mensual proyectado:
+                                <b>{aporte_mensual_texto}</b>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                with controles_proyeccion[1]:
+                    with st.container(border=True, key="tendencias_control_tasa"):
+                        st.markdown(
+                            """
+                            <div style="min-height:58px;">
+                                <div style="font-size:13px;color:#D8FBE6;font-weight:700;letter-spacing:.04em;">
+                                    📈 RENDIMIENTO EFECTIVO ANUAL
+                                </div>
+                                <div style="font-size:12px;color:#B9DCC6;margin-top:7px;">
+                                    Compara el escenario base con el crecimiento de la inversión.
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        tasa_interes_ea_pct = st.slider(
+                            "Tasa de interés efectiva anual (EA)",
+                            min_value=2,
+                            max_value=25,
+                            value=10,
+                            step=1,
+                            format="%d%%",
+                            help=(
+                                "Selecciona el rendimiento anual estimado para la proyección "
+                                "de 10, 20 y 30 años."
+                            ),
+                            key="tendencias_tasa_interes_ea_v13",
+                        )
+                        st.markdown(
+                            f"""
+                            <div class="proyeccion-control-numero">
+                                {tasa_interes_ea_pct}% EA
+                            </div>
+                            <div class="proyeccion-control-detalle">
+                                Tasa elegida para el escenario con rendimiento compuesto
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                st.caption(
+                    "El monto elegido funciona como capital inicial y también define qué proporción del saldo "
+                    "mensual observado se seguirá invirtiendo. El escenario con rendimiento añade la tasa EA seleccionada."
+                )
+
+                meses_proyectados = 30 * 12
+                periodos_futuros = pd.period_range(
+                    start=periodos_observados_proyeccion[-1] + 1,
+                    periods=meses_proyectados,
+                    freq="M",
+                )
+                salarios_futuros = []
+                gastos_futuros = []
+                saldos_mensuales_futuros = []
+                ahorro_acumulado_futuro = []
+                acumulado = float(capital_inicial_proyeccion)
+                for _ in range(meses_proyectados):
+                    acumulado += aporte_mensual_proyectado
+                    salarios_futuros.append(salario_mensual_tendencia)
+                    gastos_futuros.append(gasto_mensual_tendencia)
+                    saldos_mensuales_futuros.append(aporte_mensual_proyectado)
+                    ahorro_acumulado_futuro.append(acumulado)
+
+                valores_horizonte = {
+                    10: capital_inicial_proyeccion + aporte_mensual_proyectado * 10 * 12,
+                    20: capital_inicial_proyeccion + aporte_mensual_proyectado * 20 * 12,
+                    30: capital_inicial_proyeccion + aporte_mensual_proyectado * 30 * 12,
+                }
+                st.markdown("### Escenario base · sin rendimiento")
+                tarjetas_proyeccion = st.columns(3)
+                for tarjeta, anios_horizonte in zip(tarjetas_proyeccion, [10, 20, 30]):
+                    valor_horizonte = float(valores_horizonte[anios_horizonte])
+                    es_favorable = valor_horizonte >= 0
+                    color_tarjeta = "#00E676" if es_favorable else "#FF1744"
+                    fondo_tarjeta = (
+                        "linear-gradient(145deg, rgba(0,230,118,0.20), rgba(0,45,25,0.72))"
+                        if es_favorable
+                        else "linear-gradient(145deg, rgba(255,23,68,0.22), rgba(55,4,16,0.78))"
+                    )
+                    estado_tarjeta = "Saldo a favor" if es_favorable else "Deuda proyectada"
+                    with tarjeta:
+                        st.markdown(
+                            f"""
+                            <div style="background:{fondo_tarjeta};border:1px solid {color_tarjeta};
+                                        border-radius:18px;padding:20px 18px;min-height:145px;
+                                        box-shadow:0 0 22px {color_tarjeta}33;">
+                                <div style="font-size:13px;color:#D8FBE6;font-weight:700;letter-spacing:.04em;">
+                                    PROYECCIÓN A {anios_horizonte} AÑOS
+                                </div>
+                                <div style="font-size:27px;color:{color_tarjeta};font-weight:800;margin-top:12px;">
+                                    ${abs(valor_horizonte):,.0f}
+                                </div>
+                                <div style="font-size:13px;color:#F4FFF8;margin-top:8px;">{estado_tarjeta}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                fechas_futuras = periodos_futuros.to_timestamp(how="end")
+                ahorro_positivo = [
+                    valor if valor >= 0 else None for valor in ahorro_acumulado_futuro
+                ]
+                ahorro_negativo = [
+                    valor if valor < 0 else None for valor in ahorro_acumulado_futuro
+                ]
+                datos_proyeccion_hover = pd.DataFrame({
+                    "Salario proyectado": salarios_futuros,
+                    "Gasto proyectado": gastos_futuros,
+                    "Aporte mensual elegido": saldos_mensuales_futuros,
+                    "Capital inicial": [capital_inicial_proyeccion] * meses_proyectados,
+                })
+                fig_proyeccion_largo_plazo = go.Figure()
+                fig_proyeccion_largo_plazo.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=ahorro_positivo,
+                    mode="lines",
+                    line=dict(color="#00E676", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(0,230,118,0.18)",
+                    hoverinfo="skip",
+                    name="Saldo a favor",
+                ))
+                fig_proyeccion_largo_plazo.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=ahorro_negativo,
+                    mode="lines",
+                    line=dict(color="#FF1744", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(255,23,68,0.18)",
+                    hoverinfo="skip",
+                    name="Deuda",
+                ))
+                fig_proyeccion_largo_plazo.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=ahorro_acumulado_futuro,
+                    mode="lines",
+                    line=dict(color="#F8FAFC", width=2.2),
+                    customdata=datos_proyeccion_hover,
+                    hovertemplate=(
+                        "<b>%{x|%B %Y}</b><br>"
+                        "Saldo acumulado: <b>$%{y:,.0f}</b><br>"
+                        "Salario mensual proyectado: $%{customdata[0]:,.0f}<br>"
+                        "Gasto mensual proyectado: $%{customdata[1]:,.0f}<br>"
+                        "Aporte mensual elegido: $%{customdata[2]:,.0f}<br>"
+                        "Capital inicial elegido: $%{customdata[3]:,.0f}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+                fig_proyeccion_largo_plazo.add_hline(
+                    y=0, line_color="#94A3B8", line_width=1.2, line_dash="dot"
+                )
+
+                def formato_horizonte_compacto(valor):
+                    valor = float(valor)
+                    signo = "-" if valor < 0 else ""
+                    valor_abs = abs(valor)
+                    for divisor, sufijo in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")]:
+                        if valor_abs >= divisor:
+                            return f"{signo}${valor_abs / divisor:.1f}{sufijo}"
+                    return f"{signo}${valor_abs:,.0f}"
+
+                for anios_horizonte in [10, 20, 30]:
+                    fecha_horizonte = fechas_futuras[anios_horizonte * 12 - 1]
+                    valor_horizonte_grafica = float(valores_horizonte[anios_horizonte])
+                    fig_proyeccion_largo_plazo.add_shape(
+                        type="line",
+                        xref="x",
+                        yref="paper",
+                        x0=fecha_horizonte,
+                        x1=fecha_horizonte,
+                        y0=0,
+                        y1=1,
+                        line=dict(color="rgba(255,238,0,0.48)", width=1, dash="dot"),
+                    )
+                    fig_proyeccion_largo_plazo.add_annotation(
+                        x=fecha_horizonte,
+                        y=valor_horizonte_grafica,
+                        text=(
+                            f"<b>{anios_horizonte} años</b><br>"
+                            f"{formato_horizonte_compacto(valor_horizonte_grafica)}"
+                        ),
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowcolor="#00FF88" if valor_horizonte_grafica >= 0 else "#FF1744",
+                        ax=0,
+                        ay=-48 if valor_horizonte_grafica >= 0 else 48,
+                        bgcolor="rgba(0,20,12,.92)",
+                        bordercolor="#00FF88" if valor_horizonte_grafica >= 0 else "#FF1744",
+                        borderpad=5,
+                        font=dict(color="#F8FAFC", size=10),
+                    )
+                fig_proyeccion_largo_plazo.update_layout(
+                    height=520,
+                    xaxis_title="Horizonte de proyección",
+                    yaxis_title="Ahorro acumulado / deuda acumulada",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", y=1.08, x=0),
+                )
+                fig_proyeccion_largo_plazo.update_yaxes(tickprefix="$", tickformat="~s")
+                st.markdown(f"### Escenario base · con rendimiento del {tasa_interes_ea_pct}% EA")
+                tasa_efectiva_anual = tasa_interes_ea_pct / 100
+                tasa_efectiva_mensual = (1 + tasa_efectiva_anual) ** (1 / 12) - 1
+                capital_con_interes = []
+                interes_generado_mensual = []
+                rendimiento_acumulado = []
+                capital_actual = float(capital_inicial_proyeccion)
+                for numero_mes in range(1, meses_proyectados + 1):
+                    interes_del_mes = capital_actual * tasa_efectiva_mensual
+                    capital_actual += interes_del_mes + aporte_mensual_proyectado
+                    aporte_neto_acumulado = (
+                        capital_inicial_proyeccion + aporte_mensual_proyectado * numero_mes
+                    )
+                    capital_con_interes.append(capital_actual)
+                    interes_generado_mensual.append(interes_del_mes)
+                    rendimiento_acumulado.append(capital_actual - aporte_neto_acumulado)
+
+                valores_horizonte_interes = {
+                    10: capital_con_interes[10 * 12 - 1],
+                    20: capital_con_interes[20 * 12 - 1],
+                    30: capital_con_interes[30 * 12 - 1],
+                }
+                tarjetas_interes = st.columns(3)
+                for tarjeta, anios_horizonte in zip(tarjetas_interes, [10, 20, 30]):
+                    indice_horizonte = anios_horizonte * 12 - 1
+                    valor_horizonte = float(valores_horizonte_interes[anios_horizonte])
+                    rendimiento_horizonte = float(rendimiento_acumulado[indice_horizonte])
+                    es_favorable = valor_horizonte >= 0
+                    color_tarjeta = "#00E676" if es_favorable else "#FF1744"
+                    fondo_tarjeta = (
+                        "linear-gradient(145deg, rgba(0,230,118,0.20), rgba(0,45,25,0.72))"
+                        if es_favorable
+                        else "linear-gradient(145deg, rgba(255,23,68,0.22), rgba(55,4,16,0.78))"
+                    )
+                    estado_tarjeta = (
+                        "Capital acumulado" if es_favorable else "Deuda acumulada"
+                    )
+                    detalle_rendimiento = (
+                        "Rendimiento estimado"
+                        if rendimiento_horizonte >= 0
+                        else "Interés acumulado sobre la deuda"
+                    )
+                    with tarjeta:
+                        st.markdown(
+                            f"""
+                            <div style="background:{fondo_tarjeta};border:1px solid {color_tarjeta};
+                                        border-radius:18px;padding:20px 18px;min-height:172px;
+                                        box-shadow:0 0 22px {color_tarjeta}33;">
+                                <div style="font-size:13px;color:#D8FBE6;font-weight:700;letter-spacing:.04em;">
+                                    {tasa_interes_ea_pct}% EA · {anios_horizonte} AÑOS
+                                </div>
+                                <div style="font-size:27px;color:{color_tarjeta};font-weight:800;margin-top:12px;">
+                                    ${abs(valor_horizonte):,.0f}
+                                </div>
+                                <div style="font-size:13px;color:#F4FFF8;margin-top:7px;">{estado_tarjeta}</div>
+                                <div style="font-size:11px;color:#B9DCC6;margin-top:10px;">
+                                    {detalle_rendimiento}: ${abs(rendimiento_horizonte):,.0f}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                capital_positivo = [
+                    valor if valor >= 0 else None for valor in capital_con_interes
+                ]
+                capital_negativo = [
+                    valor if valor < 0 else None for valor in capital_con_interes
+                ]
+                datos_interes_hover = pd.DataFrame({
+                    "Aporte neto mensual": [aporte_mensual_proyectado] * meses_proyectados,
+                    "Interés del mes": interes_generado_mensual,
+                    "Rendimiento acumulado": rendimiento_acumulado,
+                    "Capital inicial": [capital_inicial_proyeccion] * meses_proyectados,
+                })
+                fig_proyeccion_interes = go.Figure()
+                fig_proyeccion_interes.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=capital_positivo,
+                    mode="lines",
+                    line=dict(color="#00E676", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(0,230,118,0.20)",
+                    hoverinfo="skip",
+                    name="Capital a favor",
+                ))
+                fig_proyeccion_interes.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=capital_negativo,
+                    mode="lines",
+                    line=dict(color="#FF1744", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(255,23,68,0.20)",
+                    hoverinfo="skip",
+                    name="Deuda con interés",
+                ))
+                fig_proyeccion_interes.add_trace(go.Scatter(
+                    x=fechas_futuras,
+                    y=capital_con_interes,
+                    mode="lines",
+                    line=dict(color="#FFEE00", width=2.4),
+                    customdata=datos_interes_hover,
+                    hovertemplate=(
+                        "<b>%{x|%B %Y}</b><br>"
+                        "Capital acumulado: <b>$%{y:,.0f}</b><br>"
+                        "Aporte neto mensual: $%{customdata[0]:,.0f}<br>"
+                        "Interés del mes: $%{customdata[1]:,.0f}<br>"
+                        "Rendimiento acumulado: $%{customdata[2]:,.0f}<br>"
+                        "Capital inicial elegido: $%{customdata[3]:,.0f}"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+                fig_proyeccion_interes.add_hline(
+                    y=0, line_color="#94A3B8", line_width=1.2, line_dash="dot"
+                )
+                for anios_horizonte in [10, 20, 30]:
+                    fecha_horizonte = fechas_futuras[anios_horizonte * 12 - 1]
+                    valor_horizonte_grafica = float(valores_horizonte_interes[anios_horizonte])
+                    fig_proyeccion_interes.add_shape(
+                        type="line",
+                        xref="x",
+                        yref="paper",
+                        x0=fecha_horizonte,
+                        x1=fecha_horizonte,
+                        y0=0,
+                        y1=1,
+                        line=dict(color="rgba(255,238,0,0.48)", width=1, dash="dot"),
+                    )
+                    fig_proyeccion_interes.add_annotation(
+                        x=fecha_horizonte,
+                        y=valor_horizonte_grafica,
+                        text=(
+                            f"<b>{anios_horizonte} años</b><br>"
+                            f"{formato_horizonte_compacto(valor_horizonte_grafica)}"
+                        ),
+                        showarrow=True,
+                        arrowhead=2,
+                        arrowcolor="#00FF88" if valor_horizonte_grafica >= 0 else "#FF1744",
+                        ax=0,
+                        ay=-48 if valor_horizonte_grafica >= 0 else 48,
+                        bgcolor="rgba(0,20,12,.92)",
+                        bordercolor="#00FF88" if valor_horizonte_grafica >= 0 else "#FF1744",
+                        borderpad=5,
+                        font=dict(color="#F8FAFC", size=10),
+                    )
+                fig_proyeccion_interes.update_layout(
+                    height=520,
+                    xaxis_title="Horizonte de inversión",
+                    yaxis_title="Capital acumulado / deuda acumulada",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", y=1.08, x=0),
+                )
+                fig_proyeccion_interes.update_yaxes(tickprefix="$", tickformat="~s")
+
+                st.markdown("### Comparación visual de los dos escenarios")
+                columnas_graficas_proyeccion = st.columns(2)
+                with columnas_graficas_proyeccion[0]:
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_proyeccion_largo_plazo,
+                            "Sin rendimiento · tendencia de salarios menos gastos",
+                        ),
+                        use_container_width=True,
+                        key="tendencias_proyeccion_ahorro_30_anios_v13",
+                    )
+                    st.caption(
+                        f"Capital inicial de ${capital_inicial_proyeccion:,.0f} más un aporte mensual ajustado "
+                        f"de ${aporte_mensual_proyectado:,.0f}, sin aplicar intereses."
+                    )
+                with columnas_graficas_proyeccion[1]:
+                    st.plotly_chart(
+                        estilo_grafico(
+                            fig_proyeccion_interes,
+                            f"Con rendimiento compuesto · {tasa_interes_ea_pct}% EA",
+                        ),
+                        use_container_width=True,
+                        key="tendencias_proyeccion_interes_ea_v13",
+                    )
+                    st.caption(
+                        f"Aplica {tasa_interes_ea_pct}% EA sobre ${capital_inicial_proyeccion:,.0f}; "
+                        f"se aportan ${aporte_mensual_proyectado:,.0f} al mes y los rendimientos se reinvierten."
+                    )
+
+                if len(periodos_observados_proyeccion) < 6:
+                    st.warning(
+                        "La proyección se construye con menos de seis meses observados; úsala con especial cautela."
+                    )
+                st.caption(
+                    "Los valores señalados en 10, 20 y 30 años facilitan la comparación. "
+                    "Son escenarios orientativos y no garantizan resultados futuros."
+                )
+        else:
+            st.info(
+                "No hay salarios laborales o gastos con fechas válidas suficientes para construir la proyección."
+            )
+
+        # ======================================================
+
+    if pestana_activa == etiquetas_pestanas[3]:
+        # Mantiene el marco existente por delante del lienzo, sin sumar otro marco.
+        st.markdown("""<style>
+        [data-testid="stPlotlyChart"] {
+            position:relative;box-sizing:border-box !important;
+            padding:0 !important;border:0 !important;
+            width:100%;max-width:100%;min-width:0;
+            border-radius:18px;overflow:hidden;isolation:isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content:"";position:absolute;inset:0;box-sizing:border-box;
+            border:1px solid rgba(0,240,255,.55);border-radius:18px;
+            pointer-events:none;z-index:10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing:border-box;width:100% !important;max-width:100%;min-width:0;
+        }
+        </style>""", unsafe_allow_html=True)
+        contexto_pestana("¿Estoy cumpliendo mis metas?", "Contrasta el gasto real con el plan, identifica desviaciones y muestra qué ajustes tendrían mayor impacto.")
+        st.markdown("## 1. 🧭 Estado general del presupuesto")
+        sub_df = df.copy()
+        sub_df["GASTOS_SUBCATEGORIA"] = sub_df["GASTOS_SUBCATEGORIA"].fillna("Sin subcategoría")
+        sub_df["GASTOS_SUBCATEGORIA_2"] = sub_df["GASTOS_SUBCATEGORIA_2"].fillna("Sin detalle")
+
+        presupuesto_periodo_total = float(presupuesto_mensual_general or 0.0)
+        gasto_presupuesto_total = float(total_gastos)
+        disponible_presupuesto = presupuesto_periodo_total - gasto_presupuesto_total
+        ejecucion_presupuesto_pct = gasto_presupuesto_total / presupuesto_periodo_total * 100 if presupuesto_periodo_total > 0 else 0.0
+
+        presupuesto_categoria_tabla = (
+            df.groupby("GASTOS_CATEGORIA", as_index=False)["GASTOS_CANTIDAD"].sum()
+            .rename(columns={"GASTOS_CANTIDAD": "Gasto"})
+        ) if not df.empty else pd.DataFrame(columns=["GASTOS_CATEGORIA", "Gasto"])
+        presupuesto_categoria_tabla["Presupuesto"] = presupuesto_categoria_tabla["GASTOS_CATEGORIA"].map(
+            lambda c: float(presupuesto_cat.get(normalizar(c), 0.0))
+        )
+        presupuesto_categoria_tabla["Diferencia"] = presupuesto_categoria_tabla["Gasto"] - presupuesto_categoria_tabla["Presupuesto"]
+        presupuesto_categoria_tabla["% ejecutado"] = presupuesto_categoria_tabla.apply(
+            lambda r: r["Gasto"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0, axis=1
+        )
+        presupuesto_categoria_tabla["Estado"] = presupuesto_categoria_tabla.apply(
+            lambda r: "Sin presupuesto" if r["Presupuesto"] <= 0 else (
+                "Controlado" if r["% ejecutado"] <= 80 else "Atención" if r["% ejecutado"] <= 100 else "Excedido"
+            ), axis=1
+        )
+        categorias_excedidas = int((presupuesto_categoria_tabla["Estado"] == "Excedido").sum())
+
+        bp1, bp2, bp3, bp4, bp5 = st.columns(5)
+        tarjeta_perfil_panel(bp1, '📋 Presupuesto', f"${presupuesto_periodo_total:,.0f}", help='Monto presupuestado para el período seleccionado, respetando los filtros activos.')
+        tarjeta_perfil_panel(bp2, '📊 Ejecutado', f"${gasto_presupuesto_total:,.0f}", help='Gasto registrado que se compara con el presupuesto del período.')
+        tarjeta_estilo_gac(
+            bp3, "Disponible", f"${disponible_presupuesto:,.0f}",
+            "Presupuesto del período menos el gasto ejecutado",
+            "#ff526e" if disponible_presupuesto < 0 else "#52e0a4",
+            "🔴" if disponible_presupuesto < 0 else "🟢",
+        )
+        tarjeta_perfil_panel(bp4, '📊 Ejecución', f"{ejecucion_presupuesto_pct:.1f}%", help='Gasto ejecutado dividido entre presupuesto, multiplicado por 100. Más del 100% indica exceso.')
+        tarjeta_perfil_panel(bp5, '🗂️ Categorías excedidas', categorias_excedidas, help='Cantidad de categorías cuyo gasto supera su presupuesto.')
+        st.markdown("## 2. 🚦 Semáforo presupuestal")
+        estados_conteo = presupuesto_categoria_tabla["Estado"].value_counts() if not presupuesto_categoria_tabla.empty else pd.Series(dtype=int)
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        tarjeta_perfil_panel(sm1, "🟢 Controlado", int(estados_conteo.get("Controlado", 0)), help='Categorías con ejecución de hasta el 80% del presupuesto.')
+        tarjeta_perfil_panel(sm2, "🟡 Atención", int(estados_conteo.get("Atención", 0)), help='Categorías con ejecución superior al 80% y de hasta el 100% del presupuesto.')
+        tarjeta_perfil_panel(sm3, "🔴 Excedido", int(estados_conteo.get("Excedido", 0)), help='Categorías cuyo gasto supera el 100% del presupuesto.')
+        tarjeta_perfil_panel(sm4, "⚪ Sin presupuesto", int(estados_conteo.get("Sin presupuesto", 0)), help='Categorías sin presupuesto asignado en esta comparación.')
+
+        st.markdown("## 3. 📊 Ranking de desviaciones")
+        st.caption(
+            "🔴 Los excesos muestran dónde el gasto superó el plan. "
+            "🟢 Las disponibilidades muestran el margen que aún queda dentro del presupuesto asignado."
+        )
+
+        def estilo_ranking_neon(
+            fig, valores, titulo, nombre_escala, margen_izquierdo=155,
+            paleta="exceso",
+        ):
+            """Aplica el estilo de referencia con color semántico por tipo de ranking."""
+            valores_color = pd.to_numeric(pd.Series(valores), errors="coerce").fillna(0).tolist()
+            max_valor = max(valores_color, default=0.0)
+            if paleta == "disponibilidad":
+                escala_neon = [
+                    [0.00, "#04150C"],
+                    [0.25, "#075C30"],
+                    [0.50, "#00A854"],
+                    [0.75, "#00E676"],
+                    [1.00, "#00FF88"],
+                ]
+                color_acento = "#00FF88"
+                color_linea = "rgba(0,255,136,0.55)"
+                color_grid = "rgba(0,255,136,0.08)"
+                color_borde_barra = "rgba(150,255,205,0.28)"
+            else:
+                escala_neon = [
+                    [0.00, "#1B050A"],
+                    [0.25, "#651020"],
+                    [0.50, "#B80F32"],
+                    [0.75, "#F01845"],
+                    [1.00, "#FF003C"],
+                ]
+                color_acento = "#FF1744"
+                color_linea = "rgba(255,23,68,0.58)"
+                color_grid = "rgba(255,23,68,0.09)"
+                color_borde_barra = "rgba(255,185,200,0.28)"
+            fig.update_traces(
+                marker=dict(
+                    color=valores_color,
+                    colorscale=escala_neon,
+                    cmin=0,
+                    cmax=max(max_valor, 1.0),
+                    line=dict(color=color_borde_barra, width=0.8),
+                    colorbar=dict(
+                        title=dict(text=nombre_escala, font=dict(color=color_acento, size=11)),
+                        tickprefix="$",
+                        tickformat="~s",
+                        thickness=12,
+                        len=0.70,
+                        x=1.02,
+                        outlinewidth=0,
+                        tickfont=dict(color="#E7F8FF", size=10),
+                    ),
+                ),
+                texttemplate="<b>$%{text:,.0f}</b>",
+                textfont=dict(color="#FFFFFF", size=11),
+                textposition="outside",
+                cliponaxis=False,
+            )
+            fig = estilo_grafico(fig, titulo)
+            fig.update_layout(
+                height=max(370, len(valores_color) * 44 + 115),
+                paper_bgcolor="#020407",
+                plot_bgcolor="#020407",
+                title=dict(
+                    text=f"<b>{titulo}</b>",
+                    x=0.015,
+                    xanchor="left",
+                    font=dict(color="#F4FBFF", size=15),
+                ),
+                margin=dict(l=margen_izquierdo, r=100, t=72, b=58),
+                bargap=0.32,
+                barcornerradius="50%",
+                showlegend=False,
+                hoverlabel=dict(
+                    bgcolor="#07111C",
+                    bordercolor=color_acento,
+                    font=dict(color="#FFFFFF", size=12),
+                ),
+            )
+            fig.update_xaxes(
+                title_text=nombre_escala,
+                tickprefix="$",
+                tickformat="~s",
+                gridcolor=color_grid,
+                linecolor=color_linea,
+                zeroline=False,
+                showline=True,
+                ticks="outside",
+                tickcolor=color_acento,
+                tickfont=dict(color="#D9F8FF", size=10),
+                title_font=dict(color="#D9F8FF", size=11),
+            )
+            fig.update_yaxes(
+                title_text="",
+                gridcolor="rgba(0,0,0,0)",
+                linecolor=color_linea,
+                showline=True,
+                tickfont=dict(color="#F3FBFF", size=10),
+            )
+            fig.add_shape(
+                type="rect",
+                xref="paper",
+                yref="paper",
+                x0=0,
+                y0=0,
+                x1=1,
+                y1=1,
+                line=dict(color=color_linea, width=1),
+                fillcolor="rgba(0,0,0,0)",
+                layer="below",
+            )
+            fig.add_annotation(
+                x=1,
+                y=1.08,
+                xref="paper",
+                yref="paper",
+                text="BAJO&nbsp;&nbsp;→&nbsp;&nbsp;ALTO",
+                showarrow=False,
+                xanchor="right",
+                font=dict(color=color_acento, size=9),
+            )
+            return fig
+
+        rk1, rk2 = st.columns(2)
+        with rk1:
+            excedidas = presupuesto_categoria_tabla[presupuesto_categoria_tabla["Diferencia"] > 0].nlargest(10, "Diferencia").copy()
+            excedidas["Exceso %"] = excedidas.apply(
+                lambda r: r["Diferencia"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0,
+                axis=1,
+            )
+            fig_exc = px.bar(
+                excedidas.sort_values("Diferencia"),
+                x="Diferencia", y="GASTOS_CATEGORIA", orientation="h", text="Diferencia",
+            )
+            fig_exc.update_traces(
+                marker=dict(color="#FF1744", line=dict(color="#FF8A9D", width=1.3)),
+                texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                customdata=excedidas.sort_values("Diferencia")[["Gasto", "Presupuesto", "Exceso %", "% ejecutado"]],
+                hovertemplate=(
+                    "🔴 <b>%{y}</b><br>"
+                    "Exceso: <b>$%{x:,.0f}</b><br>"
+                    "Gasto real: $%{customdata[0]:,.0f}<br>"
+                    "Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "Exceso sobre el plan: %{customdata[2]:.1f}%<br>"
+                    "Ejecución total: %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+            fig_exc.update_layout(
+                hoverlabel=dict(bgcolor="#2B0610", bordercolor="#FF1744", font=dict(color="#FFFFFF", size=13)),
+                margin=dict(l=145, r=45, t=65, b=35),
+            )
+            fig_exc = estilo_ranking_neon(
+                fig_exc,
+                excedidas.sort_values("Diferencia")["Diferencia"],
+                "🔴 Categorías con mayor exceso",
+                "Exceso",
+                paleta="exceso",
+            )
+            st.plotly_chart(fig_exc, use_container_width=True)
+        with rk2:
+            disponibles = presupuesto_categoria_tabla[(presupuesto_categoria_tabla["Presupuesto"] > 0) & (presupuesto_categoria_tabla["Diferencia"] < 0)].copy()
+            disponibles["Disponible"] = -disponibles["Diferencia"]
+            disponibles["Disponible %"] = disponibles.apply(
+                lambda r: r["Disponible"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0,
+                axis=1,
+            )
+            disponibles = disponibles.nlargest(10, "Disponible")
+            fig_disp = px.bar(
+                disponibles.sort_values("Disponible"),
+                x="Disponible", y="GASTOS_CATEGORIA", orientation="h", text="Disponible",
+            )
+            fig_disp.update_traces(
+                marker=dict(color="#00E676", line=dict(color="#8AFFB7", width=1.3)),
+                texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                customdata=disponibles.sort_values("Disponible")[["Gasto", "Presupuesto", "Disponible %", "% ejecutado"]],
+                hovertemplate=(
+                    "🟢 <b>%{y}</b><br>"
+                    "Disponible: <b>$%{x:,.0f}</b><br>"
+                    "Gasto real: $%{customdata[0]:,.0f}<br>"
+                    "Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "Margen disponible: %{customdata[2]:.1f}%<br>"
+                    "Ejecución total: %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+            fig_disp.update_layout(
+                hoverlabel=dict(bgcolor="#032B17", bordercolor="#00E676", font=dict(color="#FFFFFF", size=13)),
+                margin=dict(l=145, r=45, t=65, b=35),
+            )
+            fig_disp = estilo_ranking_neon(
+                fig_disp,
+                disponibles.sort_values("Disponible")["Disponible"],
+                "🟢 Categorías con mayor disponibilidad",
+                "Disponible",
+                paleta="disponibilidad",
+            )
+            st.plotly_chart(fig_disp, use_container_width=True)
+
+        st.markdown("### Ranking por subcategoría")
+        st.caption(
+            "Aplica la misma comparación a cada subcategoría. La categoría se incluye en la etiqueta "
+            "para diferenciar subcategorías con nombres iguales."
+        )
+
+        presupuesto_subcategoria_tabla = (
+            df.groupby(
+                ["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"],
+                as_index=False,
+            )["GASTOS_CANTIDAD"]
+            .sum()
+            .rename(columns={"GASTOS_CANTIDAD": "Gasto"})
+        ) if not df.empty else pd.DataFrame(
+            columns=["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA", "Gasto"]
+        )
+        presupuesto_subcategoria_tabla["Presupuesto"] = presupuesto_subcategoria_tabla.apply(
+            lambda r: float(
+                buscar_presupuesto_sub(
+                    r["GASTOS_CATEGORIA"],
+                    r["GASTOS_SUBCATEGORIA"],
+                    presupuesto_sub,
+                )
+            ),
+            axis=1,
+        )
+        presupuesto_subcategoria_tabla["Diferencia"] = (
+            presupuesto_subcategoria_tabla["Gasto"]
+            - presupuesto_subcategoria_tabla["Presupuesto"]
+        )
+        presupuesto_subcategoria_tabla["% ejecutado"] = presupuesto_subcategoria_tabla.apply(
+            lambda r: r["Gasto"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0,
+            axis=1,
+        )
+        presupuesto_subcategoria_tabla["Concepto"] = (
+            presupuesto_subcategoria_tabla["GASTOS_CATEGORIA"].astype(str)
+            + " › "
+            + presupuesto_subcategoria_tabla["GASTOS_SUBCATEGORIA"].astype(str)
+        )
+
+        rks1, rks2 = st.columns(2)
+        with rks1:
+            sub_excedidas = presupuesto_subcategoria_tabla[
+                presupuesto_subcategoria_tabla["Diferencia"] > 0
+            ].nlargest(10, "Diferencia").copy()
+            sub_excedidas["Exceso %"] = sub_excedidas.apply(
+                lambda r: r["Diferencia"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0,
+                axis=1,
+            )
+            sub_excedidas_orden = sub_excedidas.sort_values("Diferencia")
+            fig_sub_exc = px.bar(
+                sub_excedidas_orden,
+                x="Diferencia", y="Concepto", orientation="h", text="Diferencia",
+            )
+            fig_sub_exc.update_traces(
+                marker=dict(color="#FF1744", line=dict(color="#FF8A9D", width=1.3)),
+                texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                customdata=sub_excedidas_orden[["Gasto", "Presupuesto", "Exceso %", "% ejecutado"]],
+                hovertemplate=(
+                    "🔴 <b>%{y}</b><br>"
+                    "Exceso: <b>$%{x:,.0f}</b><br>"
+                    "Gasto real: $%{customdata[0]:,.0f}<br>"
+                    "Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "Exceso sobre el plan: %{customdata[2]:.1f}%<br>"
+                    "Ejecución total: %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+            fig_sub_exc.update_layout(
+                hoverlabel=dict(bgcolor="#2B0610", bordercolor="#FF1744", font=dict(color="#FFFFFF", size=13)),
+                margin=dict(l=190, r=45, t=65, b=35),
+            )
+            fig_sub_exc = estilo_ranking_neon(
+                fig_sub_exc,
+                sub_excedidas_orden["Diferencia"],
+                "🔴 Subcategorías con mayor exceso",
+                "Exceso",
+                margen_izquierdo=195,
+                paleta="exceso",
+            )
+            st.plotly_chart(
+                fig_sub_exc,
+                use_container_width=True,
+                key="presupuesto_ranking_subcategorias_exceso",
+            )
+
+        with rks2:
+            sub_disponibles = presupuesto_subcategoria_tabla[
+                (presupuesto_subcategoria_tabla["Presupuesto"] > 0)
+                & (presupuesto_subcategoria_tabla["Diferencia"] < 0)
+            ].copy()
+            sub_disponibles["Disponible"] = -sub_disponibles["Diferencia"]
+            sub_disponibles["Disponible %"] = sub_disponibles.apply(
+                lambda r: r["Disponible"] / r["Presupuesto"] * 100 if r["Presupuesto"] > 0 else 0.0,
+                axis=1,
+            )
+            sub_disponibles = sub_disponibles.nlargest(10, "Disponible")
+            sub_disponibles_orden = sub_disponibles.sort_values("Disponible")
+            fig_sub_disp = px.bar(
+                sub_disponibles_orden,
+                x="Disponible", y="Concepto", orientation="h", text="Disponible",
+            )
+            fig_sub_disp.update_traces(
+                marker=dict(color="#00E676", line=dict(color="#8AFFB7", width=1.3)),
+                texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                customdata=sub_disponibles_orden[["Gasto", "Presupuesto", "Disponible %", "% ejecutado"]],
+                hovertemplate=(
+                    "🟢 <b>%{y}</b><br>"
+                    "Disponible: <b>$%{x:,.0f}</b><br>"
+                    "Gasto real: $%{customdata[0]:,.0f}<br>"
+                    "Presupuesto: $%{customdata[1]:,.0f}<br>"
+                    "Margen disponible: %{customdata[2]:.1f}%<br>"
+                    "Ejecución total: %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+            fig_sub_disp.update_layout(
+                hoverlabel=dict(bgcolor="#032B17", bordercolor="#00E676", font=dict(color="#FFFFFF", size=13)),
+                margin=dict(l=190, r=45, t=65, b=35),
+            )
+            fig_sub_disp = estilo_ranking_neon(
+                fig_sub_disp,
+                sub_disponibles_orden["Disponible"],
+                "🟢 Subcategorías con mayor disponibilidad",
+                "Disponible",
+                margen_izquierdo=195,
+                paleta="disponibilidad",
+            )
+            st.plotly_chart(
+                fig_sub_disp,
+                use_container_width=True,
+                key="presupuesto_ranking_subcategorias_disponibilidad",
+            )
+
+        categorias_con_presupuesto = int((presupuesto_categoria_tabla["Presupuesto"] > 0).sum())
+        cobertura_categorias = categorias_con_presupuesto / max(len(presupuesto_categoria_tabla), 1) * 100
+        gasto_con_presupuesto = float(presupuesto_categoria_tabla.loc[presupuesto_categoria_tabla["Presupuesto"] > 0, "Gasto"].sum())
+        cobertura_gasto = gasto_con_presupuesto / gasto_presupuesto_total * 100 if gasto_presupuesto_total else 0.0
+        error_medio = float(presupuesto_categoria_tabla.loc[presupuesto_categoria_tabla["Presupuesto"] > 0, "% ejecutado"].sub(100).abs().mean()) if categorias_con_presupuesto else 0.0
+        st.markdown("## 4. 📅 Evolución mensual del presupuesto")
+        st.caption(
+            "Compara la ejecución real de cada mes con el presupuesto asignado. "
+            "Esta sección analiza disciplina presupuestal; la evolución completa de ingresos y balance permanece en Tendencias."
+        )
+
+        presupuesto_mensual_df = flujo_reporte.copy() if isinstance(flujo_reporte, pd.DataFrame) else pd.DataFrame()
+        if not presupuesto_mensual_df.empty:
+            presupuesto_mensual_df["Gastos"] = pd.to_numeric(
+                presupuesto_mensual_df.get("Gastos", 0), errors="coerce"
+            ).fillna(0)
+            presupuesto_mensual_df["Presupuesto mensual"] = pd.to_numeric(
+                presupuesto_mensual_df.get("Presupuesto mensual", 0), errors="coerce"
+            ).fillna(0)
+            presupuesto_mensual_df["Diferencia"] = (
+                presupuesto_mensual_df["Presupuesto mensual"] - presupuesto_mensual_df["Gastos"]
+            )
+            presupuesto_mensual_df["% ejecutado"] = presupuesto_mensual_df.apply(
+                lambda r: r["Gastos"] / r["Presupuesto mensual"] * 100
+                if r["Presupuesto mensual"] > 0 else 0.0,
+                axis=1,
+            )
+            presupuesto_mensual_df["Estado"] = presupuesto_mensual_df.apply(
+                lambda r: "Sin presupuesto" if r["Presupuesto mensual"] <= 0 else (
+                    "Cumplido" if r["Gastos"] <= r["Presupuesto mensual"] else "Excedido"
+                ),
+                axis=1,
+            )
+
+            colores_mensuales = presupuesto_mensual_df.apply(
+                lambda r: "#94A3B8" if r["Presupuesto mensual"] <= 0 else (
+                    "#00E676" if r["Gastos"] <= r["Presupuesto mensual"] else "#FF1744"
+                ),
+                axis=1,
+            ).tolist()
+
+            fig_presupuesto_mensual = go.Figure()
+            fig_presupuesto_mensual.add_trace(go.Bar(
+                x=presupuesto_mensual_df["MES"],
+                y=presupuesto_mensual_df["Gastos"],
+                name="Gasto real",
+                marker=dict(color=colores_mensuales),
+                text=presupuesto_mensual_df["Gastos"],
+                texttemplate="$%{text:,.0f}",
+                textposition="outside",
+                customdata=presupuesto_mensual_df[["Presupuesto mensual", "Diferencia", "% ejecutado", "Estado"]],
+                hovertemplate=(
+                    "📅 <b>%{x}</b><br>"
+                    "Gasto ejecutado: <b>$%{y:,.0f}</b><br>"
+                    "Presupuesto asignado: $%{customdata[0]:,.0f}<br>"
+                    "Saldo del mes: $%{customdata[1]:+,.0f}<br>"
+                    "Porcentaje ejecutado: %{customdata[2]:.1f}%<br>"
+                    "Estado: <b>%{customdata[3]}</b><br>"
+                    "Lectura: verde = dentro del plan · rojo = presupuesto excedido"
+                    "<extra></extra>"
+                ),
+            ))
+            fig_presupuesto_mensual.add_trace(go.Scatter(
+                x=presupuesto_mensual_df["MES"],
+                y=presupuesto_mensual_df["Presupuesto mensual"],
+                name="Presupuesto",
+                mode="lines+markers",
+                line=dict(color="#FFD600", width=3.6, dash="dash"),
+                marker=dict(size=10, symbol="diamond", color="#FFD600", line=dict(color="#5C4500", width=1.2)),
+                hovertemplate="🎯 <b>%{x}</b><br>Meta presupuestal: <b>$%{y:,.0f}</b><br>Esta línea representa el límite planificado para el mes.<extra></extra>",
+            ))
+            fig_presupuesto_mensual.update_layout(
+                barmode="group", height=470,
+                xaxis=dict(categoryorder="array", categoryarray=MESES_ORDEN),
+                yaxis=dict(tickprefix="$", tickformat=",.0f"),
+                legend=dict(orientation="h", y=1.08),
+                hoverlabel=dict(bgcolor="#07111F", bordercolor="#38BDF8", font=dict(color="#FFFFFF", size=13)),
+            )
+            st.plotly_chart(
+                estilo_grafico(fig_presupuesto_mensual, "Presupuesto mensual frente a ejecución real"),
+                use_container_width=True,
+                key="presupuesto_evolucion_mensual_v914",
+            )
+
+            meses_cumplidos = int((presupuesto_mensual_df["Estado"] == "Cumplido").sum())
+            meses_excedidos = int((presupuesto_mensual_df["Estado"] == "Excedido").sum())
+            pm1, pm2, pm3 = st.columns(3)
+            tarjeta_perfil_panel(pm1, '📅 Meses cumplidos', meses_cumplidos, help='Cantidad de meses clasificados como cumplidos en la comparación mensual de presupuesto y gasto.')
+            tarjeta_perfil_panel(pm2, '📅 Meses excedidos', meses_excedidos, help='Cantidad de meses clasificados como excedidos en la comparación mensual.')
+            tarjeta_perfil_panel(pm3, '📊 Desviación acumulada',
+                f"${presupuesto_mensual_df['Diferencia'].sum():,.0f}",
+                help="Valor positivo = disponibilidad; valor negativo = exceso acumulado.",
+            )
+        else:
+            st.info("No hay información mensual suficiente para evaluar la evolución del presupuesto.")
+
+        st.markdown("## 5. ⏱️ Ritmo de ejecución y proyección al cierre")
+        fecha_actual = pd.Timestamp.today().normalize()
+        mes_actual_nombre = MESES_ORDEN[fecha_actual.month - 1]
+        filtro_incluye_mes_actual = fecha_desde_ts.normalize() <= fecha_actual <= fecha_hasta_ts.normalize()
+
+        if filtro_incluye_mes_actual and presupuesto_periodo_total > 0:
+            inicio_mes_actual = fecha_actual.replace(day=1)
+            fin_mes_actual = inicio_mes_actual + pd.offsets.MonthEnd(0)
+            dias_transcurridos = int(fecha_actual.day)
+            dias_mes = int(fin_mes_actual.day)
+            avance_calendario_pct = dias_transcurridos / dias_mes * 100
+
+            gastos_mes_actual = df[
+                pd.to_datetime(df["GASTOS_FECHA"], errors="coerce").dt.to_period("M")
+                == fecha_actual.to_period("M")
+            ]["GASTOS_CANTIDAD"].sum() if not df.empty else 0.0
+
+            presupuesto_mes_actual = float(
+                presupuesto_mensual_por_periodo.get((int(fecha_actual.year), mes_actual_nombre), 0.0)
+                if isinstance(presupuesto_mensual_por_periodo, dict) else 0.0
+            )
+            if presupuesto_mes_actual <= 0 and not presupuesto_mensual_df.empty:
+                if {"ANIO", "MES_NOMBRE"}.issubset(presupuesto_mensual_df.columns):
+                    fila_mes_actual = presupuesto_mensual_df[
+                        pd.to_numeric(presupuesto_mensual_df["ANIO"], errors="coerce").eq(int(fecha_actual.year))
+                        & presupuesto_mensual_df["MES_NOMBRE"].map(normalizar_mes).eq(normalizar_mes(mes_actual_nombre))
+                    ]
+                else:
+                    fila_mes_actual = presupuesto_mensual_df[
+                        presupuesto_mensual_df["MES"].astype(str).str.upper().eq(mes_actual_nombre)
+                    ]
+                if not fila_mes_actual.empty:
+                    presupuesto_mes_actual = float(fila_mes_actual.iloc[-1]["Presupuesto mensual"])
+
+            ritmo_ejecucion_pct = gastos_mes_actual / presupuesto_mes_actual * 100 if presupuesto_mes_actual > 0 else 0.0
+            gasto_promedio_diario_actual = gastos_mes_actual / max(dias_transcurridos, 1)
+            gasto_proyectado_mes = gasto_promedio_diario_actual * dias_mes
+            diferencia_proyectada = presupuesto_mes_actual - gasto_proyectado_mes
+            estado_ritmo = (
+                "Acelerado" if ritmo_ejecucion_pct > avance_calendario_pct + 10 else
+                "Controlado" if ritmo_ejecucion_pct <= avance_calendario_pct + 3 else
+                "En atención"
+            )
+
+            rt1, rt2, rt3, rt4 = st.columns(4)
+            tarjeta_perfil_panel(rt1, '📅 Avance del mes', f"{avance_calendario_pct:.1f}%", help='Porcentaje del calendario mensual que ha transcurrido a la fecha de referencia.')
+            tarjeta_perfil_panel(rt2, '📋 Presupuesto ejecutado', f"{ritmo_ejecucion_pct:.1f}%", help='Porcentaje del presupuesto mensual consumido por los gastos registrados.')
+            tarjeta_perfil_panel(rt3, '💸 Ritmo de gasto', estado_ritmo, help='Compara el porcentaje de presupuesto consumido con el avance del calendario mensual.')
+            tarjeta_perfil_panel(rt4, '📊 Proyección al cierre', f"${gasto_proyectado_mes:,.0f}", help='Estimación del gasto al terminar el mes si se mantiene el ritmo registrado.')
+
+            if presupuesto_mes_actual > 0 and gasto_promedio_diario_actual > 0:
+                dias_hasta_agotar = presupuesto_mes_actual / gasto_promedio_diario_actual
+                fecha_agotamiento = inicio_mes_actual + pd.Timedelta(days=max(int(dias_hasta_agotar) - 1, 0))
+                if gasto_proyectado_mes > presupuesto_mes_actual:
+                    st.warning(
+                        f"Al ritmo actual, el presupuesto mensual podría agotarse aproximadamente el "
+                        f"**{fecha_agotamiento:%d/%m/%Y}**. La proyección indica un exceso de "
+                        f"**${abs(diferencia_proyectada):,.0f}** al cierre."
+                    )
+                else:
+                    st.success(
+                        f"Al ritmo actual, terminarías el mes con aproximadamente "
+                        f"**${diferencia_proyectada:,.0f} disponibles** frente al presupuesto."
+                    )
+            else:
+                st.info("No existe presupuesto mensual suficiente para estimar la fecha de agotamiento.")
+        else:
+            st.info(
+                "El análisis de ritmo se activa cuando el filtro incluye el mes actual y existe presupuesto definido."
+            )
+
+        gasto_sin_presupuesto = float(
+            presupuesto_categoria_tabla.loc[
+                presupuesto_categoria_tabla["Presupuesto"] <= 0, "Gasto"
+            ].sum()
+        ) if not presupuesto_categoria_tabla.empty else 0.0
+        pct_gasto_sin_presupuesto = gasto_sin_presupuesto / gasto_presupuesto_total * 100 if gasto_presupuesto_total else 0.0
+        categorias_sin_presupuesto = presupuesto_categoria_tabla[
+            presupuesto_categoria_tabla["Presupuesto"] <= 0
+        ].copy()
+
+        st.markdown("## 6. 🔁 Categorías sistemáticamente mal presupuestadas")
+        historial_categoria = []
+        if not df.empty and {"ANIO", "MES", "GASTOS_CATEGORIA", "GASTOS_CANTIDAD"}.issubset(df.columns):
+            mensual_categoria = (
+                df.groupby(["ANIO", "MES", "GASTOS_CATEGORIA"], dropna=False)["GASTOS_CANTIDAD"]
+                .sum().reset_index(name="Gasto")
+            )
+            for fila in mensual_categoria.itertuples(index=False):
+                presupuesto_mes_cat = float(
+                    presupuesto_categoria_mes(historico_presupuesto, fila.GASTOS_CATEGORIA, fila.MES)
+                ) if not historico_presupuesto.empty else 0.0
+                historial_categoria.append({
+                    "Categoría": fila.GASTOS_CATEGORIA,
+                    "Año": fila.ANIO,
+                    "Mes": fila.MES,
+                    "Gasto": float(fila.Gasto),
+                    "Presupuesto": presupuesto_mes_cat,
+                    "Excedida": presupuesto_mes_cat > 0 and float(fila.Gasto) > presupuesto_mes_cat,
+                    "Exceso %": ((float(fila.Gasto) - presupuesto_mes_cat) / presupuesto_mes_cat * 100)
+                    if presupuesto_mes_cat > 0 else 0.0,
+                })
+
+        historico_eval = pd.DataFrame(historial_categoria)
+        if not historico_eval.empty:
+            resumen_sistematico = historico_eval.groupby("Categoría").agg(
+                Meses_analizados=("Mes", "count"),
+                Meses_excedidos=("Excedida", "sum"),
+                Exceso_promedio_pct=("Exceso %", lambda s: float(s[s > 0].mean()) if (s > 0).any() else 0.0),
+            ).reset_index()
+            resumen_sistematico["Frecuencia de exceso %"] = (
+                resumen_sistematico["Meses_excedidos"] / resumen_sistematico["Meses_analizados"] * 100
+            )
+            resumen_sistematico = resumen_sistematico.sort_values(
+                ["Meses_excedidos", "Frecuencia de exceso %"], ascending=False
+            )
+            sistematicas = resumen_sistematico[
+                (resumen_sistematico["Meses_excedidos"] >= 2)
+                | (resumen_sistematico["Frecuencia de exceso %"] >= 60)
+            ]
+            if not sistematicas.empty:
+                st.error(
+                    "Estas categorías exceden el presupuesto de forma repetida. Esto puede indicar "
+                    "un gasto estructural o un presupuesto subestimado."
+                )
+                with st.expander("Ver tabla", expanded=False):
+                    st.dataframe(sistematicas, use_container_width=True, hide_index=True)
+            else:
+                st.success("No se detectaron incumplimientos sistemáticos con el histórico filtrado.")
+        else:
+            st.info("No hay histórico suficiente para evaluar categorías sistemáticamente mal presupuestadas.")
+
+        excesos_redistribucion = presupuesto_categoria_tabla[
+            presupuesto_categoria_tabla["Diferencia"] > 0
+        ].copy().sort_values("Diferencia", ascending=False)
+        disponibles_redistribucion = presupuesto_categoria_tabla[
+            (presupuesto_categoria_tabla["Presupuesto"] > 0)
+            & (presupuesto_categoria_tabla["Diferencia"] < 0)
+        ].copy()
+        disponibles_redistribucion["Disponible"] = -disponibles_redistribucion["Diferencia"]
+        disponibles_redistribucion = disponibles_redistribucion.sort_values("Disponible", ascending=False)
+
+        total_exceso = float(excesos_redistribucion["Diferencia"].sum()) if not excesos_redistribucion.empty else 0.0
+        total_disponible_otras = float(disponibles_redistribucion["Disponible"].sum()) if not disponibles_redistribucion.empty else 0.0
+        st.markdown("## 7. 🛠️ Plan de acción para cerrar dentro del presupuesto")
+        acciones = []
+        for _, fila in excesos_redistribucion.head(5).iterrows():
+            acciones.append(
+                f"Revisar **{fila['GASTOS_CATEGORIA']}**: excede el plan en **${fila['Diferencia']:,.0f}** "
+                f"({fila['% ejecutado']:.1f}% ejecutado)."
+            )
+        categorias_en_atencion = presupuesto_categoria_tabla[
+            presupuesto_categoria_tabla["Estado"] == "Atención"
+        ].sort_values("% ejecutado", ascending=False)
+        for _, fila in categorias_en_atencion.head(3).iterrows():
+            margen = max(float(fila["Presupuesto"]) - float(fila["Gasto"]), 0.0)
+            acciones.append(
+                f"Limitar nuevos gastos en **{fila['GASTOS_CATEGORIA']}** a aproximadamente **${margen:,.0f}** "
+                "durante el resto del periodo."
+            )
+        if gasto_sin_presupuesto > 0:
+            acciones.append(
+                f"Asignar presupuesto a los movimientos no planificados, que suman **${gasto_sin_presupuesto:,.0f}**."
+            )
+        if not acciones:
+            acciones.append("Mantener el ritmo actual y revisar semanalmente las categorías en atención.")
+
+        for accion in acciones:
+            st.markdown(f"- {accion}")
+
+        st.caption(
+            "Las acciones son reglas calculadas con los datos filtrados. No sustituyen la revisión de pagos futuros, "
+            "obligaciones contractuales o gastos extraordinarios pendientes."
+        )
+
+        st.markdown("## 8. Tabla maestra de cumplimiento")
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(
+                presupuesto_categoria_tabla.rename(columns={"GASTOS_CATEGORIA": "Categoría"}),
+                use_container_width=True, hide_index=True,
+            )
+
+        st.markdown("## 9. Comparación detallada por categoría")
+        # CATEGORÍAS + DINERO NO UTILIZADO + LÍNEA DE PRESUPUESTO
+        # ======================================================
+        categorias_ingresos = (
+            df.groupby("GASTOS_CATEGORIA", dropna=False)["GASTOS_CANTIDAD"]
+            .sum()
+            .reset_index()
+            .rename(columns={
+                "GASTOS_CATEGORIA": "Categoría",
+                "GASTOS_CANTIDAD": "Monto",
+            })
+        )
+
+        if not categorias_ingresos.empty:
+            no_utilizado = max(float(total_ingresos) - float(total_gastos), 0.0)
+            porcentaje_no_utilizado = (
+                no_utilizado / float(total_ingresos) * 100
+                if total_ingresos > 0
+                else 0.0
+            )
+
+            fila_no_utilizado = pd.DataFrame({
+                "Categoría": ["No utilizado"],
+                "Monto": [no_utilizado],
+            })
+
+            categorias_ingresos = pd.concat(
+                [categorias_ingresos, fila_no_utilizado],
+                ignore_index=True,
+            )
+
+            categorias_ingresos["% de ingresos"] = (
+                categorias_ingresos["Monto"] / total_ingresos * 100
+                if total_ingresos > 0
+                else 0.0
+            )
+
+            # Número de periodos reales filtrados para ajustar el presupuesto mensual.
+            periodos_categoria = (
+                df[["ANIO", "MES"]]
+                .dropna(how="all")
+                .drop_duplicates()
+            )
+            n_periodos_categoria = max(len(periodos_categoria), 1)
+
+            # Presupuesto total por categoría para el periodo filtrado.
+            categorias_ingresos["Presupuesto"] = categorias_ingresos["Categoría"].map(
+                lambda categoria: (
+                    0.0
+                    if categoria == "No utilizado"
+                    else float(
+                        presupuesto_cat.get(normalizar(categoria), 0.0)
+                    )
+                )
+            )
+
+            categorias_ingresos["Diferencia vs presupuesto"] = (
+                categorias_ingresos["Monto"] - categorias_ingresos["Presupuesto"]
+            )
+            categorias_ingresos["Lectura porcentual vs presupuesto"] = categorias_ingresos.apply(
+                lambda r: (
+                    "No aplica"
+                    if r["Categoría"] == "No utilizado"
+                    else "Sin presupuesto definido"
+                    if r["Presupuesto"] <= 0
+                    else f"Exceso: {(r['Monto'] - r['Presupuesto']) / r['Presupuesto'] * 100:.1f}%"
+                    if r["Monto"] > r["Presupuesto"]
+                    else f"Faltante: {(r['Presupuesto'] - r['Monto']) / r['Presupuesto'] * 100:.1f}%"
+                    if r["Monto"] < r["Presupuesto"]
+                    else "En presupuesto: 0.0%"
+                ),
+                axis=1,
+            )
+
+            categorias_ingresos = categorias_ingresos.sort_values(
+                "Monto",
+                ascending=False,
+            ).reset_index(drop=True)
+
+            categorias_ingresos["Etiqueta"] = categorias_ingresos.apply(
+                lambda r: f"${r['Monto']:,.0f}<br>{r['% de ingresos']:.1f}%",
+                axis=1,
+            )
+
+            categorias_gasto = categorias_ingresos[
+                categorias_ingresos["Categoría"] != "No utilizado"
+            ]
+            categoria_mayor = (
+                categorias_gasto.iloc[0]
+                if not categorias_gasto.empty
+                else None
+            )
+
+            # Blanco si el gasto está dentro de una tolerancia de ±10% frente al
+            # punto amarillo del presupuesto. Fuera de esa zona se conservan
+            # los colores actuales: rojo sobre presupuesto, azul por debajo y
+            # verde para No utilizado. Sin presupuesto definido se muestra azul.
+            colores_categorias = []
+            for _, fila in categorias_ingresos.iterrows():
+                if fila["Categoría"] == "No utilizado":
+                    colores_categorias.append("#00FF66")
+                elif (
+                    fila["Presupuesto"] > 0
+                    and abs(fila["Monto"] - fila["Presupuesto"]) / fila["Presupuesto"] <= 0.10
+                ):
+                    colores_categorias.append("#FFFFFF")
+                elif fila["Presupuesto"] > 0 and fila["Monto"] > fila["Presupuesto"]:
+                    colores_categorias.append("#FF003C")
+                else:
+                    colores_categorias.append("#3B82F6")
+
+            fig_categoria_ingresos = go.Figure()
+
+            fig_categoria_ingresos.add_trace(go.Bar(
+                x=categorias_ingresos["Categoría"],
+                y=categorias_ingresos["Monto"],
+                name="Gasto real",
+                text=categorias_ingresos["Etiqueta"],
+                textposition="outside",
+                cliponaxis=False,
+                marker=dict(
+                    color=colores_categorias,
+                    line=dict(color="#E2E8F0", width=1.1),
+                ),
+                customdata=categorias_ingresos[
+                    [
+                        "% de ingresos",
+                        "Presupuesto",
+                        "Diferencia vs presupuesto",
+                        "Lectura porcentual vs presupuesto",
+                    ]
+                ],
+                hovertemplate=(
+                    "<b>%{x}</b><br><br>"
+                    "Gasto registrado: <b>$%{y:,.0f}</b><br>"
+                    "Participación en ingresos: <b>%{customdata[0]:.1f}%</b><br><br>"
+                    "Presupuesto del período: <b>$%{customdata[1]:,.0f}</b><br>"
+                    "Diferencia frente al presupuesto: <b>$%{customdata[2]:+,.0f}</b><br><br>"
+                    "<b>%{customdata[3]}</b>"
+                    "<extra></extra>"
+                ),
+            ))
+
+            # Línea de presupuesto sobre cada categoría.
+            categorias_presupuesto = categorias_ingresos[
+                categorias_ingresos["Categoría"] != "No utilizado"
+            ]
+
+            fig_categoria_ingresos.add_trace(go.Scatter(
+                x=categorias_presupuesto["Categoría"],
+                y=categorias_presupuesto["Presupuesto"],
+                name="Presupuesto ajustado",
+                mode="lines+markers",
+                line=dict(
+                    color="#FFEE00",
+                    width=3,
+                    dash="dash",
+                    shape="linear",
+                ),
+                marker=dict(
+                    size=9,
+                    color="#FFEE00",
+                    symbol="diamond",
+                    line=dict(color="#422006", width=1.2),
+                ),
+                customdata=categorias_presupuesto[
+                    ["Monto", "Diferencia vs presupuesto"]
+                ],
+                hovertemplate=(
+                    "<b>%{x}</b><br><br>"
+                    "Presupuesto del período: <b>$%{y:,.0f}</b><br><br>"
+                    "Gasto registrado: <b>$%{customdata[0]:,.0f}</b><br>"
+                    "Diferencia: <b>$%{customdata[1]:+,.0f}</b>"
+                    "<extra></extra>"
+                ),
+            ))
+
+            fig_categoria_ingresos.update_layout(
+                template="plotly_dark",
+                height=610,
+                paper_bgcolor="#000000",
+                plot_bgcolor="#000000",
+                font=dict(color="#E2E8F0"),
+                title=dict(
+                    text="Categorías de gasto, dinero no utilizado y presupuesto",
+                    font=dict(color="#F8FAFC"),
+                ),
+                xaxis=dict(
+                    title="Categoría",
+                    type="category",
+                    categoryorder="array",
+                    categoryarray=categorias_ingresos["Categoría"].tolist(),
+                    tickangle=-35,
+                    gridcolor="rgba(148,163,184,0.08)",
+                ),
+                yaxis=dict(
+                    title="Valor",
+                    tickprefix="$",
+                    tickformat=",.0f",
+                    gridcolor="rgba(148,163,184,0.14)",
+                    rangemode="tozero",
+                ),
+                bargap=0.28,
+                margin=dict(t=95, b=145, l=70, r=35),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0,
+                ),
+                hoverlabel=dict(
+                    bgcolor="#10263c",
+                    bordercolor="#39d7ff",
+                    align="left",
+                    font=dict(color="#eef7ff", size=14, family="Arial, sans-serif"),
+                ),
+            )
+
+            st.plotly_chart(
+                fig_categoria_ingresos,
+                use_container_width=True,
+                key="grafico_categorias_presupuesto_v1",
+            )
+
+            tabla_categoria_ingresos = categorias_ingresos.copy()
+            tabla_categoria_ingresos["Monto"] = tabla_categoria_ingresos["Monto"].map(
+                lambda x: f"${x:,.0f}"
+            )
+            tabla_categoria_ingresos["% de ingresos"] = tabla_categoria_ingresos[
+                "% de ingresos"
+            ].map(lambda x: f"{x:.2f}%")
+            tabla_categoria_ingresos["Presupuesto"] = tabla_categoria_ingresos[
+                "Presupuesto"
+            ].map(lambda x: f"${x:,.0f}")
+            tabla_categoria_ingresos["Diferencia vs presupuesto"] = (
+                tabla_categoria_ingresos["Diferencia vs presupuesto"]
+                .map(lambda x: f"${x:,.0f}")
+            )
+
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(
+                    tabla_categoria_ingresos[
+                        [
+                            "Categoría",
+                            "Monto",
+                            "% de ingresos",
+                            "Presupuesto",
+                            "Diferencia vs presupuesto",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.info("No hay datos de categorías para mostrar con los filtros actuales.")
+
+        st.divider()
+        st.markdown("## 10. Comparación detallada por subcategoría")
+        # SUBCATEGORÍAS + LÍNEA DE PRESUPUESTO
+        # ======================================================
+        subcategorias_ingresos = (
+            sub_df.groupby("GASTOS_SUBCATEGORIA", dropna=False)["GASTOS_CANTIDAD"]
+            .sum()
+            .reset_index()
+            .rename(columns={
+                "GASTOS_SUBCATEGORIA": "Subcategoría",
+                "GASTOS_CANTIDAD": "Monto",
+            })
+        )
+
+        if not subcategorias_ingresos.empty:
+            no_utilizado_sub = max(float(total_ingresos) - float(total_gastos), 0.0)
+            porcentaje_no_utilizado_sub = (
+                no_utilizado_sub / float(total_ingresos) * 100
+                if total_ingresos > 0
+                else 0.0
+            )
+
+            subcategorias_ingresos["% de ingresos"] = (
+                subcategorias_ingresos["Monto"] / total_ingresos * 100
+                if total_ingresos > 0
+                else 0.0
+            )
+
+            periodos_subcategoria = (
+                sub_df[["ANIO", "MES"]]
+                .dropna(how="all")
+                .drop_duplicates()
+            )
+            n_periodos_subcategoria = max(len(periodos_subcategoria), 1)
+
+            # El presupuesto se busca por categoría + subcategoría y luego se suma
+            # cuando una misma subcategoría aparece en más de una categoría.
+            presupuesto_sub_agrupado = {}
+            for categoria, subcategoria in (
+                sub_df[["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"]]
+                .drop_duplicates()
+                .itertuples(index=False)
+            ):
+                valor_presupuesto = buscar_presupuesto_sub(
+                    categoria,
+                    subcategoria,
+                    presupuesto_sub,
+                )
+                clave = str(subcategoria)
+                presupuesto_sub_agrupado[clave] = (
+                    presupuesto_sub_agrupado.get(clave, 0.0)
+                    + float(valor_presupuesto)
+                )
+
+            subcategorias_ingresos["Presupuesto"] = subcategorias_ingresos[
+                "Subcategoría"
+            ].map(
+                lambda subcategoria: presupuesto_sub_agrupado.get(str(subcategoria), 0.0)
+            )
+
+            subcategorias_ingresos["Diferencia vs presupuesto"] = (
+                subcategorias_ingresos["Monto"]
+                - subcategorias_ingresos["Presupuesto"]
+            )
+            subcategorias_ingresos["Lectura porcentual vs presupuesto"] = subcategorias_ingresos.apply(
+                lambda r: (
+                    "Sin presupuesto definido"
+                    if r["Presupuesto"] <= 0
+                    else f"Exceso: {(r['Monto'] - r['Presupuesto']) / r['Presupuesto'] * 100:.1f}%"
+                    if r["Monto"] > r["Presupuesto"]
+                    else f"Faltante: {(r['Presupuesto'] - r['Monto']) / r['Presupuesto'] * 100:.1f}%"
+                    if r["Monto"] < r["Presupuesto"]
+                    else "En presupuesto: 0.0%"
+                ),
+                axis=1,
+            )
+
+            subcategorias_ingresos = subcategorias_ingresos.sort_values(
+                "Monto",
+                ascending=False,
+            ).reset_index(drop=True)
+
+            subcategorias_ingresos["Etiqueta"] = subcategorias_ingresos.apply(
+                lambda r: f"${r['Monto']:,.0f}<br>{r['% de ingresos']:.1f}%",
+                axis=1,
+            )
+
+            subcategorias_gasto = subcategorias_ingresos.copy()
+            subcategoria_mayor = (
+                subcategorias_gasto.iloc[0]
+                if not subcategorias_gasto.empty
+                else None
+            )
+
+            colores_subcategorias = []
+            for _, fila in subcategorias_ingresos.iterrows():
+                if (
+                    fila["Presupuesto"] > 0
+                    and abs(fila["Monto"] - fila["Presupuesto"]) / fila["Presupuesto"] <= 0.10
+                ):
+                    colores_subcategorias.append("#FFFFFF")
+                elif fila["Presupuesto"] > 0 and fila["Monto"] > fila["Presupuesto"]:
+                    colores_subcategorias.append("#FF003C")
+                else:
+                    colores_subcategorias.append("#3B82F6")
+
+            fig_subcategoria_ingresos = go.Figure()
+
+            fig_subcategoria_ingresos.add_trace(go.Bar(
+                x=subcategorias_ingresos["Subcategoría"],
+                y=subcategorias_ingresos["Monto"].where(subcategorias_ingresos["Monto"].gt(0)),
+                name="Gasto real",
+                text=subcategorias_ingresos["Etiqueta"],
+                textposition="outside",
+                cliponaxis=False,
+                marker=dict(
+                    color=colores_subcategorias,
+                    line=dict(color="#E2E8F0", width=1.1),
+                ),
+                customdata=subcategorias_ingresos[
+                    [
+                        "% de ingresos",
+                        "Presupuesto",
+                        "Diferencia vs presupuesto",
+                        "Lectura porcentual vs presupuesto",
+                    ]
+                ],
+                hovertemplate=(
+                    "<b>%{x}</b><br><br>"
+                    "Gasto registrado: <b>$%{y:,.0f}</b><br>"
+                    "Participación en ingresos: <b>%{customdata[0]:.1f}%</b><br><br>"
+                    "Presupuesto del período: <b>$%{customdata[1]:,.0f}</b><br>"
+                    "Diferencia frente al presupuesto: <b>$%{customdata[2]:+,.0f}</b><br><br>"
+                    "<b>%{customdata[3]}</b>"
+                    "<extra></extra>"
+                ),
+            ))
+
+            subcategorias_presupuesto = subcategorias_ingresos.copy()
+
+            fig_subcategoria_ingresos.add_trace(go.Scatter(
+                x=subcategorias_presupuesto["Subcategoría"],
+                y=subcategorias_presupuesto["Presupuesto"].where(subcategorias_presupuesto["Presupuesto"].gt(0)),
+                name="Presupuesto ajustado",
+                mode="lines+markers",
+                line=dict(
+                    color="#FFEE00",
+                    width=3,
+                    dash="dash",
+                    shape="linear",
+                ),
+                marker=dict(
+                    size=9,
+                    color="#FFEE00",
+                    symbol="diamond",
+                    line=dict(color="#422006", width=1.2),
+                ),
+                customdata=subcategorias_presupuesto[
+                    ["Monto", "Diferencia vs presupuesto"]
+                ],
+                hovertemplate=(
+                    "<b>%{x}</b><br><br>"
+                    "Presupuesto del período: <b>$%{y:,.0f}</b><br><br>"
+                    "Gasto registrado: <b>$%{customdata[0]:,.0f}</b><br>"
+                    "Diferencia: <b>$%{customdata[1]:+,.0f}</b>"
+                    "<extra></extra>"
+                ),
+            ))
+
+            fig_subcategoria_ingresos.update_layout(
+                template="plotly_dark",
+                height=680,
+                paper_bgcolor="#000000",
+                plot_bgcolor="#000000",
+                font=dict(color="#E2E8F0"),
+                title=dict(
+                    text="Subcategorías de gasto y presupuesto",
+                    font=dict(color="#F8FAFC"),
+                ),
+                xaxis=dict(
+                    title="Subcategoría",
+                    type="category",
+                    categoryorder="array",
+                    categoryarray=subcategorias_ingresos["Subcategoría"].tolist(),
+                    tickangle=-40,
+                    gridcolor="rgba(148,163,184,0.08)",
+                    automargin=True,
+                ),
+                yaxis=dict(
+                    title="Valor en COP · escala logarítmica",
+                    type="log",
+                    dtick=1,
+                    tickprefix="$",
+                    tickformat=",.0f",
+                    gridcolor="rgba(148,163,184,0.14)",
+                ),
+                bargap=0.24,
+                margin=dict(t=95, b=190, l=70, r=35),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0,
+                ),
+                hoverlabel=dict(
+                    bgcolor="#10263c",
+                    bordercolor="#39d7ff",
+                    align="left",
+                    font=dict(color="#eef7ff", size=14, family="Arial, sans-serif"),
+                ),
+            )
+
+            st.caption("Escala logarítmica: cada salto del eje representa diez veces el importe anterior.")
+            if subcategorias_ingresos[["Monto", "Presupuesto"]].le(0).any().any():
+                st.caption("Los importes cero o negativos no se dibujan en esta escala; se conservan en «Ver tabla».")
+            st.plotly_chart(
+                fig_subcategoria_ingresos,
+                use_container_width=True,
+                key="grafico_subcategorias_presupuesto_v1",
+            )
+
+            tabla_subcategorias_ingresos = subcategorias_ingresos.copy()
+            tabla_subcategorias_ingresos["Monto"] = tabla_subcategorias_ingresos["Monto"].map(
+                lambda x: f"${x:,.0f}"
+            )
+            tabla_subcategorias_ingresos["% de ingresos"] = tabla_subcategorias_ingresos[
+                "% de ingresos"
+            ].map(lambda x: f"{x:.2f}%")
+            tabla_subcategorias_ingresos["Presupuesto"] = tabla_subcategorias_ingresos[
+                "Presupuesto"
+            ].map(lambda x: f"${x:,.0f}")
+            tabla_subcategorias_ingresos["Diferencia vs presupuesto"] = (
+                tabla_subcategorias_ingresos["Diferencia vs presupuesto"]
+                .map(lambda x: f"${x:,.0f}")
+            )
+
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(
+                    tabla_subcategorias_ingresos[
+                        [
+                            "Subcategoría",
+                            "Monto",
+                            "% de ingresos",
+                            "Presupuesto",
+                            "Diferencia vs presupuesto",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.info("No hay datos de subcategorías para mostrar con los filtros actuales.")
+
+        st.markdown("#### Detalle completo")
+        resumen_sub = (
+            sub_df.groupby(["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA", "GASTOS_SUBCATEGORIA_2"])
+            .agg(monto=("GASTOS_CANTIDAD", "sum"), transacciones=("GASTOS_CANTIDAD", "count"))
+            .reset_index().sort_values("monto", ascending=False)
+        )
+        resumen_sub["presupuesto"] = resumen_sub.apply(
+            lambda r: buscar_presupuesto_sub(r["GASTOS_CATEGORIA"], r["GASTOS_SUBCATEGORIA"], presupuesto_sub),
+            axis=1,
+        )
+        resumen_sub["diferencia"] = resumen_sub["monto"] - resumen_sub["presupuesto"]
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(resumen_sub, use_container_width=True)
+        csv = resumen_sub.to_csv(index=False).encode("utf-8")
+        st.download_button("Descargar resumen de subcategorías (CSV)", csv, "subcategorias.csv", "text/csv")
+
+
+        st.markdown("## 11. 🌱 Presupuesto aún sin estrenar")
+        st.caption(
+            "Muestra únicamente subcategorías con presupuesto asignado que nunca han tenido "
+            "un movimiento de gasto en todo el historial, independientemente del periodo filtrado."
+        )
+
+        subcategorias_utilizadas = set()
+        if not gastos.empty and "GASTOS_SUBCATEGORIA" in gastos.columns:
+            subcategorias_utilizadas = {
+                normalizar(subcategoria)
+                for subcategoria in gastos["GASTOS_SUBCATEGORIA"].dropna()
+                if str(subcategoria).strip()
+            }
+
+        presupuesto_sin_estrenar = []
+        for (categoria, subcategoria), valor_presupuestado in presupuesto_sub.items():
+            valor_presupuestado = float(valor_presupuestado or 0.0)
+            subcategoria_normalizada = normalizar(subcategoria)
+            if (
+                valor_presupuestado <= 0
+                or not subcategoria_normalizada
+                or subcategoria_normalizada in subcategorias_utilizadas
+            ):
+                continue
+            presupuesto_sin_estrenar.append({
+                "Categoría": str(categoria).title(),
+                "Subcategoría": str(subcategoria).title(),
+                "Presupuesto disponible": valor_presupuestado,
+            })
+
+        presupuesto_sin_estrenar_df = pd.DataFrame(presupuesto_sin_estrenar)
+        if not presupuesto_sin_estrenar_df.empty:
+            presupuesto_sin_estrenar_df = presupuesto_sin_estrenar_df.sort_values(
+                "Presupuesto disponible", ascending=False
+            )
+            total_sin_estrenar = float(
+                presupuesto_sin_estrenar_df["Presupuesto disponible"].sum()
+            )
+            cantidad_sin_estrenar = len(presupuesto_sin_estrenar_df)
+            porcentaje_sin_estrenar = (
+                total_sin_estrenar / presupuesto_periodo_total * 100
+                if presupuesto_periodo_total > 0 else 0.0
+            )
+
+            se1, se2, se3 = st.columns(3)
+            tarjeta_perfil_panel(se1, "💰 Presupuesto disponible", f"${total_sin_estrenar:,.0f}", help='Presupuesto asignado a subcategorías que todavía no tienen gasto registrado.')
+            tarjeta_perfil_panel(se2, "🌱 Subcategorías sin estrenar", cantidad_sin_estrenar, help='Cantidad de subcategorías con presupuesto que aún no registran gastos.')
+            tarjeta_perfil_panel(se3, "📊 % del presupuesto", f"{porcentaje_sin_estrenar:.1f}%", help='Porcentaje del presupuesto que corresponde a subcategorías aún sin gastos.')
+
+            presupuesto_sin_estrenar_df["Concepto"] = (
+                presupuesto_sin_estrenar_df["Categoría"]
+                + " › "
+                + presupuesto_sin_estrenar_df["Subcategoría"]
+            )
+            max_presupuesto_sin_estrenar = float(
+                presupuesto_sin_estrenar_df["Presupuesto disponible"].max()
+            )
+            promedio_sin_estrenar = float(
+                presupuesto_sin_estrenar_df["Presupuesto disponible"].mean()
+            )
+            presupuesto_sin_estrenar_orden = presupuesto_sin_estrenar_df.sort_values(
+                "Presupuesto disponible", ascending=True
+            )
+            valores_sin_estrenar = presupuesto_sin_estrenar_orden[
+                "Presupuesto disponible"
+            ].astype(float).tolist()
+            conceptos_sin_estrenar = presupuesto_sin_estrenar_orden["Concepto"].tolist()
+
+            # Plotly no admite gradientes nativos dentro de una barra. Se crea un
+            # degradado real con 32 segmentos apilados y sin bordes visibles.
+            segmentos_degradado = 32
+            ancho_segmento = max(max_presupuesto_sin_estrenar, 1.0) / segmentos_degradado
+            color_inicial = (4, 18, 11)      # negro con matiz verde
+            color_final = (0, 255, 102)      # verde neón intenso
+
+            def color_degradado(fraccion):
+                rgb = tuple(
+                    round(inicio + (fin - inicio) * fraccion)
+                    for inicio, fin in zip(color_inicial, color_final)
+                )
+                return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+            fig_sin_estrenar = go.Figure()
+            for indice_segmento in range(segmentos_degradado):
+                inicio_segmento = indice_segmento * ancho_segmento
+                valores_segmento = [
+                    max(min(valor - inicio_segmento, ancho_segmento), 0.0)
+                    for valor in valores_sin_estrenar
+                ]
+                fig_sin_estrenar.add_trace(go.Bar(
+                    x=valores_segmento,
+                    y=conceptos_sin_estrenar,
+                    orientation="h",
+                    width=0.62,
+                    marker=dict(
+                        color=color_degradado(
+                            indice_segmento / max(segmentos_degradado - 1, 1)
+                        ),
+                        line=dict(width=0),
+                    ),
+                    customdata=valores_sin_estrenar,
+                    hovertemplate=(
+                        "<b>🌱 %{y}</b><br><br>"
+                        "Presupuesto disponible&nbsp; <b>$%{customdata:,.0f}</b><br>"
+                        "Estado&nbsp; Sin movimientos en todo el historial"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+
+            # Etiquetas independientes para mantener el valor al final del degradado.
+            fig_sin_estrenar.add_trace(go.Scatter(
+                x=valores_sin_estrenar,
+                y=conceptos_sin_estrenar,
+                mode="text",
+                text=[f"<b>${valor:,.0f}</b>" for valor in valores_sin_estrenar],
+                textposition="middle right",
+                textfont=dict(color="#EFFFF4", size=12),
+                cliponaxis=False,
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+            fig_sin_estrenar.update_layout(
+                height=max(390, len(presupuesto_sin_estrenar_df) * 52),
+                barmode="stack",
+                bargap=0.28,
+                xaxis_title="",
+                yaxis_title="",
+                showlegend=False,
+                margin=dict(l=210, r=95, t=105, b=45),
+                hoverlabel=dict(
+                    bgcolor="#052E1A",
+                    bordercolor="#00FF66",
+                    font=dict(color="#F3FFF7", size=13),
+                ),
+                uniformtext=dict(minsize=11, mode="show"),
+            )
+            fig_sin_estrenar.update_xaxes(
+                tickprefix="$",
+                tickformat=",.0f",
+                range=[0, max(max_presupuesto_sin_estrenar * 1.22, 1.0)],
+                gridcolor="rgba(120,255,170,0.10)",
+                zeroline=False,
+                showline=False,
+                tickfont=dict(color="#A7CDB4", size=11),
+            )
+            fig_sin_estrenar.update_yaxes(
+                gridcolor="rgba(0,0,0,0)",
+                showline=False,
+                tickfont=dict(color="#E9FFF0", size=12),
+            )
+            if len(presupuesto_sin_estrenar_df) > 1:
+                fig_sin_estrenar.add_vline(
+                    x=promedio_sin_estrenar,
+                    line_width=1.2,
+                    line_dash="dot",
+                    line_color="rgba(255,255,255,0.42)",
+                    annotation_text=f"Promedio ${promedio_sin_estrenar:,.0f}",
+                    annotation_position="top",
+                    annotation_font=dict(color="#D7FFE4", size=10),
+                )
+            fig_sin_estrenar = estilo_grafico(
+                fig_sin_estrenar,
+                "🌱 Subcategorías con presupuesto aún sin estrenar",
+            )
+            fig_sin_estrenar.update_layout(
+                paper_bgcolor="#020A06",
+                plot_bgcolor="#020A06",
+                title=dict(
+                    text=(
+                        "<b>🌱 Subcategorías con presupuesto aún sin estrenar</b>"
+                        "<br><span style='font-size:12px;color:#8FD8A8'>"
+                        "De negro a verde neón = mayor presupuesto asignado sin ningún uso histórico</span>"
+                    ),
+                    x=0.01,
+                    xanchor="left",
+                    font=dict(color="#F2FFF6", size=20),
+                ),
+                margin=dict(l=210, r=95, t=105, b=45),
+            )
+            fig_sin_estrenar.update_xaxes(
+                gridcolor="rgba(120,255,170,0.10)",
+                linecolor="rgba(0,0,0,0)",
+                zeroline=False,
+                showline=False,
+            )
+            fig_sin_estrenar.update_yaxes(
+                gridcolor="rgba(0,0,0,0)",
+                linecolor="rgba(0,0,0,0)",
+                zeroline=False,
+                showline=False,
+            )
+            st.plotly_chart(
+                fig_sin_estrenar,
+                use_container_width=True,
+                key="presupuesto_subcategorias_nunca_utilizadas",
+            )
+
+            with st.expander("Ver detalle del presupuesto sin estrenar"):
+                st.dataframe(
+                    presupuesto_sin_estrenar_df[
+                        ["Categoría", "Subcategoría", "Presupuesto disponible"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Presupuesto disponible": st.column_config.NumberColumn(
+                            "Presupuesto disponible", format="$%d"
+                        )
+                    },
+                )
+        else:
+            st.success(
+                "Todas las subcategorías con presupuesto asignado ya han sido utilizadas "
+                "al menos una vez en el historial."
+            )
+
+        st.markdown("## 12. ✅ Resultado final del presupuesto")
+        st.caption(
+            "Una lectura directa del período filtrado: blanco = dentro del margen de ±10 %, "
+            "verde = disponibilidad y rojo = exceso. Los gastos sin presupuesto se destacan "
+            "en morado dentro de las tarjetas y el detalle."
+        )
+
+        selector_nivel, selector_vista = st.columns(2)
+        with selector_nivel:
+            nivel_cumplimiento = st.radio(
+                "Nivel de análisis",
+                ["Categorías", "Subcategorías"],
+                horizontal=True,
+                key="presupuesto_resultado_final_nivel_v13",
+            )
+        with selector_vista:
+            vista_cumplimiento = st.radio(
+                "Forma de visualizar",
+                ["Porcentaje", "Valor en efectivo"],
+                horizontal=True,
+                key="presupuesto_resultado_final_vista_v13",
+            )
+
+        if nivel_cumplimiento == "Categorías":
+            gastos_resultado = (
+                df.groupby("GASTOS_CATEGORIA", as_index=False)["GASTOS_CANTIDAD"]
+                .sum()
+                .rename(columns={"GASTOS_CATEGORIA": "Categoría", "GASTOS_CANTIDAD": "Gasto"})
+            ) if not df.empty else pd.DataFrame(columns=["Categoría", "Gasto"])
+            gasto_por_clave = {
+                normalizar(fila["Categoría"]): float(fila["Gasto"])
+                for _, fila in gastos_resultado.iterrows()
+            }
+            claves_resultado = set(gasto_por_clave) | set(presupuesto_cat)
+            categorias_filtro_explicito = {
+                normalizar(categoria) for categoria in categorias_elegidas
+            }
+            if categorias_filtro_explicito:
+                claves_resultado &= categorias_filtro_explicito
+            resultado_final_df = pd.DataFrame([
+                {
+                    "Concepto": str(clave).title(),
+                    "Presupuesto": float(presupuesto_cat.get(clave, 0.0) or 0.0),
+                    "Gasto": float(gasto_por_clave.get(clave, 0.0) or 0.0),
+                }
+                for clave in sorted(claves_resultado)
+            ])
+        else:
+            gastos_resultado = (
+                df.dropna(subset=["GASTOS_SUBCATEGORIA"])
+                .groupby(["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"], as_index=False)["GASTOS_CANTIDAD"]
+                .sum()
+                .rename(columns={"GASTOS_CANTIDAD": "Gasto"})
+            ) if not df.empty else pd.DataFrame(
+                columns=["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA", "Gasto"]
+            )
+            gasto_por_clave = {
+                (normalizar(fila["GASTOS_CATEGORIA"]), normalizar(fila["GASTOS_SUBCATEGORIA"])):
+                float(fila["Gasto"])
+                for _, fila in gastos_resultado.iterrows()
+            }
+            claves_resultado = set(gasto_por_clave) | set(presupuesto_sub)
+            categorias_filtro_explicito = {
+                normalizar(categoria) for categoria in categorias_elegidas
+            }
+            subcategorias_filtro_explicito = {
+                normalizar(subcategoria) for subcategoria in subcategorias_elegidas
+            }
+            if categorias_filtro_explicito:
+                claves_resultado = {
+                    clave for clave in claves_resultado if clave[0] in categorias_filtro_explicito
+                }
+            if subcategorias_filtro_explicito:
+                claves_resultado = {
+                    clave for clave in claves_resultado if clave[1] in subcategorias_filtro_explicito
+                }
+            resultado_final_df = pd.DataFrame([
+                {
+                    "Concepto": f"{str(clave[0]).title()} › {str(clave[1]).title()}",
+                    "Presupuesto": float(presupuesto_sub.get(clave, 0.0) or 0.0),
+                    "Gasto": float(gasto_por_clave.get(clave, 0.0) or 0.0),
+                }
+                for clave in sorted(claves_resultado)
+            ])
+
+        if resultado_final_df.empty:
+            st.info("No hay información presupuestal para evaluar con los filtros actuales.")
+        else:
+            resultado_final_df["Saldo"] = (
+                resultado_final_df["Presupuesto"] - resultado_final_df["Gasto"]
+            )
+            resultado_final_df["% ejecutado"] = resultado_final_df.apply(
+                lambda fila: fila["Gasto"] / fila["Presupuesto"] * 100
+                if fila["Presupuesto"] > 0 else None,
+                axis=1,
+            )
+
+            def clasificar_cumplimiento(fila):
+                presupuesto_valor = float(fila["Presupuesto"])
+                gasto_valor = float(fila["Gasto"])
+                if presupuesto_valor <= 0:
+                    return "Sin presupuesto" if gasto_valor > 0 else "Sin actividad"
+                if gasto_valor == 0:
+                    return "Sin utilizar"
+                ejecucion = gasto_valor / presupuesto_valor * 100
+                if ejecucion > 110:
+                    return "Excedido"
+                if ejecucion < 90:
+                    return "Con disponibilidad"
+                return "Cumplido"
+
+            resultado_final_df["Estado"] = resultado_final_df.apply(
+                clasificar_cumplimiento, axis=1
+            )
+            resultado_final_df["Desviación %"] = resultado_final_df.apply(
+                lambda fila: (fila["Gasto"] - fila["Presupuesto"]) / fila["Presupuesto"] * 100
+                if fila["Presupuesto"] > 0 else None,
+                axis=1,
+            )
+            resultado_final_df["Desviación texto"] = resultado_final_df.apply(
+                lambda fila: f"{fila['Desviación %']:+.1f}%"
+                if fila["Presupuesto"] > 0 else "No aplica: sin presupuesto",
+                axis=1,
+            )
+            resultado_final_df["Impacto"] = resultado_final_df["Saldo"].abs()
+            resultado_final_df["Resultado efectivo"] = resultado_final_df["Saldo"].map(
+                lambda valor: (
+                    f"Disponible ${valor:,.0f}" if valor >= 0
+                    else f"Exceso ${abs(valor):,.0f}"
+                )
+            )
+
+            presupuesto_evaluable = float(resultado_final_df["Presupuesto"].sum())
+            gasto_evaluable = float(resultado_final_df["Gasto"].sum())
+            ejecucion_general = (
+                gasto_evaluable / presupuesto_evaluable * 100
+                if presupuesto_evaluable > 0 else 0.0
+            )
+            cantidad_cumplida = int((resultado_final_df["Estado"] == "Cumplido").sum())
+            exceso_total = float(
+                (-resultado_final_df.loc[resultado_final_df["Saldo"] < 0, "Saldo"]).sum()
+            )
+            disponibilidad_total = float(
+                resultado_final_df.loc[resultado_final_df["Saldo"] > 0, "Saldo"].sum()
+            )
+            sin_presupuesto_total = float(
+                resultado_final_df.loc[
+                    resultado_final_df["Estado"] == "Sin presupuesto", "Gasto"
+                ].sum()
+            )
+
+            rf1, rf2, rf3, rf4, rf5 = st.columns(5)
+            tarjeta_perfil_panel(rf1, '📊 Ejecución general', f"{ejecucion_general:.1f}%", help='Porcentaje del presupuesto consumido según el resultado general de esta sección.')
+            tarjeta_perfil_panel(rf2, "✅ Cumplidas", cantidad_cumplida, help='Cantidad de elementos clasificados como cumplidos en el resultado final.')
+            rf3.metric("🟢 Disponible", f"${disponibilidad_total:,.0f}", help='Presupuesto restante después del gasto registrado; un valor negativo indica exceso.')
+            tarjeta_perfil_panel(rf4, "🔴 Exceso", f"${exceso_total:,.0f}", help='Total de gasto que supera el presupuesto en el resultado final.')
+            tarjeta_perfil_panel(rf5, "🟣 Sin presupuesto", f"${sin_presupuesto_total:,.0f}", help='Monto de gastos sin presupuesto asignado en el resultado final.')
+
+            if presupuesto_evaluable > 0:
+                balance_periodo = presupuesto_evaluable - gasto_evaluable
+                estado_periodo = "disponibles" if balance_periodo >= 0 else "de exceso"
+                st.info(
+                    f"En el período filtrado se ejecutó el {ejecucion_general:.1f}% del presupuesto "
+                    f"evaluado. El resultado neto es ${abs(balance_periodo):,.0f} {estado_periodo}."
+                )
+
+            if vista_cumplimiento == "Porcentaje":
+                resultado_grafico = resultado_final_df[
+                    resultado_final_df["Presupuesto"] > 0
+                ].copy()
+            else:
+                resultado_grafico = resultado_final_df[
+                    (resultado_final_df["Presupuesto"] > 0)
+                    | (resultado_final_df["Gasto"] > 0)
+                ].copy()
+            if not resultado_grafico.empty:
+                colores_estado = {
+                    "Cumplido": "#F8FAFC",
+                    "Con disponibilidad": "#00FF88",
+                    "Excedido": "#FF1744",
+                    "Sin utilizar": "#064E3B",
+                    "Sin presupuesto": "#A855F7",
+                    "Sin actividad": "#475569",
+                }
+                resultado_grafico["Color"] = resultado_grafico["Estado"].map(colores_estado)
+                if vista_cumplimiento == "Porcentaje":
+                    resultado_grafico = resultado_grafico.sort_values(
+                        ["% ejecutado", "Impacto"], ascending=[True, False]
+                    )
+                else:
+                    resultado_grafico["Mayor valor"] = resultado_grafico[
+                        ["Presupuesto", "Gasto"]
+                    ].max(axis=1)
+                    resultado_grafico = resultado_grafico.sort_values(
+                        ["Mayor valor", "Impacto"], ascending=[True, True]
+                    )
+                altura_resultado = max(430, min(1050, len(resultado_grafico) * 43 + 150))
+                datos_tooltip = resultado_grafico[
+                    [
+                        "Presupuesto", "Gasto", "Saldo", "Desviación texto", "Estado",
+                        "Resultado efectivo",
+                    ]
+                ]
+                tooltip_cumplimiento = (
+                    "<b>%{y}</b><br><br>"
+                    "Estado: <b>%{customdata[4]}</b><br>"
+                    "Presupuesto: $%{customdata[0]:,.0f}<br>"
+                    "Gasto: $%{customdata[1]:,.0f}<br>"
+                    "Resultado: <b>%{customdata[5]}</b><br>"
+                    "Desviación: %{customdata[3]}"
+                    "<extra></extra>"
+                )
+
+                if vista_cumplimiento == "Porcentaje":
+                    max_ejecucion = float(
+                        pd.to_numeric(
+                            resultado_grafico["% ejecutado"], errors="coerce"
+                        ).max()
+                    )
+                    fig_resultado_final = go.Figure(go.Bar(
+                        x=resultado_grafico["% ejecutado"],
+                        y=resultado_grafico["Concepto"],
+                        orientation="h",
+                        marker=dict(
+                            color=resultado_grafico["Color"],
+                            line=dict(color="rgba(255,255,255,0.32)", width=0.7),
+                        ),
+                        text=resultado_grafico["% ejecutado"].map(
+                            lambda valor: f"{valor:.1f}%"
+                        ),
+                        textposition="outside",
+                        textfont=dict(color="#FFFFFF", size=11),
+                        cliponaxis=False,
+                        customdata=datos_tooltip,
+                        hovertemplate=tooltip_cumplimiento,
+                        showlegend=False,
+                    ))
+                    fig_resultado_final.add_vrect(
+                        x0=90, x1=110,
+                        fillcolor="rgba(255,255,255,0.055)",
+                        line_width=0,
+                        layer="below",
+                    )
+                    fig_resultado_final.add_vline(
+                        x=100,
+                        line_width=2,
+                        line_dash="dot",
+                        line_color="#FFEE00",
+                        annotation_text="Presupuesto 100%",
+                        annotation_position="top",
+                        annotation_font=dict(color="#FFEE00", size=11),
+                    )
+                    titulo_eje_resultado = "Porcentaje del presupuesto ejecutado"
+                    titulo_resultado = f"Cumplimiento por {nivel_cumplimiento.lower()}"
+                else:
+                    resultado_grafico["Gastado dentro del presupuesto"] = resultado_grafico.apply(
+                        lambda fila: min(fila["Gasto"], fila["Presupuesto"])
+                        if fila["Presupuesto"] > 0 else 0.0,
+                        axis=1,
+                    )
+                    resultado_grafico["Disponible"] = (
+                        resultado_grafico["Presupuesto"] - resultado_grafico["Gasto"]
+                    ).clip(lower=0)
+                    resultado_grafico["Exceso"] = resultado_grafico.apply(
+                        lambda fila: max(fila["Gasto"] - fila["Presupuesto"], 0.0)
+                        if fila["Presupuesto"] > 0 else 0.0,
+                        axis=1,
+                    )
+                    resultado_grafico["Sin presupuesto"] = resultado_grafico.apply(
+                        lambda fila: fila["Gasto"] if fila["Presupuesto"] <= 0 else 0.0,
+                        axis=1,
+                    )
+                    max_valor_efectivo = float(
+                        resultado_grafico[["Presupuesto", "Gasto"]].max().max()
+                    )
+                    fig_resultado_final = go.Figure()
+                    segmentos_efectivo = [
+                        ("Gastado dentro del presupuesto", "#F8FAFC"),
+                        ("Disponible", "#00FF66"),
+                        ("Exceso", "#FF0033"),
+                        ("Sin presupuesto", "#A855F7"),
+                    ]
+                    for nombre_segmento, color_segmento in segmentos_efectivo:
+                        fig_resultado_final.add_trace(go.Bar(
+                            x=resultado_grafico[nombre_segmento],
+                            y=resultado_grafico["Concepto"],
+                            orientation="h",
+                            name=nombre_segmento,
+                            marker=dict(
+                                color=color_segmento,
+                                line=dict(color="rgba(255,255,255,0.20)", width=0.5),
+                            ),
+                            customdata=datos_tooltip,
+                            hovertemplate=(
+                                "<b>%{y}</b><br><br>"
+                                f"{nombre_segmento}: <b>$%{{x:,.0f}}</b><br>"
+                                "Presupuesto: $%{customdata[0]:,.0f}<br>"
+                                "Gasto total: $%{customdata[1]:,.0f}<br>"
+                                "Resultado: <b>%{customdata[5]}</b><br>"
+                                "Desviación: %{customdata[3]}"
+                                "<extra></extra>"
+                            ),
+                        ))
+                    fig_resultado_final.add_trace(go.Scatter(
+                        x=resultado_grafico["Mayor valor"],
+                        y=resultado_grafico["Concepto"],
+                        mode="text",
+                        name="Resultado",
+                        text=resultado_grafico["Resultado efectivo"],
+                        textposition="middle right",
+                        textfont=dict(color="#FFFFFF", size=10),
+                        cliponaxis=False,
+                        hoverinfo="skip",
+                        showlegend=False,
+                    ))
+                    titulo_eje_resultado = "Valor en efectivo"
+                    titulo_resultado = (
+                        f"Cómo se distribuyó el presupuesto por {nivel_cumplimiento.lower()}"
+                    )
+
+                    resultado_grafico["Estado del saldo"] = resultado_grafico.apply(
+                        lambda fila: "Sin presupuesto"
+                        if fila["Presupuesto"] <= 0 and fila["Gasto"] > 0
+                        else "Disponible" if fila["Saldo"] > 0
+                        else "Exceso" if fila["Saldo"] < 0
+                        else "Exacto",
+                        axis=1,
+                    )
+                    colores_saldo = {
+                        "Disponible": "#00FF66",
+                        "Exceso": "#FF0033",
+                        "Exacto": "#F8FAFC",
+                        "Sin presupuesto": "#A855F7",
+                    }
+                    max_saldo_absoluto = max(
+                        float(resultado_grafico["Saldo"].abs().max()), 1.0
+                    )
+                    fig_saldo_efectivo = go.Figure(go.Bar(
+                        x=resultado_grafico["Saldo"],
+                        y=resultado_grafico["Concepto"],
+                        orientation="h",
+                        marker=dict(
+                            color=resultado_grafico["Estado del saldo"].map(colores_saldo),
+                            line=dict(color="rgba(255,255,255,0.20)", width=0.5),
+                        ),
+                        text=resultado_grafico["Resultado efectivo"],
+                        textposition="outside",
+                        textfont=dict(color="#FFFFFF", size=10),
+                        cliponaxis=False,
+                        customdata=datos_tooltip,
+                        hovertemplate=tooltip_cumplimiento,
+                        showlegend=False,
+                    ))
+                    for nombre_estado, color_estado in colores_saldo.items():
+                        fig_saldo_efectivo.add_trace(go.Scatter(
+                            x=[None],
+                            y=[None],
+                            mode="markers",
+                            name=nombre_estado,
+                            marker=dict(color=color_estado, size=10, symbol="square"),
+                            hoverinfo="skip",
+                        ))
+                    fig_saldo_efectivo.add_vline(
+                        x=0,
+                        line_width=2,
+                        line_color="#FFEE00",
+                        annotation_text="Saldo exacto $0",
+                        annotation_position="top",
+                        annotation_font=dict(color="#FFEE00", size=11),
+                    )
+                    fig_saldo_efectivo.add_annotation(
+                        x=0.02,
+                        y=1.07,
+                        xref="paper",
+                        yref="paper",
+                        text="← Exceso",
+                        showarrow=False,
+                        font=dict(color="#FF6B81", size=12),
+                    )
+                    fig_saldo_efectivo.add_annotation(
+                        x=0.98,
+                        y=1.07,
+                        xref="paper",
+                        yref="paper",
+                        text="Disponibilidad →",
+                        showarrow=False,
+                        font=dict(color="#00FF66", size=12),
+                    )
+                    fig_saldo_efectivo.update_layout(
+                        height=altura_resultado,
+                        showlegend=True,
+                        bargap=0.28,
+                        margin=dict(l=220, r=90, t=95, b=65),
+                        paper_bgcolor="#020407",
+                        plot_bgcolor="#020407",
+                        hoverlabel=dict(
+                            bgcolor="#07111F",
+                            bordercolor="#38BDF8",
+                            font=dict(color="#F8FAFC", size=13),
+                        ),
+                    )
+                    fig_saldo_efectivo.update_xaxes(
+                        title="Exceso ← Saldo en efectivo → Disponibilidad",
+                        tickprefix="$",
+                        tickformat=",.0f",
+                        range=[-max_saldo_absoluto * 1.35, max_saldo_absoluto * 1.35],
+                        gridcolor="rgba(148,163,184,0.10)",
+                        zeroline=False,
+                    )
+                    fig_saldo_efectivo.update_yaxes(
+                        title="",
+                        gridcolor="rgba(0,0,0,0)",
+                    )
+                    fig_saldo_efectivo = estilo_grafico(
+                        fig_saldo_efectivo,
+                        f"Saldo disponible o excedido por {nivel_cumplimiento.lower()}",
+                    )
+
+                fig_resultado_final.update_layout(
+                    height=altura_resultado,
+                    showlegend=vista_cumplimiento == "Valor en efectivo",
+                    barmode="stack" if vista_cumplimiento == "Valor en efectivo" else "relative",
+                    bargap=0.28,
+                    margin=dict(l=220, r=90, t=85, b=65),
+                    paper_bgcolor="#020407",
+                    plot_bgcolor="#020407",
+                    hoverlabel=dict(
+                        bgcolor="#07111F",
+                        bordercolor="#38BDF8",
+                        font=dict(color="#F8FAFC", size=13),
+                    ),
+                )
+                if vista_cumplimiento == "Porcentaje":
+                    fig_resultado_final.update_xaxes(
+                        title=titulo_eje_resultado,
+                        ticksuffix="%",
+                        range=[0, max(125, max_ejecucion * 1.14)],
+                        gridcolor="rgba(148,163,184,0.10)",
+                        zeroline=False,
+                    )
+                else:
+                    fig_resultado_final.update_xaxes(
+                        title=titulo_eje_resultado,
+                        tickprefix="$",
+                        tickformat=",.0f",
+                        range=[0, max(max_valor_efectivo * 1.34, 1.0)],
+                        gridcolor="rgba(148,163,184,0.10)",
+                        zeroline=False,
+                    )
+                fig_resultado_final.update_yaxes(
+                    title="",
+                    gridcolor="rgba(0,0,0,0)",
+                )
+                fig_resultado_final = estilo_grafico(
+                    fig_resultado_final,
+                    titulo_resultado,
+                )
+                if vista_cumplimiento == "Valor en efectivo":
+                    st.caption(
+                        "La línea amarilla representa un saldo exacto de $0. A la derecha está el dinero "
+                        "disponible; a la izquierda, el exceso. La longitud de la barra indica el valor en pesos."
+                    )
+                    st.plotly_chart(
+                        fig_saldo_efectivo,
+                        use_container_width=True,
+                        key=(
+                            f"presupuesto_saldo_efectivo_{nivel_cumplimiento.lower()}_v13"
+                        ),
+                    )
+                else:
+                    st.plotly_chart(
+                        fig_resultado_final,
+                        use_container_width=True,
+                        key=(
+                            f"presupuesto_resultado_final_{nivel_cumplimiento.lower()}_"
+                            f"{vista_cumplimiento.lower()}_v13"
+                        ),
+                    )
+
+            excepciones_df = resultado_final_df[
+                ~resultado_final_df["Estado"].isin(["Cumplido", "Sin actividad"])
+            ].sort_values("Impacto", ascending=False)
+            with st.expander(
+                f"Ver partidas que requieren atención ({len(excepciones_df)})",
+                expanded=False,
+            ):
+                if excepciones_df.empty:
+                    st.success("Todas las partidas evaluables están dentro del margen de ±10 %.")
+                else:
+                    iconos_estado = {
+                        "Excedido": "🔴 Excedido",
+                        "Con disponibilidad": "🟢 Con disponibilidad",
+                        "Sin utilizar": "🌱 Sin utilizar",
+                        "Sin presupuesto": "🟣 Sin presupuesto",
+                    }
+                    tabla_excepciones = excepciones_df.copy()
+                    tabla_excepciones["Estado"] = tabla_excepciones["Estado"].map(
+                        iconos_estado
+                    ).fillna(tabla_excepciones["Estado"])
+                    st.dataframe(
+                        tabla_excepciones[
+                            [
+                                "Estado", "Concepto", "Presupuesto", "Gasto",
+                                "Saldo", "% ejecutado", "Desviación %",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Presupuesto": st.column_config.NumberColumn(format="$%d"),
+                            "Gasto": st.column_config.NumberColumn(format="$%d"),
+                            "Saldo": st.column_config.NumberColumn(format="$%d"),
+                            "% ejecutado": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Desviación %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        },
+                    )
+
+            resultado_distribucion_final = resultado_final_df[
+                (resultado_final_df["Presupuesto"] > 0)
+                | (resultado_final_df["Gasto"] > 0)
+            ].copy()
+            if not resultado_distribucion_final.empty:
+                resultado_distribucion_final["Mayor valor"] = resultado_distribucion_final[
+                    ["Presupuesto", "Gasto"]
+                ].max(axis=1)
+                resultado_distribucion_final = resultado_distribucion_final.sort_values(
+                    ["Mayor valor", "Impacto"], ascending=[True, True]
+                )
+                resultado_distribucion_final[
+                    "Gastado dentro del presupuesto"
+                ] = resultado_distribucion_final.apply(
+                    lambda fila: min(fila["Gasto"], fila["Presupuesto"])
+                    if fila["Presupuesto"] > 0 else 0.0,
+                    axis=1,
+                )
+                resultado_distribucion_final["Disponible"] = (
+                    resultado_distribucion_final["Presupuesto"]
+                    - resultado_distribucion_final["Gasto"]
+                ).clip(lower=0)
+                resultado_distribucion_final["Exceso"] = resultado_distribucion_final.apply(
+                    lambda fila: max(fila["Gasto"] - fila["Presupuesto"], 0.0)
+                    if fila["Presupuesto"] > 0 else 0.0,
+                    axis=1,
+                )
+                resultado_distribucion_final["Sin presupuesto"] = (
+                    resultado_distribucion_final.apply(
+                        lambda fila: fila["Gasto"]
+                        if fila["Presupuesto"] <= 0 else 0.0,
+                        axis=1,
+                    )
+                )
+                datos_tooltip_distribucion = resultado_distribucion_final[
+                    [
+                        "Presupuesto", "Gasto", "Saldo", "Desviación texto", "Estado",
+                        "Resultado efectivo",
+                    ]
+                ]
+                max_distribucion_efectivo = float(
+                    resultado_distribucion_final[["Presupuesto", "Gasto"]].max().max()
+                )
+                altura_distribucion = max(
+                    430, min(1050, len(resultado_distribucion_final) * 43 + 150)
+                )
+                fig_distribucion_final = go.Figure()
+                segmentos_distribucion = [
+                    ("Gastado dentro del presupuesto", "#F8FAFC"),
+                    ("Disponible", "#00FF66"),
+                    ("Exceso", "#FF0033"),
+                    ("Sin presupuesto", "#A855F7"),
+                ]
+                for nombre_segmento, color_segmento in segmentos_distribucion:
+                    fig_distribucion_final.add_trace(go.Bar(
+                        x=resultado_distribucion_final[nombre_segmento],
+                        y=resultado_distribucion_final["Concepto"],
+                        orientation="h",
+                        name=nombre_segmento,
+                        marker=dict(
+                            color=color_segmento,
+                            line=dict(color="rgba(255,255,255,0.20)", width=0.5),
+                        ),
+                        customdata=datos_tooltip_distribucion,
+                        hovertemplate=(
+                            "<b>%{y}</b><br><br>"
+                            f"{nombre_segmento}: <b>$%{{x:,.0f}}</b><br>"
+                            "Presupuesto: $%{customdata[0]:,.0f}<br>"
+                            "Gasto total: $%{customdata[1]:,.0f}<br>"
+                            "Resultado: <b>%{customdata[5]}</b><br>"
+                            "Desviación: %{customdata[3]}"
+                            "<extra></extra>"
+                        ),
+                    ))
+                fig_distribucion_final.add_trace(go.Scatter(
+                    x=resultado_distribucion_final["Mayor valor"],
+                    y=resultado_distribucion_final["Concepto"],
+                    mode="text",
+                    name="Resultado",
+                    text=resultado_distribucion_final["Resultado efectivo"],
+                    textposition="middle right",
+                    textfont=dict(color="#FFFFFF", size=10),
+                    cliponaxis=False,
+                    hoverinfo="skip",
+                    showlegend=False,
+                ))
+                fig_distribucion_final.update_layout(
+                    height=altura_distribucion,
+                    showlegend=True,
+                    barmode="stack",
+                    bargap=0.28,
+                    margin=dict(l=220, r=90, t=85, b=65),
+                    paper_bgcolor="#020407",
+                    plot_bgcolor="#020407",
+                    hoverlabel=dict(
+                        bgcolor="#07111F",
+                        bordercolor="#38BDF8",
+                        font=dict(color="#F8FAFC", size=13),
+                    ),
+                )
+                fig_distribucion_final.update_xaxes(
+                    title="Valor en efectivo",
+                    tickprefix="$",
+                    tickformat=",.0f",
+                    range=[0, max(max_distribucion_efectivo * 1.34, 1.0)],
+                    gridcolor="rgba(148,163,184,0.10)",
+                    zeroline=False,
+                )
+                fig_distribucion_final.update_yaxes(
+                    title="",
+                    gridcolor="rgba(0,0,0,0)",
+                )
+                fig_distribucion_final = estilo_grafico(
+                    fig_distribucion_final,
+                    f"Cómo se distribuyó el presupuesto por {nivel_cumplimiento.lower()}",
+                )
+                st.markdown("#### Distribución final del presupuesto")
+                st.caption(
+                    "Esta gráfica permanece visible como cierre: blanco es lo gastado dentro del plan, "
+                    "verde es el dinero disponible, rojo es el exceso y morado es gasto sin presupuesto."
+                )
+                st.plotly_chart(
+                    fig_distribucion_final,
+                    use_container_width=True,
+                    key=f"presupuesto_distribucion_final_{nivel_cumplimiento.lower()}_v13",
+                )
+
+        st.divider()
+        st.markdown("## 13. Visualización avanzada del cumplimiento")
+        st.subheader("🕸️ Radar Financiero Ejecutivo")
+        st.caption(
+            "🔴 Rojo = sobre presupuesto · ⚪ Blanco = cerca del presupuesto · 🔵 Azul = bajo presupuesto. "
+            "Línea amarilla punteada = presupuesto acumulado del periodo desde Historico_presupuesto."
+        )
+
+        radar_df = df.copy()
+        meses_radar = ", ".join(map(str, sorted(radar_df["MES"].dropna().unique())))
+        periodos_radar = radar_df[["ANIO", "MES"]].dropna(how="all").drop_duplicates()
+        n_periodos_radar = max(len(periodos_radar), 1)
+        presupuesto_cat_radar = presupuesto_cat.copy()
+        presupuesto_sub_radar = presupuesto_sub.copy()
+        st.info(
+            "El radar usa automáticamente los filtros del panel izquierdo"
+            + (f". Periodo incluido: {meses_radar}." if meses_radar else ".")
+            + f" Presupuesto ajustado a {n_periodos_radar} periodo(s) filtrado(s)."
+        )
+
+        comp_cat = (
+            radar_df.groupby("GASTOS_CATEGORIA")["GASTOS_CANTIDAD"]
+            .sum()
+            .reset_index()
+            .rename(columns={"GASTOS_CATEGORIA": "Categoría", "GASTOS_CANTIDAD": "Gasto"})
+        )
+        comp_cat["Presupuesto"] = comp_cat["Categoría"].map(
+            lambda c: presupuesto_cat_radar.get(normalizar(c), 0)
+        )
+        comp_cat["Diferencia"] = comp_cat["Gasto"] - comp_cat["Presupuesto"]
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(comp_cat, use_container_width=True, hide_index=True)
+
+        st.divider()
+        comp_sub = (
+            radar_df.dropna(subset=["GASTOS_SUBCATEGORIA"])
+            .groupby(["GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA"])["GASTOS_CANTIDAD"]
+            .sum()
+            .reset_index()
+            .rename(columns={"GASTOS_SUBCATEGORIA": "Subcategoría", "GASTOS_CANTIDAD": "Gasto"})
+        )
+        comp_sub["Presupuesto"] = comp_sub.apply(
+            lambda r: buscar_presupuesto_sub(r["GASTOS_CATEGORIA"], r["Subcategoría"], presupuesto_sub_radar),
+            axis=1,
+        )
+        comp_sub["Diferencia"] = comp_sub["Gasto"] - comp_sub["Presupuesto"]
+        with st.expander("Ver tabla", expanded=False):
+            st.dataframe(comp_sub, use_container_width=True, hide_index=True)
+
+        with st.expander("🕸️ Radar de cumplimiento por categoría", expanded=False):
+            fig_cat = construir_radar_categorias(radar_df, presupuesto_cat_radar)
+            st.plotly_chart(fig_cat, use_container_width=True)
+
+        with st.expander("🕸️ Radar de cumplimiento por subcategoría", expanded=False):
+            fig_sub = construir_radar_subcategorias(radar_df, presupuesto_sub_radar)
+            st.plotly_chart(fig_sub, use_container_width=True)
+
+
+    if pestana_activa == etiquetas_pestanas[4]:
+        st.markdown("""
+        <style>
+        [data-testid="stPlotlyChart"],
+        .st-key-ingresos_fuentes_neon_v20,
+        .st-key-mapa_fuentes_tarjetas_v20 {
+            position: relative;
+            box-sizing: border-box !important;
+            padding: 0 !important;
+            border: 0 !important;
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+            border-radius: 18px;
+            overflow: hidden;
+            isolation: isolate;
+        }
+        [data-testid="stPlotlyChart"]::after,
+        .st-key-ingresos_fuentes_neon_v20::after,
+        .st-key-mapa_fuentes_tarjetas_v20::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            border: 1px solid rgba(0, 240, 255, 0.55);
+            border-radius: 18px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing: border-box;
+            min-width: 0;
+            max-width: 100%;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        contexto_pestana("¿De dónde proviene el dinero?", "Muestra las fuentes, la composición y la evolución de los ingresos dentro del periodo seleccionado.")
+        st.markdown("## Fuentes y comportamiento de los ingresos")
+        st.subheader("💰 Panel de Ingresos")
+        st.caption("Los ingresos se leen de la tabla de ingresos y se clasifican por la fecha real del movimiento.")
+
+        if ingresos_filtrados.empty:
+            st.warning("No se encontraron ingresos con fecha válida dentro del periodo seleccionado.")
+        else:
+            ingresos_mes = ingresos_filtrados.groupby("MES", as_index=False)["INGRESOS_CANTIDAD"].sum()
+            ingresos_mes = ordenar_por_mes(ingresos_mes)
+            ingresos_fuente = ingresos_filtrados.groupby("INGRESOS_FUENTE", as_index=False)["INGRESOS_CANTIDAD"].sum().sort_values("INGRESOS_CANTIDAD", ascending=False)
+            ingresos_tipo = ingresos_filtrados.groupby("INGRESOS_CATEGORIA", as_index=False)["INGRESOS_CANTIDAD"].sum().sort_values("INGRESOS_CANTIDAD", ascending=False)
+
+
+            # ============================================================
+            # V9.15 · PANORAMA, ESTABILIDAD, DIVERSIFICACIÓN Y RIESGO
+            # ============================================================
+            ingresos_analisis = ingresos_filtrados.copy()
+            ingresos_analisis["INGRESOS_FECHA"] = pd.to_datetime(
+                ingresos_analisis["INGRESOS_FECHA"], errors="coerce", dayfirst=True
+            )
+            ingresos_analisis["INGRESOS_CANTIDAD"] = pd.to_numeric(
+                ingresos_analisis["INGRESOS_CANTIDAD"], errors="coerce"
+            ).fillna(0)
+            ingresos_analisis["INGRESOS_FUENTE"] = (
+                ingresos_analisis["INGRESOS_FUENTE"].astype("string").fillna("Sin fuente").str.strip()
+            )
+            ingresos_analisis["INGRESOS_CATEGORIA"] = (
+                ingresos_analisis["INGRESOS_CATEGORIA"].astype("string").fillna("Sin tipo").str.strip()
+            )
+            ingresos_analisis["PERIODO"] = ingresos_analisis["INGRESOS_FECHA"].dt.to_period("M").astype("string")
+
+            total_ingresos_panel = float(ingresos_analisis["INGRESOS_CANTIDAD"].sum())
+            meses_validos_ing = ingresos_analisis.loc[
+                ingresos_analisis["INGRESOS_FECHA"].notna(), "PERIODO"
+            ].nunique()
+            promedio_mensual_ing = total_ingresos_panel / max(int(meses_validos_ing), 1)
+            fuente_principal = ingresos_fuente.iloc[0]["INGRESOS_FUENTE"] if not ingresos_fuente.empty else "Sin fuente"
+            monto_fuente_principal = float(ingresos_fuente.iloc[0]["INGRESOS_CANTIDAD"]) if not ingresos_fuente.empty else 0.0
+            pct_fuente_principal = monto_fuente_principal / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            pct_top3_fuentes = float(ingresos_fuente.head(3)["INGRESOS_CANTIDAD"].sum()) / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            numero_fuentes = int(ingresos_fuente["INGRESOS_FUENTE"].nunique()) if not ingresos_fuente.empty else 0
+
+            # Clasificación exacta y excluyente. ``NO LABORAL`` se evalúa antes
+            # que cualquier coincidencia laboral para evitar falsos positivos.
+            ingresos_analisis["TIPO_INGRESO"] = ingresos_analisis["INGRESOS_CATEGORIA"].map(etiqueta_tipo_ingreso)
+            mask_laboral_ing = ingresos_analisis["TIPO_INGRESO"].eq("Laborales")
+            mask_no_laboral_ing = ingresos_analisis["TIPO_INGRESO"].eq("Residuales")
+            mask_sin_clasificar_ing = ingresos_analisis["TIPO_INGRESO"].eq("Sin clasificar")
+            ingreso_laboral = float(ingresos_analisis.loc[mask_laboral_ing, "INGRESOS_CANTIDAD"].sum())
+            ingreso_no_laboral = float(ingresos_analisis.loc[mask_no_laboral_ing, "INGRESOS_CANTIDAD"].sum())
+            ingreso_sin_clasificar = float(ingresos_analisis.loc[mask_sin_clasificar_ing, "INGRESOS_CANTIDAD"].sum())
+            pct_laboral = ingreso_laboral / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            pct_no_laboral = ingreso_no_laboral / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            pct_sin_clasificar = ingreso_sin_clasificar / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            ingresos_tipo = (
+                ingresos_analisis.groupby("TIPO_INGRESO", as_index=False)["INGRESOS_CANTIDAD"]
+                .sum().sort_values("INGRESOS_CANTIDAD", ascending=False)
+            )
+
+            ingresos_periodo = (
+                ingresos_analisis.dropna(subset=["INGRESOS_FECHA"])
+                .groupby("PERIODO", as_index=False)["INGRESOS_CANTIDAD"].sum()
+                .sort_values("PERIODO")
+            )
+            ingreso_max_mensual = float(ingresos_periodo["INGRESOS_CANTIDAD"].max()) if not ingresos_periodo.empty else 0.0
+            ingreso_min_mensual = float(ingresos_periodo["INGRESOS_CANTIDAD"].min()) if not ingresos_periodo.empty else 0.0
+            desviacion_ingresos = float(ingresos_periodo["INGRESOS_CANTIDAD"].std(ddof=0)) if len(ingresos_periodo) > 1 else 0.0
+            coef_variacion_ing = desviacion_ingresos / promedio_mensual_ing * 100 if promedio_mensual_ing else 0.0
+            if coef_variacion_ing <= 10:
+                estabilidad_ing = "Muy estable"
+                icono_estabilidad = "🟢"
+            elif coef_variacion_ing <= 25:
+                estabilidad_ing = "Estable"
+                icono_estabilidad = "🔵"
+            elif coef_variacion_ing <= 45:
+                estabilidad_ing = "Variable"
+                icono_estabilidad = "🟠"
+            else:
+                estabilidad_ing = "Muy variable"
+                icono_estabilidad = "🔴"
+
+            st.markdown("### 🧭 Panorama general de los ingresos")
+            st.caption("Lectura rápida del volumen, origen, diversificación y estabilidad de los ingresos filtrados.")
+            pi1, pi2, pi3, pi4 = st.columns(4)
+            tarjeta_perfil_panel(pi1, "💰 Ingresos totales", f"${total_ingresos_panel:,.0f}")
+            tarjeta_perfil_panel(pi2, "📆 Promedio mensual", f"${promedio_mensual_ing:,.0f}")
+            tarjeta_perfil_panel(pi3, "🏆 Fuente principal", str(fuente_principal), f"{pct_fuente_principal:.1f}% del total")
+            tarjeta_perfil_panel(pi4, "🧩 Fuentes activas", numero_fuentes)
+            pi5, pi6, pi7, pi8 = st.columns(4)
+            tarjeta_perfil_panel(pi5, "💼 Ingreso laboral", f"{pct_laboral:.1f}%", f"${ingreso_laboral:,.0f}")
+            tarjeta_perfil_panel(pi6, "🌱 Residual", f"{pct_no_laboral:.1f}%", f"${ingreso_no_laboral:,.0f}")
+            tarjeta_perfil_panel(pi7, "❔ Sin clasificar", f"{pct_sin_clasificar:.1f}%", f"${ingreso_sin_clasificar:,.0f}")
+            tarjeta_perfil_panel(pi8, f"{icono_estabilidad} Estabilidad", estabilidad_ing, f"Variación: {coef_variacion_ing:.1f}%")
+            if ingreso_sin_clasificar > 0:
+                st.warning(f"🟣 Hay **${ingreso_sin_clasificar:,.0f}** sin clasificación. Revise la categoría en el hoja Ingresos.")
+
+            st.markdown("### 🧩 Concentración y diversificación")
+            cd1, cd2, cd3, cd4 = st.columns(4)
+            tarjeta_perfil_panel(cd1, "🎯 Fuente principal", f"{pct_fuente_principal:.1f}%")
+            tarjeta_perfil_panel(cd2, "🔝 Tres principales", f"{pct_top3_fuentes:.1f}%")
+            tarjeta_perfil_panel(cd3, "🔗 Dependencia", "Alta" if pct_fuente_principal >= 60 else "Media" if pct_fuente_principal >= 35 else "Baja")
+            tarjeta_perfil_panel(cd4, "🌐 Diversificación", "Alta" if numero_fuentes >= 5 and pct_fuente_principal < 40 else "Media" if numero_fuentes >= 3 else "Baja")
+            if pct_fuente_principal >= 60:
+                st.warning(f"⚠️ **Dependencia alta:** {fuente_principal} aporta {pct_fuente_principal:.1f}% de los ingresos del periodo.")
+            else:
+                st.success(f"✅ La fuente principal representa {pct_fuente_principal:.1f}% del total; la concentración no es crítica con los datos filtrados.")
+
+            # ============================================================
+            # V9.15 MEJORADA · CALIDAD, ESTABILIDAD Y ESCENARIOS POR FUENTE
+            # ============================================================
+            participaciones_fuente = (
+                ingresos_fuente["INGRESOS_CANTIDAD"] / total_ingresos_panel
+                if total_ingresos_panel else pd.Series(dtype=float)
+            )
+            indice_hhi = float((participaciones_fuente.pow(2).sum()) * 10000) if not participaciones_fuente.empty else 10000.0
+            puntaje_diversificacion = max(0.0, min(30.0, 30.0 * (1 - min(indice_hhi, 10000) / 10000)))
+            puntaje_estabilidad = max(0.0, min(30.0, 30.0 * (1 - min(coef_variacion_ing, 100) / 100)))
+            meses_por_fuente_score = (
+                ingresos_analisis.dropna(subset=["INGRESOS_FECHA"])
+                .groupby("INGRESOS_FUENTE")["PERIODO"].nunique()
+            )
+            recurrencia_promedio = float(meses_por_fuente_score.mean()) if not meses_por_fuente_score.empty else 0.0
+            puntaje_recurrencia = min(20.0, recurrencia_promedio / max(int(meses_validos_ing), 1) * 20.0)
+            puntaje_dependencia = max(0.0, min(15.0, 15.0 * (1 - pct_fuente_principal / 100)))
+            puntaje_calidad = 5.0 if ingreso_sin_clasificar == 0 else max(0.0, 5.0 * (1 - pct_sin_clasificar / 100))
+            score_calidad_ingresos = round(
+                puntaje_diversificacion + puntaje_estabilidad + puntaje_recurrencia
+                + puntaje_dependencia + puntaje_calidad, 1
+            )
+            if score_calidad_ingresos >= 80:
+                nivel_calidad_ing = "Muy sólida"
+                icono_calidad_ing = "🟢"
+            elif score_calidad_ingresos >= 65:
+                nivel_calidad_ing = "Sólida"
+                icono_calidad_ing = "🔵"
+            elif score_calidad_ingresos >= 45:
+                nivel_calidad_ing = "Vulnerable"
+                icono_calidad_ing = "🟠"
+            else:
+                nivel_calidad_ing = "Frágil"
+                icono_calidad_ing = "🔴"
+
+            st.markdown("### 🛡️ Score de calidad de los ingresos")
+            sc1, sc2 = st.columns([1, 2])
+            with sc1:
+                tarjeta_perfil_panel(st, 
+                    f"{icono_calidad_ing} Calidad", f"{score_calidad_ingresos:.1f}/100", nivel_calidad_ing,
+                    help="Suma de cinco componentes: diversificación (30), estabilidad (30), recurrencia (20), baja dependencia (15) y clasificación (5). Niveles: Muy sólida desde 80; Sólida desde 65; Vulnerable desde 45; Frágil por debajo de 45. Se calcula con los datos filtrados.",
+                )
+                st.caption("Integra diversificación, estabilidad, recurrencia, dependencia y calidad de clasificación.")
+            with sc2:
+                score_componentes = pd.DataFrame({
+                    "Componente": ["Diversificación", "Estabilidad", "Recurrencia", "Baja dependencia", "Calidad de datos"],
+                    "Puntos": [puntaje_diversificacion, puntaje_estabilidad, puntaje_recurrencia, puntaje_dependencia, puntaje_calidad],
+                    "Máximo": [30, 30, 20, 15, 5],
+                    "Icono": ["🌐", "📉", "🔁", "🛡️", "🧹"],
+                })
+                score_componentes["Etiqueta"] = score_componentes.apply(
+                    lambda r: f"{r['Icono']} {r['Componente']}", axis=1
+                )
+                score_componentes["Avance"] = score_componentes["Puntos"] / score_componentes["Máximo"] * 100
+                score_componentes["Explicación"] = [
+                    "Evalúa cómo se reparten los ingresos entre las fuentes.<br>Mayor concentración reduce la puntuación.",
+                    "Evalúa la variación de los ingresos mensuales.<br>Menor variación aumenta la puntuación.",
+                    "Evalúa en cuántos meses aparece cada fuente, en promedio,<br>respecto a los meses analizados.",
+                    "Evalúa el peso de la fuente principal.<br>Menor dependencia aumenta la puntuación.",
+                    "Evalúa la proporción de ingresos clasificados.<br>Menos ingresos sin clasificar aumenta la puntuación.",
+                ]
+                score_componentes["Dato"] = [
+                    f"Concentración de fuentes: <b>{indice_hhi:,.0f} / 10.000</b>",
+                    f"Variación mensual: <b>{coef_variacion_ing:.1f}%</b>",
+                    f"Presencia media por fuente: <b>{recurrencia_promedio:.1f} de {int(meses_validos_ing)} meses</b>",
+                    f"La fuente principal aporta <b>{pct_fuente_principal:.1f}%</b> del ingreso",
+                    f"Ingresos sin clasificar: <b>{pct_sin_clasificar:.1f}%</b>",
+                ]
+                score_componentes["Interpretación"] = [
+                    "Una distribución más equilibrada entre fuentes<br>mejora este componente.",
+                    "Ingresos mensuales más constantes<br>mejoran este componente.",
+                    "Fuentes presentes en más meses del período<br>mejoran este componente.",
+                    "Depender menos de una sola fuente<br>mejora este componente.",
+                    "Clasificar los ingresos pendientes<br>mejora este componente.",
+                ]
+                fig_score_ing = px.bar(
+                    score_componentes, x="Puntos", y="Etiqueta", orientation="h", text="Puntos",
+                    color="Puntos", color_continuous_scale=["#FF1744", "#FFD600", "#00FF88"],
+                    range_x=[0, 30],
+                )
+                fig_score_ing.update_traces(
+                    texttemplate="%{text:.1f}", textposition="outside",
+                    customdata=score_componentes[["Máximo", "Avance", "Dato", "Interpretación"]],
+                    hovertemplate=(
+                        "<b>%{y}</b><br><br>"
+                        "<span style='font-size:18px'><b>%{x:.1f} / %{customdata[0]:.0f} puntos</b></span><br>"
+                        "<span style='color:#73ffb8'>%{customdata[1]:.1f}% del máximo del componente</span><br><br>"
+                        "<b>DATO DEL PERÍODO</b><br>%{customdata[2]}<br><br>"
+                        "<b>CÓMO INTERPRETARLO</b><br>%{customdata[3]}"
+                        "<extra></extra>"
+                    ),
+                )
+                fig_score_ing.update_layout(height=350, showlegend=False, coloraxis_showscale=False)
+                fig_score_ing = estilo_grafico(fig_score_ing, "Componentes de la calidad del ingreso")
+                fig_score_ing.update_layout(hoverlabel=dict(
+                    bgcolor="#10263c", bordercolor="#52e0a4", align="left",
+                    font=dict(color="#eef7ff", size=14, family="Arial, sans-serif"),
+                ))
+                st.plotly_chart(fig_score_ing, use_container_width=True)
+
+            # Estabilidad y riqueza de información por fuente.
+            fuente_periodo = (
+                ingresos_analisis.dropna(subset=["INGRESOS_FECHA"])
+                .groupby(["INGRESOS_FUENTE", "PERIODO"], as_index=False)["INGRESOS_CANTIDAD"].sum()
+            )
+            estabilidad_fuentes = []
+            for fuente, grupo in fuente_periodo.groupby("INGRESOS_FUENTE"):
+                valores = grupo["INGRESOS_CANTIDAD"].astype(float)
+                promedio_f = float(valores.mean()) if not valores.empty else 0.0
+                desv_f = float(valores.std(ddof=0)) if len(valores) > 1 else 0.0
+                cv_f = desv_f / promedio_f * 100 if promedio_f else 0.0
+                meses_f = int(grupo["PERIODO"].nunique())
+                movimientos_f = int((ingresos_analisis["INGRESOS_FUENTE"] == fuente).sum())
+                total_f = float(valores.sum())
+                if meses_f <= 1:
+                    nivel_f = "Esporádica"
+                    icono_f = "⚪"
+                elif cv_f <= 15:
+                    nivel_f = "Muy estable"
+                    icono_f = "🟢"
+                elif cv_f <= 35:
+                    nivel_f = "Estable"
+                    icono_f = "🔵"
+                elif cv_f <= 60:
+                    nivel_f = "Variable"
+                    icono_f = "🟠"
+                else:
+                    nivel_f = "Muy variable"
+                    icono_f = "🔴"
+                estabilidad_fuentes.append({
+                    "Fuente": fuente, "Total": total_f, "Participación %": total_f / total_ingresos_panel * 100 if total_ingresos_panel else 0,
+                    "Promedio mensual": promedio_f, "Meses activos": meses_f, "Movimientos": movimientos_f,
+                    "Variación %": cv_f, "Estabilidad": f"{icono_f} {nivel_f}",
+                })
+            estabilidad_fuentes_df = pd.DataFrame(estabilidad_fuentes).sort_values("Total", ascending=False)
+
+            st.markdown("### 🏦 Estabilidad y recurrencia por fuente")
+            if not estabilidad_fuentes_df.empty:
+                ef1, ef2 = st.columns([1.25, 1])
+                with ef1:
+                    fig_est_fuente = px.bar(
+                        estabilidad_fuentes_df.sort_values("Total"),
+                        x="Total", y="Fuente", orientation="h", text="Participación %",
+                        color="Variación %", color_continuous_scale=["#00FF88", "#FFD600", "#FF1744"],
+                    )
+                    fig_est_fuente.update_traces(
+                        texttemplate="%{text:.1f}%", textposition="outside",
+                        customdata=estabilidad_fuentes_df.sort_values("Total")[["Promedio mensual", "Meses activos", "Movimientos", "Variación %", "Estabilidad"]],
+                        hovertemplate=(
+                            "<b>🏦 %{y}</b><br>💰 Total: $%{x:,.0f}<br>📊 Participación: %{text:.1f}%<br>"
+                            "📆 Promedio mensual: $%{customdata[0]:,.0f}<br>🗓️ Meses activos: %{customdata[1]}<br>"
+                            "🧾 Movimientos: %{customdata[2]}<br>📉 Variación: %{customdata[3]:.1f}%<br>"
+                            "🛡️ Estado: %{customdata[4]}<extra></extra>"
+                        ),
+                    )
+                    fig_est_fuente.update_layout(height=max(410, len(estabilidad_fuentes_df) * 42), coloraxis_colorbar_title="Variación %")
+                    st.plotly_chart(estilo_grafico(fig_est_fuente, "Valor y estabilidad de cada fuente"), use_container_width=True)
+                with ef2:
+                    with st.expander("Ver tabla", expanded=False):
+                        st.dataframe(
+                            estabilidad_fuentes_df.style.format({
+                                "Total": "${:,.0f}", "Participación %": "{:.1f}%", "Promedio mensual": "${:,.0f}", "Variación %": "{:.1f}%"
+                            }), use_container_width=True, hide_index=True,
+                        )
+
+            # Eficiencia laboral usando el bloque original K:Q conservado en felicidad_trabajos.
+            if felicidad_trabajos_filtrados is not None and not felicidad_trabajos_filtrados.empty:
+                eficiencia_ing = felicidad_trabajos_filtrados.copy()
+                fuente_col_eff = next((c for c in ["EMPRESA", "TRABAJO", "FUENTE", "NOMBRE"] if c in eficiencia_ing.columns), None)
+                valor_col_eff = next((c for c in ["VALOR", "INGRESO", "MONTO"] if c in eficiencia_ing.columns), None)
+                horas_col_eff = next((c for c in ["HORAS", "HORAS_TRABAJADAS"] if c in eficiencia_ing.columns), None)
+                if fuente_col_eff and valor_col_eff and horas_col_eff:
+                    eficiencia_ing[valor_col_eff] = pd.to_numeric(eficiencia_ing[valor_col_eff], errors="coerce").fillna(0)
+                    eficiencia_ing[horas_col_eff] = pd.to_numeric(eficiencia_ing[horas_col_eff], errors="coerce").fillna(0)
+                    resumen_eff = eficiencia_ing.groupby(fuente_col_eff, as_index=False).agg(
+                        Ingreso=(valor_col_eff, "sum"), Horas=(horas_col_eff, "sum")
+                    )
+                    resumen_eff["Valor por hora"] = resumen_eff.apply(
+                        lambda r: r["Ingreso"] / r["Horas"] if r["Horas"] > 0 else 0.0, axis=1
+                    )
+                    resumen_eff = resumen_eff[resumen_eff["Ingreso"] > 0].sort_values("Valor por hora", ascending=False)
+                    fuentes_sin_horas_eff = int(resumen_eff["Horas"].le(0).sum())
+                    resumen_eff = resumen_eff.loc[
+                        resumen_eff["Horas"].gt(0)
+                        & np.isfinite(resumen_eff["Horas"])
+                        & np.isfinite(resumen_eff["Ingreso"])
+                    ].copy()
+                    if fuentes_sin_horas_eff:
+                        st.caption(f"La escala logarítmica excluye {fuentes_sin_horas_eff} fuente(s) con ingreso positivo y sin horas positivas registradas.")
+                    if not resumen_eff.empty:
+                        st.markdown("### ⏱️ Eficiencia de las fuentes laborales")
+                        resumen_eff["Tarifa tooltip"] = resumen_eff.apply(
+                            lambda r: f"${r['Valor por hora']:,.0f} por hora" if r["Horas"] > 0 else "Sin horas válidas para calcular",
+                            axis=1,
+                        )
+                        resumen_eff["Participación tooltip"] = resumen_eff["Ingreso"] / resumen_eff["Ingreso"].sum() * 100
+                        fig_eff = px.scatter(
+                            resumen_eff, x="Horas", y="Ingreso", size="Ingreso", color="Valor por hora",
+                            size_max=64, text=fuente_col_eff,
+                            color_continuous_scale=["#00B7FF", "#00FF88", "#FFD600"],
+                        )
+                        fig_eff.update_traces(
+                            textposition="top center",
+                            customdata=resumen_eff[["Tarifa tooltip", "Participación tooltip"]],
+                            hovertemplate=(
+                                "<b>🏢 %{text}</b><br><br>"
+                                "<span style='font-size:18px;color:#73ffb8'><b>%{customdata[0]}</b></span><br><br>"
+                                "Ingreso generado: <b>$%{y:,.0f}</b><br>"
+                                "Tiempo registrado: <b>%{x:,.1f} horas</b><br>"
+                                "Del ingreso de las fuentes mostradas: <b>%{customdata[1]:.1f}%</b><br><br>"
+                                "<span style='font-size:12px'>Valor por hora = ingreso ÷ horas registradas.</span>"
+                                "<extra></extra>"
+                            ),
+                        )
+                        fig_eff.update_layout(height=480, coloraxis_colorbar_title="$/hora")
+                        fig_eff = estilo_grafico(fig_eff, "Horas invertidas frente al ingreso generado")
+                        fig_eff.update_layout(hoverlabel=dict(
+                            bgcolor="#10263c", bordercolor="#52e0a4", align="left",
+                            font=dict(color="#eef7ff", size=14, family="Arial, sans-serif"),
+                        ))
+                        fig_eff.update_xaxes(type="log", title="Horas registradas · escala logarítmica",
+                                             tickformat=",.1f", nticks=7, automargin=True)
+                        fig_eff.update_yaxes(type="linear", title="Ingreso generado (COP)",
+                                             tickprefix="$", tickformat=",.0f", nticks=7, automargin=True)
+                        fig_eff.update_layout(height=560, separators=",.",
+                                              margin=dict(t=85,b=80,l=95,r=95))
+                        st.plotly_chart(fig_eff, use_container_width=True, key="eficiencia_laboral_log_v20")
+                    else:
+                        st.info("Se necesitan fuentes con ingresos y horas positivos para mostrar la eficiencia en escala logarítmica.")
+
+            # Simulador de reducción o pérdida de la fuente principal.
+            st.markdown("### 🧪 Simulador de dependencia")
+            reduccion_fuente = st.slider(
+                f"Reducción simulada de {fuente_principal}", 0, 100, 100, 5,
+                help="100% simula la pérdida completa de la fuente principal; no modifica los datos.",
+                key="simulador_reduccion_fuente_ingresos_v915m",
+            )
+            perdida_simulada = monto_fuente_principal * reduccion_fuente / 100
+            ingreso_restante_sim = max(total_ingresos_panel - perdida_simulada, 0.0)
+            cobertura_sim = ingreso_restante_sim / total_gastos * 100 if total_gastos else 0.0
+            sim1, sim2, sim3, sim4 = st.columns(4)
+            tarjeta_perfil_panel(sim1, "🏦 Fuente evaluada", str(fuente_principal))
+            tarjeta_perfil_panel(sim2, "📉 Reducción", f"{reduccion_fuente}%", f"-${perdida_simulada:,.0f}")
+            tarjeta_perfil_panel(sim3, "💰 Ingreso restante", f"${ingreso_restante_sim:,.0f}")
+            tarjeta_perfil_panel(sim4, "🛡️ Cobertura de gastos", f"{cobertura_sim:.1f}%")
+            if cobertura_sim < 100:
+                st.error(f"🚨 Con este escenario faltarían **${max(total_gastos - ingreso_restante_sim, 0):,.0f}** para cubrir los gastos filtrados.")
+            else:
+                st.success(f"✅ Incluso con este escenario, los ingresos restantes cubrirían el **{cobertura_sim:.1f}%** de los gastos filtrados.")
+
+            # Recurrencia aproximada: una fuente presente en al menos dos meses se considera habitual.
+            meses_por_fuente = (
+                ingresos_analisis.dropna(subset=["INGRESOS_FECHA"])
+                .groupby("INGRESOS_FUENTE")["PERIODO"].nunique()
+            )
+            fuentes_recurrentes = set(meses_por_fuente[meses_por_fuente >= 2].index)
+            texto_extra_ing = (
+                ingresos_analisis.get("INGRESOS_DESCRIPCION", pd.Series("", index=ingresos_analisis.index)).astype(str).map(normalizar)
+                + " " + ingresos_analisis["INGRESOS_CATEGORIA"].astype(str).map(normalizar)
+            )
+            claves_extra_ing = ["PRIMA", "BONIFIC", "EXTRAORD", "RETROACT", "INDEMNIZ", "VENTA", "PREMIO"]
+            mask_extra_ing = texto_extra_ing.map(lambda valor: any(clave in valor for clave in claves_extra_ing))
+            mask_recurrente_ing = ingresos_analisis["INGRESOS_FUENTE"].isin(fuentes_recurrentes) & ~mask_extra_ing
+            ingreso_habitual = float(ingresos_analisis.loc[mask_recurrente_ing, "INGRESOS_CANTIDAD"].sum())
+            ingreso_extraordinario = float(ingresos_analisis.loc[mask_extra_ing, "INGRESOS_CANTIDAD"].sum())
+            ingreso_ocasional = max(total_ingresos_panel - ingreso_habitual - ingreso_extraordinario, 0.0)
+            habitual_mensual = ingreso_habitual / max(int(meses_validos_ing), 1)
+
+            st.markdown("### 🔁 Ingreso habitual, ocasional y extraordinario")
+            clas_ing = pd.DataFrame({
+                "Naturaleza": ["Habitual", "Ocasional", "Extraordinario"],
+                "Valor": [ingreso_habitual, ingreso_ocasional, ingreso_extraordinario],
+            })
+            clas_ing["Participación"] = clas_ing["Valor"] / total_ingresos_panel * 100 if total_ingresos_panel else 0.0
+            clas_ing["Explicación"] = [
+                "Fuente presente en al menos dos meses del período,<br>excluyendo ingresos clasificados como extraordinarios.",
+                "Ingreso restante que no se clasifica como habitual<br>ni extraordinario en el período seleccionado.",
+                "Identificado por textos como prima, bonificación,<br>retroactivo, indemnización, venta o premio.",
+            ]
+            fig_nat_ing = px.bar(
+                clas_ing, x="Naturaleza", y="Valor", color="Naturaleza", text="Valor",
+                color_discrete_map={"Habitual":"#00FF9C", "Ocasional":"#38BDF8", "Extraordinario":"#FFB000"},
+                custom_data=["Participación", "Explicación"],
+            )
+            fig_nat_ing.update_traces(
+                texttemplate="$%{text:,.0f}", textposition="outside",
+                hovertemplate=(
+                    "<b>Ingreso %{x}</b><br><br>"
+                    "<span style='font-size:18px'><b>$%{y:,.0f}</b></span><br>"
+                    "Del ingreso total filtrado: <b>%{customdata[0]:.1f}%</b><br><br>"
+                    "<b>CLASIFICACIÓN</b><br>%{customdata[1]}<extra></extra>"
+                ),
+            )
+            fig_nat_ing.update_layout(showlegend=False, height=390)
+            fig_nat_ing = estilo_grafico(fig_nat_ing, "Naturaleza de los ingresos")
+            fig_nat_ing.update_layout(hoverlabel=dict(
+                bgcolor="#10263c", bordercolor="#52e0a4", align="left",
+                font=dict(color="#eef7ff", size=14, family="Arial, sans-serif"),
+            ))
+            st.plotly_chart(fig_nat_ing, use_container_width=True)
+            st.info(f"💡 Ingreso habitual mensual estimado: **${habitual_mensual:,.0f}**. Las primas y bonificaciones no se tratan como ingreso mensual permanente.")
+
+            st.markdown("### 📊 Estabilidad mensual y comparación reciente")
+            est1, est2 = st.columns([1.45, 1])
+            with est1:
+                fig_est_ing = go.Figure()
+                fig_est_ing.add_trace(go.Bar(
+                    x=ingresos_periodo["PERIODO"], y=ingresos_periodo["INGRESOS_CANTIDAD"],
+                    name="Ingreso mensual", marker_color="#00DFA2",
+                    text=ingresos_periodo["INGRESOS_CANTIDAD"], texttemplate="$%{text:,.0f}", textposition="outside",
+                    hovertemplate="<b>📅 %{x}</b><br>Ingreso: $%{y:,.0f}<br>Comparación visual con el promedio<extra></extra>",
+                ))
+                fig_est_ing.add_hline(y=promedio_mensual_ing, line_color="#FFEE00", line_dash="dash", line_width=3,
+                                      annotation_text=f"Promedio ${promedio_mensual_ing:,.0f}")
+                fig_est_ing.update_layout(height=430, showlegend=False)
+                st.plotly_chart(estilo_grafico(fig_est_ing, "Ingreso mensual frente a tu promedio"), use_container_width=True)
+            with est2:
+                if len(ingresos_periodo) >= 2:
+                    actual_ing = float(ingresos_periodo.iloc[-1]["INGRESOS_CANTIDAD"])
+                    anterior_ing = float(ingresos_periodo.iloc[-2]["INGRESOS_CANTIDAD"])
+                    cambio_ing = actual_ing - anterior_ing
+                    cambio_pct_ing = cambio_ing / anterior_ing * 100 if anterior_ing else 0.0
+                    tarjeta_perfil_panel(st, "🔄 Cambio último mes", f"{cambio_pct_ing:+.1f}%", f"${cambio_ing:+,.0f}")
+                    tarjeta_perfil_panel(st, "📉 Mínimo mensual", f"${ingreso_min_mensual:,.0f}")
+                    tarjeta_perfil_panel(st, "📈 Máximo mensual", f"${ingreso_max_mensual:,.0f}")
+                    tarjeta_perfil_panel(st, "📏 Desviación mensual", f"${desviacion_ingresos:,.0f}")
+                else:
+                    st.info("ℹ️ Se necesitan al menos dos meses con ingresos para comparar la evolución.")
+
+            # Fuentes nuevas, perdidas y cambios entre los dos últimos meses.
+            if len(ingresos_periodo) >= 2:
+                periodo_actual_ing = ingresos_periodo.iloc[-1]["PERIODO"]
+                periodo_anterior_ing = ingresos_periodo.iloc[-2]["PERIODO"]
+                tabla_fuentes_periodo = ingresos_analisis.pivot_table(
+                    index="INGRESOS_FUENTE", columns="PERIODO", values="INGRESOS_CANTIDAD", aggfunc="sum", fill_value=0
+                )
+                for per in [periodo_actual_ing, periodo_anterior_ing]:
+                    if per not in tabla_fuentes_periodo.columns:
+                        tabla_fuentes_periodo[per] = 0.0
+                cambios_fuente = tabla_fuentes_periodo[[periodo_anterior_ing, periodo_actual_ing]].copy()
+                cambios_fuente["Cambio"] = cambios_fuente[periodo_actual_ing] - cambios_fuente[periodo_anterior_ing]
+                nuevas_fuentes = cambios_fuente[(cambios_fuente[periodo_anterior_ing] == 0) & (cambios_fuente[periodo_actual_ing] > 0)].index.tolist()
+                fuentes_perdidas = cambios_fuente[(cambios_fuente[periodo_anterior_ing] > 0) & (cambios_fuente[periodo_actual_ing] == 0)].index.tolist()
+                st.markdown("### 🆕 Fuentes nuevas, perdidas y principales cambios")
+                cf1, cf2 = st.columns(2)
+                with cf1:
+                    st.success("🆕 **Fuentes nuevas:** " + (", ".join(map(str, nuevas_fuentes)) if nuevas_fuentes else "Ninguna"))
+                    st.error("📭 **Fuentes sin ingreso reciente:** " + (", ".join(map(str, fuentes_perdidas)) if fuentes_perdidas else "Ninguna"))
+                with cf2:
+                    cambios_mostrar = cambios_fuente.reset_index().sort_values("Cambio", ascending=False)
+                    fig_cambios_fuente = px.bar(
+                        cambios_mostrar, x="Cambio", y="INGRESOS_FUENTE", orientation="h", text="Cambio",
+                        color="Cambio", color_continuous_scale=[(0,"#FF1744"),(0.5,"#94A3B8"),(1,"#00E676")],
+                    )
+                    fig_cambios_fuente.update_traces(
+                        texttemplate="$%{text:+,.0f}", textposition="outside",
+                        customdata=cambios_mostrar[[periodo_anterior_ing, periodo_actual_ing]],
+                        hovertemplate=("<b>🔄 %{y}</b><br>" + periodo_anterior_ing + ": $%{customdata[0]:,.0f}<br>" + periodo_actual_ing + ": $%{customdata[1]:,.0f}<br>Cambio: $%{x:+,.0f}<extra></extra>"),
+                    )
+                    fig_cambios_fuente.update_yaxes(autorange="reversed")
+                    st.plotly_chart(estilo_grafico(fig_cambios_fuente, "Cambio por fuente frente al mes anterior"), use_container_width=True)
+
+            # Cobertura de gastos habituales y simulación de pérdida de fuente principal.
+            gastos_habituales_df = agregar_tipo_gasto(df) if not df.empty else df.copy()
+            if not gastos_habituales_df.empty and "TIPO_GASTO" in gastos_habituales_df.columns:
+                mask_no_extra_g = ~gastos_habituales_df["TIPO_GASTO"].astype(str).map(normalizar).str.contains("EXTRAORD")
+                gasto_habitual_total = float(gastos_habituales_df.loc[mask_no_extra_g, "GASTOS_CANTIDAD"].sum())
+            else:
+                gasto_habitual_total = float(total_gastos)
+            gasto_habitual_mensual = gasto_habitual_total / max(int(meses_validos_ing), 1)
+            cobertura_habitual = habitual_mensual / gasto_habitual_mensual * 100 if gasto_habitual_mensual else 0.0
+            ingreso_restante_sin_principal = max(promedio_mensual_ing - (monto_fuente_principal / max(int(meses_validos_ing), 1)), 0.0)
+            resultado_sin_principal = ingreso_restante_sin_principal - gasto_habitual_mensual
+
+            st.markdown("### 🛡️ Cobertura y escenario de riesgo")
+            cr1, cr2, cr3, cr4 = st.columns(4)
+            tarjeta_perfil_panel(cr1, "🔁 Ingreso habitual mensual", f"${habitual_mensual:,.0f}")
+            tarjeta_perfil_panel(cr2, "🏠 Gasto habitual mensual", f"${gasto_habitual_mensual:,.0f}")
+            tarjeta_perfil_panel(cr3, "🛡️ Cobertura habitual", f"{cobertura_habitual:.1f}%")
+            tarjeta_perfil_panel(cr4, "⚠️ Sin fuente principal", f"${resultado_sin_principal:,.0f}", "Superávit" if resultado_sin_principal >= 0 else "Déficit mensual")
+            if resultado_sin_principal < 0:
+                st.error(f"🚨 Si desapareciera **{fuente_principal}**, el ingreso restante estimado produciría un déficit mensual de **${abs(resultado_sin_principal):,.0f}** frente al gasto habitual.")
+            else:
+                st.success(f"✅ Sin la fuente principal todavía existiría un margen estimado de **${resultado_sin_principal:,.0f}** sobre el gasto habitual.")
+
+            # Calendario de entradas.
+            st.markdown("### 🗓️ Calendario de ingresos")
+            ingresos_calendario = ingresos_analisis.dropna(subset=["INGRESOS_FECHA"]).copy()
+            if not ingresos_calendario.empty:
+                ingresos_calendario["Fecha"] = pd.to_datetime(ingresos_calendario["INGRESOS_FECHA"], errors="coerce")
+                ingresos_calendario["Día"] = ingresos_calendario["Fecha"].dt.day
+                ingresos_calendario["Mes"] = ingresos_calendario["Fecha"].dt.strftime("%Y-%m")
+                ingresos_calendario["Fuente"] = ingresos_calendario["INGRESOS_FUENTE"].fillna("Sin fuente").astype(str)
+                ingresos_calendario["Tipo"] = ingresos_calendario["TIPO_INGRESO"].fillna("Sin clasificar").astype(str)
+                ingresos_calendario["Etiqueta"] = ingresos_calendario.apply(
+                    lambda fila: f"{fila['Fuente']} · ${fila['INGRESOS_CANTIDAD']:,.0f}", axis=1
+                )
+                monto_min_cal = float(ingresos_calendario["INGRESOS_CANTIDAD"].min())
+                monto_max_cal = float(ingresos_calendario["INGRESOS_CANTIDAD"].max())
+                paletas_laborales = [
+                    ((128, 140, 11), (206, 222, 26)), # base #CEDE1A
+                    ((146, 158, 14), (226, 241, 47)), # lima luminoso
+                    ((111, 123, 9), (194, 211, 20)),  # lima profundo
+                    ((166, 179, 18), (241, 251, 75)), # lima claro
+                ]
+                fuentes_laborales = sorted(
+                    ingresos_calendario.loc[
+                        ingresos_calendario["Tipo"].eq("Laborales"), "Fuente"
+                    ].unique()
+                )
+                paleta_por_fuente = {
+                    fuente: paletas_laborales[posición % len(paletas_laborales)]
+                    for posición, fuente in enumerate(fuentes_laborales)
+                }
+
+                def tono_calendario(monto, tipo, fuente):
+                    """De oscuro a claro: los importes mayores resaltan con más luz."""
+                    proporción = (
+                        (float(monto) - monto_min_cal) / (monto_max_cal - monto_min_cal)
+                        if monto_max_cal > monto_min_cal else 0.55
+                    )
+                    # Raíz cuadrada: hace perceptible la diferencia también en importes medios.
+                    proporción = proporción ** 0.5
+                    paletas = {
+                        "Residuales": ((0, 105, 245), (0, 225, 255)),
+                        "Sin clasificar": ((71, 85, 105), (174, 196, 222)),
+                    }
+                    if str(tipo) == "Laborales":
+                        oscuro, claro = paleta_por_fuente.get(str(fuente), paletas_laborales[0])
+                    else:
+                        oscuro, claro = paletas.get(str(tipo), paletas["Sin clasificar"])
+                    rgb = [round(inicio + (fin - inicio) * proporción) for inicio, fin in zip(oscuro, claro)]
+                    return f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
+
+                ingresos_calendario["Tono"] = ingresos_calendario.apply(
+                    lambda fila: tono_calendario(
+                        fila["INGRESOS_CANTIDAD"], fila["Tipo"], fila["Fuente"]
+                    ), axis=1
+                )
+                # Desplazamiento visual mínimo para distinguir ingresos del mismo día.
+                ingresos_calendario["Día visual"] = ingresos_calendario["Día"].astype(float)
+                for _, índices in ingresos_calendario.groupby("Fecha").groups.items():
+                    if len(índices) > 1:
+                        orden = ingresos_calendario.loc[list(índices)].sort_values(
+                            ["Tipo", "Fuente", "INGRESOS_CANTIDAD"]
+                        ).index
+                        ingresos_calendario.loc[orden, "Día visual"] += np.linspace(-0.24, 0.24, len(orden))
+                fig_cal_ing = px.scatter(
+                    ingresos_calendario,
+                    x="Día visual",
+                    y="Mes",
+                    size="INGRESOS_CANTIDAD",
+                    color="Tipo",
+                    custom_data=["Fecha", "Fuente", "Tipo", "INGRESOS_CANTIDAD"],
+                    color_discrete_map={
+                        "Laborales": "#00F58A",
+                        "Residuales": "#008CFF",
+                        "Sin clasificar": "#B026FF",
+                    },
+                    size_max=46,
+                )
+                fig_cal_ing.update_traces(
+                    hovertemplate=(
+                        "<b>📅 %{customdata[0]|%d/%m/%Y}</b><br>"
+                        "📌 Origen del ingreso: %{customdata[1]}<br>"
+                        "🏷️ Tipo: %{customdata[2]}<br>"
+                        "💰 Valor: $%{customdata[3]:,.0f}<extra></extra>"
+                    ),
+                    marker=dict(line=dict(color="#000000", width=1.6), opacity=0.78),
+                )
+                # Se conserva una leyenda por tipo y cada burbuja recibe su tono según el valor.
+                for traza in fig_cal_ing.data:
+                    máscara_tipo = ingresos_calendario["Tipo"].eq(traza.name)
+                    traza.marker.color = ingresos_calendario.loc[máscara_tipo, "Tono"].tolist()
+                fig_cal_ing.update_layout(
+                    legend_title_text="Tipo de ingreso",
+                    height=465,
+                    margin=dict(t=78, b=60, l=70, r=30),
+                    legend=dict(orientation="h", y=1.08, x=0),
+                    xaxis=dict(
+                        title="Día del mes",
+                        tickmode="linear",
+                        dtick=1,
+                        range=[0, 32],
+                        gridcolor="rgba(148,163,184,0.16)",
+                    ),
+                    yaxis=dict(
+                        title="Mes de ingreso",
+                        categoryorder="category ascending",
+                        gridcolor="rgba(148,163,184,0.08)",
+                    ),
+                )
+                st.caption("Cada burbuja representa un ingreso: el tamaño indica el valor, el color el tipo de ingreso, el eje horizontal el día en que entró el dinero y el detalle muestra la fuente registrada en el Excel.")
+                st.plotly_chart(estilo_grafico(fig_cal_ing, "Días de entrada del dinero y origen de cada ingreso"), use_container_width=True)
+
+            # Próximo ingreso estimado por periodicidad mediana de la fuente principal.
+            fechas_principal = ingresos_analisis.loc[
+                (ingresos_analisis["INGRESOS_FUENTE"] == fuente_principal) & ingresos_analisis["INGRESOS_FECHA"].notna(),
+                "INGRESOS_FECHA",
+            ].sort_values().drop_duplicates()
+            if len(fechas_principal) >= 2:
+                intervalos = fechas_principal.diff().dropna().dt.days
+                intervalo_estimado = int(intervalos.median()) if not intervalos.empty else 0
+                if intervalo_estimado > 0:
+                    proxima_fecha_ing = fechas_principal.iloc[-1] + pd.Timedelta(days=intervalo_estimado)
+                    valor_estimado_ing = float(
+                        ingresos_analisis.loc[ingresos_analisis["INGRESOS_FUENTE"] == fuente_principal, "INGRESOS_CANTIDAD"].median()
+                    )
+                    st.info(f"🔮 **Próximo ingreso estimado:** {fuente_principal}, alrededor del **{proxima_fecha_ing:%d/%m/%Y}**, por aproximadamente **${valor_estimado_ing:,.0f}**. Es una estimación basada en recurrencia histórica, no un ingreso confirmado.")
+
+            st.divider()
+            st.markdown("### 📚 Visualizaciones existentes y detalle completo")
+            col1, col2 = st.columns(2)
+            with col1:
+                from modules.ingresos_noche import crear_ingresos_mensuales
+                st.plotly_chart(
+                    crear_ingresos_mensuales(ingresos_mes),
+                    use_container_width=True, key="ingresos_mensuales_noche_v20",
+                    config={"displaylogo": False},
+                )
+            with col2:
+                fig_ing_pie = px.pie(
+                    ingresos_fuente, names="INGRESOS_FUENTE", values="INGRESOS_CANTIDAD",
+                    hole=0.42, color_discrete_sequence=["#00FF88", "#00B7FF", "#B026FF", "#FFD600", "#FF1744", "#00E5FF", "#7C4DFF", "#76FF03"]
+                )
+                fig_ing_pie.update_traces(textinfo="percent+label", marker=dict(line=dict(color="#000000", width=2)), hovertemplate="<b>🏦 %{label}</b><br>💰 Valor: $%{value:,.0f}<br>📊 Participación: %{percent}<extra></extra>")
+                fig_ing_pie.update_traces(marker=dict(colors=[
+                    ["#00E5A0", "#168BFF", "#B46CFF", "#FFC400", "#FF1744", "#00D9ED", "#7C4DFF", "#84CC16"][i % 8]
+                    for i in range(len(ingresos_fuente))
+                ]))
+                from modules.anillos_neon import mostrar_anillo_neon
+                mostrar_anillo_neon(
+                    fig_ing_pie, float(ingresos_fuente["INGRESOS_CANTIDAD"].sum()),
+                    "Participación por fuente de ingreso", "ingresos_fuentes_neon_v20",
+                    ingreso=True,
+                )
+
+            from modules.ingresos_noche import crear_ranking_y_tipos
+            fig_fuente, fig_tipo_bar = crear_ranking_y_tipos(ingresos_fuente, ingresos_tipo)
+            col3, col4 = st.columns(2)
+            with col3:
+                st.plotly_chart(fig_fuente, use_container_width=True,
+                                key="ingresos_ranking_noche_v20", config={"displaylogo": False})
+            with col4:
+                st.plotly_chart(fig_tipo_bar, use_container_width=True,
+                                key="ingresos_tipos_noche_v20", config={"displaylogo": False})
+
+            st.markdown("#### Mapa de ingresos: tipo de fuente → fuente")
+            st.caption("Agrupa claramente las fuentes **laborales** y **residuales**; dentro de cada bloque aparecen las fuentes específicas.")
+            from modules.ingresos_noche import crear_mapa_fuentes_tarjetas
+            import streamlit.components.v1 as componentes_mapa_fuentes
+            html_fuentes, altura_fuentes = crear_mapa_fuentes_tarjetas(
+                fig_mapa_ingresos_tipo_fuente(ingresos_filtrados)
+            )
+            if html_fuentes:
+                st.markdown(
+                    f'<style>.st-key-mapa_fuentes_tarjetas_v20 iframe {{width:100% !important;'
+                    f'height:auto !important;aspect-ratio:1200 / {altura_fuentes};'
+                    f'display:block;border:0;max-height:none !important;}}</style>',
+                    unsafe_allow_html=True,
+                )
+                with st.container(key="mapa_fuentes_tarjetas_v20"):
+                    componentes_mapa_fuentes.html(html_fuentes,height=altura_fuentes,scrolling=False)
+            else:
+                st.info("No hay importes positivos por fuente para mostrar el mapa.")
+
+            st.markdown("#### Tabla de ingresos cargados")
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(ingresos_filtrados.sort_values(["ANIO", "MES", "INGRESOS_FUENTE"]), use_container_width=True, hide_index=True)
+
+    if pestana_activa == etiquetas_pestanas[5]:
+        # El borde del marco existente queda delante del gráfico, sin otro contenedor.
+        st.markdown("""<style>
+        [class*="st-key-avance_deuda_"] .barlayer {
+            clip-path:inset(0 round 999px) fill-box;
+        }
+        [data-testid="stPlotlyChart"] {
+            position:relative;box-sizing:border-box !important;
+            padding:0 !important;border:0 !important;
+            width:100%;max-width:100%;min-width:0;
+            border-radius:18px;overflow:hidden;isolation:isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content:"";position:absolute;inset:0;box-sizing:border-box;
+            border:1px solid rgba(0,240,255,.55);border-radius:18px;
+            pointer-events:none;z-index:10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing:border-box;width:100% !important;max-width:100%;min-width:0;
+        }
+        </style>""", unsafe_allow_html=True)
+        contexto_pestana("¿Qué obligaciones tengo?", "Resume saldos pendientes, intereses, avance de pago y orden recomendado para atender las deudas.")
+        st.markdown("## Obligaciones y estrategia de pago")
+        st.subheader("💳 Deudas")
+        st.caption(
+            "Prioridad de pago por método avalancha: primero la tasa de interés más alta. "
+            "Cuando dos deudas tienen el mismo interés, se muestra primero la de mayor saldo pendiente."
+        )
+
+        if deudas.empty:
+            st.info(
+                "No se encontraron registros válidos en la hoja **Deudas**. "
+                "Usa las columnas: nombre, deuda, interés mensual, saldo, avance e inicio del crédito."
+            )
+        else:
+            total_deuda_inicial = float(deudas["Deuda inicial"].sum())
+            total_saldo_deudas = float(deudas["Saldo"].sum())
+            total_pagado_deudas = float(deudas["Pagado"].sum())
+            avance_total_deudas = (
+                total_pagado_deudas / total_deuda_inicial * 100
+                if total_deuda_inicial > 0
+                else 0.0
+            )
+            interes_promedio_ponderado = (
+                (
+                    deudas["Interés"] * deudas["Saldo"]
+                ).sum() / total_saldo_deudas * 100
+                if total_saldo_deudas > 0
+                else 0.0
+            )
+
+            d1, d2, d3, d4 = st.columns(4)
+            tarjeta_perfil_panel(d1, '💳 Deuda inicial total', f"${total_deuda_inicial:,.0f}", help='Suma del capital inicial registrado para todas las obligaciones cargadas.')
+            tarjeta_perfil_panel(d2, '🏦 Saldo pendiente', f"${total_saldo_deudas:,.0f}", help='Capital pendiente de pago según el saldo registrado en el Excel. No incluye intereses estimados adicionales.')
+            tarjeta_perfil_panel(d3, '📊 Total pagado', f"${total_pagado_deudas:,.0f}", help='Suma de los importes calculados como deuda inicial menos saldo pendiente. Representa reducción del capital.')
+            tarjeta_perfil_panel(d4, '📊 Avance total',
+                f"{avance_total_deudas:.1f}%",
+                f"Interés ponderado: {interes_promedio_ponderado:.2f}%",
+             help='Capital pagado dividido entre deuda inicial total, expresado como porcentaje.')
+
+            st.progress(min(max(avance_total_deudas, 0), 100) / 100)
+
+            # ============================================================
+            # ANÁLISIS EJECUTIVO DE DEUDAS V9.17
+            # ============================================================
+            from modules.report_deudas import preparar_deudas
+            fecha_analisis_deudas = pd.Timestamp(fecha_hasta).normalize()
+            deudas_analisis = preparar_deudas(deudas, fecha_analisis_deudas)
+
+            deudas_analisis["Prioridad"] = range(1, len(deudas_analisis) + 1)
+            deudas_analisis["Estado"] = deudas_analisis.apply(
+                lambda r: "Pagada" if r["Saldo"] <= 0 or r["Avance"] >= 100
+                else "Cerca de terminar" if r["Avance"] >= 75
+                else "En progreso" if r["Avance"] >= 40
+                else "Saldo alto",
+                axis=1,
+            )
+
+            interes_total_estimado = float(
+                deudas_analisis["Interés acumulado estimado"].sum()
+            )
+            creditos_con_fecha = int(
+                deudas_analisis["Inicio del crédito"].notna().sum()
+            )
+            antiguedad_promedio_meses = float(
+                deudas_analisis.loc[
+                    deudas_analisis["Inicio del crédito"].notna(),
+                    "Meses transcurridos",
+                ].mean()
+            ) if creditos_con_fecha else 0.0
+
+            st.markdown("### 🗓️ Antigüedad y costo acumulado estimado")
+            ai1, ai2, ai3, ai4 = st.columns(4)
+            tarjeta_perfil_panel(ai1, "📅 Créditos con fecha", creditos_con_fecha, help='Cantidad de obligaciones que tienen una fecha de inicio válida.')
+            tarjeta_perfil_panel(ai2, "⏳ Antigüedad promedio", f"{antiguedad_promedio_meses:.1f} meses", help='Promedio de meses transcurridos desde el inicio de los créditos con fecha válida hasta el final del período seleccionado.')
+            tarjeta_perfil_panel(ai3, "🔥 Interés acumulado estimado", f"${interes_total_estimado:,.0f}", help='Saldo promedio × tasa mensual × tiempo. Para ingleses solo se cuentan meses completos vencidos desde Inicio del crédito. No confirma pagos reales; si hubo abonos faltan sus fechas.')
+            tarjeta_perfil_panel(ai4, "💸 Principal + interés estimado",
+                f"${total_pagado_deudas + interes_total_estimado:,.0f}",
+             help='Capital pagado calculado más intereses acumulados estimados. No representa necesariamente el dinero efectivamente desembolsado.')
+            st.info(
+                "ℹ️ **Estimación:** la hoja no contiene el historial de cuotas ni los "
+                "intereses efectivamente cobrados. El cálculo usa la tasa mensual, el "
+                "saldo promedio entre el capital inicial y actual. En los créditos ingleses "
+                "cuenta meses completos vencidos desde Inicio del crédito, sin fracciones de mes. "
+                "Si hubo abonos, el acumulado sigue siendo aproximado porque faltan sus fechas."
+            )
+
+            # ============================================================
+            # CONTINÚA EL ANÁLISIS EJECUTIVO
+            # ============================================================
+
+            deuda_prioritaria = deudas_analisis.iloc[0]
+            st.markdown("### 🎯 Deuda prioritaria y razón")
+            st.error(
+                f"🚨 **Prioridad 1: {deuda_prioritaria['Nombre']}** · "
+                f"tasa **{deuda_prioritaria['Interés %']:.2f}%**, saldo **${deuda_prioritaria['Saldo']:,.0f}**. "
+                "Se ubica primero por el método avalancha: mayor interés y, en empate, mayor saldo."
+            )
+
+            st.markdown("### 📊 Ranking por saldo, costo financiero e interés acumulado")
+            rk1, rk2 = st.columns(2)
+            with rk1:
+                saldo_rank = deudas_analisis.sort_values("Saldo", ascending=True)
+                fig_saldo_rank = px.bar(
+                    saldo_rank, x="Saldo", y="Nombre", orientation="h", text="Saldo",
+                    color_discrete_sequence=["#FF0000"],
+                )
+                fig_saldo_rank.update_traces(
+                    texttemplate="$%{text:,.0f}", textposition="outside",
+                    customdata=saldo_rank[["Deuda inicial", "Pagado", "Avance", "Participación saldo %", "Inicio del crédito", "Interés acumulado estimado", "Interés %", "Pago económico estimado"]],
+                    hovertemplate=(
+                        "<b>💳 Obligación: %{y}</b><br>"
+                        "🔴 Saldo pendiente: $%{x:,.0f}<br>"
+                        "💰 Deuda inicial: $%{customdata[0]:,.0f}<br>"
+                        "✅ Abonado a capital: $%{customdata[1]:,.0f}<br>"
+                        "💸 Total pagado estimado: $%{customdata[7]:,.0f}<br>"
+                        "📊 Avance del capital: %{customdata[2]:.1f}%<br>"
+                        "🧩 Participación del saldo: %{customdata[3]:.1f}%<br>"
+                        "📅 Inicio del crédito: %{customdata[4]|%d/%m/%Y}<br>"
+                        "🔥 Interés acumulado estimado: $%{customdata[5]:,.0f}<br>"
+                        "📈 Tasa mensual: %{customdata[6]:.2f}%<br>"
+                        "ℹ️ Total estimado = capital abonado + interés estimado."
+                        "<extra></extra>"
+                    ),
+                )
+                fig_saldo_rank.update_yaxes(title="", automargin=True)
+                fig_saldo_rank.update_layout(
+                    barcornerradius="50%", bargap=0.24,
+                    coloraxis_colorbar=dict(
+                        title="Saldo ($)", thickness=14,
+                        tickvals=[0, 100_000, 15_000_000, 50_000_000],
+                        ticktext=["$0", "$100 mil", "$15 M", "$50 M o más"],
+                    ),
+                )
+                st.plotly_chart(estilo_grafico(fig_saldo_rank, "💰 Mayor saldo pendiente"), use_container_width=True)
+                st.caption("Las barras rojas muestran el saldo pendiente de cada deuda.")
+            with rk2:
+                costo_rank = deudas_analisis.sort_values("Interés acumulado estimado", ascending=True)
+                fig_costo_rank = px.bar(
+                    costo_rank, x="Interés acumulado estimado", y="Nombre", orientation="h", text="Interés acumulado estimado",
+                    color_discrete_sequence=["#FF0000"],
+                )
+                fig_costo_rank.update_traces(
+                    texttemplate="$%{text:,.0f}", textposition="outside",
+                    customdata=costo_rank[["Saldo", "Interés %", "Costo mensual estimado", "Inicio del crédito", "Meses transcurridos", "Tasa efectiva anual %", "Pagado", "Pago económico estimado"]],
+                    hovertemplate=(
+                        "<b>🔥 Obligación: %{y}</b><br>"
+                        "💸 Interés acumulado estimado: $%{x:,.0f}<br>"
+                        "✅ Abonado a capital: $%{customdata[6]:,.0f}<br>"
+                        "💰 Total pagado estimado: $%{customdata[7]:,.0f}<br>"
+                        "🔴 Saldo actual: $%{customdata[0]:,.0f}<br>"
+                        "📈 Tasa mensual: %{customdata[1]:.2f}%<br>"
+                        "🧾 Interés del mes sobre saldo actual: $%{customdata[2]:,.0f}<br>"
+                        "📅 Inicio del crédito: %{customdata[3]|%d/%m/%Y}<br>"
+                        "⏳ Tiempo transcurrido: %{customdata[4]:.1f} meses<br>"
+                        "📊 Tasa efectiva anual aprox.: %{customdata[5]:.2f}%<br>"
+                        "ℹ️ Total estimado = capital abonado + interés estimado."
+                        "<extra></extra>"
+                    ),
+                )
+                fig_costo_rank.update_yaxes(title="", automargin=True)
+                fig_costo_rank.update_layout(barcornerradius="50%", bargap=0.24)
+                fig_costo_rank.update_layout(coloraxis_colorbar=dict(
+                    title="Tasa mensual", tickvals=[0, 1, 2.5, 3.75, 5],
+                    ticktext=["0 %", "1 %", "2,5 %", "3,75 %", "5 % o más"],
+                    thickness=14,
+                ))
+                st.plotly_chart(estilo_grafico(fig_costo_rank, "🔥 Interés acumulado estimado desde el inicio"), use_container_width=True)
+                st.caption("Las barras rojas muestran el interés acumulado estimado. Consulta la tasa mensual en el tooltip.")
+
+            st.markdown("### 🧩 Concentración del saldo total")
+            import textwrap
+            concentracion_deudas = deudas_analisis.loc[
+                deudas_analisis["Saldo"].gt(0)
+            ].sort_values("Saldo", ascending=False).copy()
+            tooltips_concentracion = []
+            for _, fila_concentracion in concentracion_deudas.iterrows():
+                nombre_tooltip = "<br>".join(
+                    html.escape(linea) for linea in textwrap.wrap(str(fila_concentracion["Nombre"]), width=32)
+                )
+                fecha_tooltip = fila_concentracion["Inicio del crédito"]
+                fecha_tooltip = fecha_tooltip.strftime("%d/%m/%Y") if pd.notna(fecha_tooltip) else "Sin registrar"
+                participacion_tooltip = (
+                    float(fila_concentracion["Saldo"]) / total_saldo_deudas * 100
+                    if total_saldo_deudas > 0 else 0.0
+                )
+                tooltips_concentracion.append(
+                    f"<b>💳 {nombre_tooltip}</b><br><br>"
+                    f"🏦 Saldo: <b>${fila_concentracion['Saldo']:,.0f}</b><br>"
+                    f"✅ Abonado a capital: <b>${fila_concentracion['Pagado']:,.0f}</b><br>"
+                    f"💸 Total pagado estimado:<br><b>${fila_concentracion['Pago económico estimado']:,.0f}</b><br>"
+                    f"🧩 Parte del saldo total: <b>{participacion_tooltip:.1f}%</b><br>"
+                    f"📈 Interés mensual: {fila_concentracion['Interés %']:.2f}%<br>"
+                    f"✅ Capital amortizado: {fila_concentracion['Avance']:.1f}%<br>"
+                    f"📅 Inicio: {fecha_tooltip}<br><br>"
+                    f"🔥 Interés acumulado estimado:<br><b>${fila_concentracion['Interés acumulado estimado']:,.0f}</b><br>"
+                    "ℹ️ Total estimado = capital + interés estimado.<br>No equivale a pagos históricos confirmados."
+                )
+            from modules.sunburst_deudas_noche import mostrar_sunburst_deudas
+            mostrar_sunburst_deudas(concentracion_deudas,ayudas=tooltips_concentracion)
+            if not concentracion_deudas.empty:
+                mayor_concentracion = concentracion_deudas.iloc[0]
+                st.caption(
+                    f"Mayor concentración: {mayor_concentracion['Nombre']} reúne "
+                    f"el {float(mayor_concentracion['Saldo']) / total_saldo_deudas:.1%} del saldo pendiente. "
+                    "Los segmentos pequeños conservan su detalle al pasar el cursor; los créditos sin saldo no aparecen."
+                )
+            else:
+                st.info("No hay saldos pendientes para mostrar en la distribución.")
+
+            st.markdown("### 🛡️ Capacidad de pago")
+            texto_deuda_periodo = (
+                df.get("GASTOS_CATEGORIA", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+                df.get("GASTOS_SUBCATEGORIA", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+                df.get("GASTOS_SUBCATEGORIA_2", pd.Series(dtype=str)).astype(str).map(normalizar) + " " +
+                df.get("GASTOS_DESCRIPCION", pd.Series(dtype=str)).astype(str).map(normalizar)
+            ) if not df.empty else pd.Series(dtype=str)
+            claves_deuda_periodo = ("DEUDA", "CREDITO", "PRESTAMO", "CUOTA", "HIPOTECA", "TARJETA", "LIBRANZA")
+            mask_deuda_periodo = texto_deuda_periodo.str.contains("|".join(claves_deuda_periodo), regex=True, na=False)
+            pagos_deuda_periodo = float(df.loc[mask_deuda_periodo, "GASTOS_CANTIDAD"].sum()) if not df.empty else 0.0
+            meses_deuda_ref = max(len(flujo_reporte[flujo_reporte["Ingresos"].gt(0)]) if not flujo_reporte.empty else 1, 1)
+            pago_mensual_estimado = pagos_deuda_periodo / meses_deuda_ref
+            meses_ingreso_deuda = flujo_reporte.loc[flujo_reporte["Ingresos"].gt(0), "Ingresos"] if not flujo_reporte.empty else pd.Series(dtype=float)
+            ingreso_habitual_ref = float(meses_ingreso_deuda.mean()) if not meses_ingreso_deuda.empty else 0.0
+            compromiso_deuda_pct = pago_mensual_estimado / ingreso_habitual_ref * 100 if ingreso_habitual_ref else 0.0
+            margen_despues_deuda = ingreso_habitual_ref - pago_mensual_estimado
+            cp1, cp2, cp3, cp4 = st.columns(4)
+            tarjeta_perfil_panel(cp1, "💳 Pago mensual detectado", f"${pago_mensual_estimado:,.0f}", help='Gastos identificados por textos como deuda, crédito, cuota o préstamo, divididos entre los meses de referencia con ingresos. Puede incluir movimientos clasificados por aproximación.')
+            tarjeta_perfil_panel(cp2, "💵 Ingreso mensual promedio", f"${ingreso_habitual_ref:,.0f}", help='Promedio de ingresos de los meses con ingresos positivos del período seleccionado.')
+            tarjeta_perfil_panel(cp3, "📊 Compromiso de ingresos", f"{compromiso_deuda_pct:.1f}%", help='Pago mensual detectado dividido entre ingreso mensual promedio, multiplicado por 100. Sin ingresos de referencia, la aplicación muestra cero.')
+            tarjeta_perfil_panel(cp4, "🛡️ Margen después de deuda", f"${margen_despues_deuda:,.0f}", help='Ingreso mensual promedio menos pago mensual detectado. No descuenta los demás gastos personales.')
+            if compromiso_deuda_pct > 30:
+                st.error("🚨 Más del 30% del ingreso mensual estimado está comprometido en pagos detectados de deuda.")
+            elif compromiso_deuda_pct > 20:
+                st.warning("⚠️ El compromiso mensual de deuda se encuentra en una zona de atención.")
+            else:
+                st.success("✅ El compromiso mensual estimado de deuda permanece en una zona controlada.")
+
+            st.markdown("### ⚖️ Avalancha frente a bola de nieve")
+            avalancha = deudas_analisis.sort_values(["Interés", "Saldo"], ascending=[False, False]).copy()
+            nieve = deudas_analisis.sort_values(["Saldo", "Interés"], ascending=[True, False]).copy()
+            comp_metodos = pd.DataFrame({
+                "Posición": range(1, len(deudas_analisis) + 1),
+                "Avalancha": avalancha["Nombre"].tolist(),
+                "Bola de nieve": nieve["Nombre"].tolist(),
+            })
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(comp_metodos, use_container_width=True, hide_index=True)
+            st.info("ℹ️ Avalancha minimiza costo financiero; bola de nieve prioriza victorias rápidas. La mejor elección depende de disciplina, liquidez y condiciones reales de cada crédito.")
+
+            st.markdown("### Prioridad de pago")
+            st.caption(
+                "La primera deuda es la más costosa por interés. "
+                "Las barras rojas representan el saldo pendiente."
+            )
+
+            deudas_grafico = deudas.copy()
+            deudas_grafico["Interés %"] = deudas_grafico["Interés"] * 100
+            deudas_grafico["Etiqueta"] = deudas_grafico.apply(
+                lambda fila: (
+                    f"${fila['Saldo']:,.0f}<br>"
+                    f"{fila['Interés %']:.2f}%"
+                ),
+                axis=1,
+            )
+
+            fig_deudas = go.Figure(
+                go.Bar(
+                    x=deudas_grafico["Saldo"],
+                    y=deudas_grafico["Nombre"],
+                    orientation="h",
+                    text=deudas_grafico["Etiqueta"],
+                    textposition="outside",
+                    cliponaxis=False,
+                    marker=dict(
+                        color="#FF0000",
+                        line=dict(color="#0F172A", width=1.5),
+                    ),
+                    customdata=deudas_grafico[
+                        ["Deuda inicial", "Interés %", "Pagado", "Avance"]
+                    ],
+                    hovertemplate=(
+                        "<b>💳 %{y}</b><br>"
+                        "🔴 Saldo pendiente: $%{x:,.0f}<br>"
+                        "💰 Deuda inicial: $%{customdata[0]:,.0f}<br>"
+                        "📈 📈 Interés: %{customdata[1]:.2f}%<br>"
+                        "✅ ✅ Pagado: $%{customdata[2]:,.0f}<br>"
+                        "📊 📊 Avance: %{customdata[3]:.1f}%"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            fig_deudas.update_layout(
+                template="plotly_dark",
+                height=max(430, len(deudas_grafico) * 62),
+                paper_bgcolor="#000000",
+                plot_bgcolor="#000000",
+                title="Deudas ordenadas por costo financiero",
+                xaxis=dict(
+                    title="Saldo pendiente",
+                    tickprefix="$",
+                    tickformat=",.0f",
+                    gridcolor="rgba(148,163,184,0.14)",
+                ),
+                yaxis=dict(
+                    title="Deuda",
+                    autorange="reversed",
+                ),
+                margin=dict(t=75, b=45, l=40, r=150),
+                barcornerradius="50%",
+                bargap=0.26,
+                showlegend=False,
+            )
+
+            st.plotly_chart(
+                fig_deudas,
+                use_container_width=True,
+                key="grafico_prioridad_deudas_v1",
+            )
+
+            st.markdown("### Avance de cada deuda")
+
+            for posicion, (_, deuda_row) in enumerate(
+                deudas.iterrows(),
+                start=1,
+            ):
+                with st.container(border=True, key=f"ficha_deuda_marco_{posicion}"):
+                    nombre_deuda = str(deuda_row["Nombre"])
+                    deuda_inicial = float(deuda_row["Deuda inicial"])
+                    saldo_deuda = float(deuda_row["Saldo"])
+                    pagado_deuda = float(deuda_row["Pagado"])
+                    interes_deuda_pct = float(deuda_row["Interés"]) * 100
+                    avance_deuda = float(deuda_row["Avance"])
+                    avance_deuda_limitado = min(max(avance_deuda, 0), 100)
+                    faltante_deuda = max(saldo_deuda, 0)
+                    pagada_sin_importe = saldo_deuda <= 0 and deuda_inicial <= 0
+                    if saldo_deuda <= 0:
+                        avance_deuda = 100.0
+                        avance_deuda_limitado = 100.0
+
+                    if avance_deuda >= 100 or saldo_deuda <= 0:
+                        estado_deuda = "Pagada"
+                        color_estado = "#34D399"
+                    elif avance_deuda >= 75:
+                        estado_deuda = "Cerca de terminar"
+                        color_estado = "#38BDF8"
+                    elif avance_deuda >= 40:
+                        estado_deuda = "En progreso"
+                        color_estado = "#FBBF24"
+                    else:
+                        estado_deuda = "Saldo alto"
+                        color_estado = "#FB7185"
+
+                    from modules.proyeccion_creditos import texto
+                    metodo_ficha = texto(deuda_row.get('Sistema de amortización')) or texto(deuda_row.get('Tipo'))
+                    es_aleman = metodo_ficha in {'aleman', 'alemana', 'sistema aleman', 'amortizacion alemana', 'credito aleman'}
+                    tiene_switch_amortizacion = es_aleman or metodo_ficha in {
+                        'frances', 'francesa', 'sistema frances', 'amortizacion francesa', 'credito frances',
+                        'ingles', 'inglesa', 'sistema ingles', 'amortizacion inglesa', 'credito ingles',
+                        'americano', 'americana', 'sistema americano', 'amortizacion americana', 'credito americano',
+                    }
+                    if tiene_switch_amortizacion:
+                        clave_desplegar = f'credito_frances_{posicion}_mostrar_amortizacion'
+                        with st.container(border=True):
+                            titulo_col, boton_col, estado_col = st.columns([5, 2, 1.4], vertical_alignment='center')
+                            with titulo_col:
+                                st.caption(f'PRIORIDAD {posicion}')
+                                st.markdown(f'💳 **{nombre_deuda}**')
+                            with boton_col:
+                                estilo_switch = f'amortizacion_switch_{posicion}'
+                                activo = st.session_state.get(clave_desplegar, False)
+                                color_switch = '#55F6B1' if es_aleman else (
+                                    '#FF6666' if metodo_ficha in {
+                                        'ingles', 'inglesa', 'sistema ingles', 'amortizacion inglesa', 'credito ingles',
+                                        'americano', 'americana', 'sistema americano', 'amortizacion americana', 'credito americano',
+                                    } else '#38BDF8')
+                                st.markdown(f'''<style>
+                                    .st-key-{estilo_switch} {{
+                                        border:1px solid {color_switch};border-radius:999px;
+                                        padding:6px 12px;background:#000000;
+                                        box-shadow:0 0 {'12px' if activo else '4px'} {color_switch}33;
+                                    }}
+                                    .st-key-{estilo_switch} [data-testid="stToggle"] label {{
+                                        margin:0;align-items:center;
+                                    }}
+                                    .st-key-{estilo_switch} [data-testid="stToggle"] p,
+                                    .st-key-{estilo_switch} [data-testid="stToggle"] label,
+                                    .st-key-{estilo_switch} [data-testid="stToggle"] [data-testid="stMarkdownContainer"],
+                                    .st-key-{estilo_switch} [data-testid="stToggle"] [data-testid="stMarkdownContainer"] * {{
+                                        color:{color_switch} !important;font-weight:700;font-size:14px;
+                                    }}
+                                    .st-key-{estilo_switch} [role="switch"][aria-checked="true"] {{
+                                        background-color:{color_switch} !important;
+                                    }}
+                                </style>''', unsafe_allow_html=True)
+                                with st.container(key=estilo_switch):
+                                    st.toggle('Amortización', key=clave_desplegar,
+                                        help='Activa para mostrar los gráficos y la tabla de amortización.')
+                            with estado_col:
+                                st.markdown(f'<div style="color:{color_estado};border:1px solid {color_estado};border-radius:999px;padding:6px 12px;text-align:center;font-weight:800;">{estado_deuda}</div>', unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                background:linear-gradient(135deg,rgba(15,23,42,.98),rgba(2,6,23,.98));
+                                border:1px solid {color_estado};
+                                border-radius:18px;
+                                padding:18px;
+                                margin-top:14px;
+                                box-shadow:0 10px 28px rgba(0,0,0,.35);
+                            ">
+                                <div style="display:flex;justify-content:space-between;align-items:center;gap:15px;">
+                                    <div>
+                                        <div style="color:#94a3b8;font-size:.82rem;font-weight:700;">
+                                            PRIORIDAD {posicion}
+                                        </div>
+                                        <div style="color:#f8fafc;font-size:1.25rem;font-weight:800;">
+                                            💳 {nombre_deuda}
+                                        </div>
+                                    </div>
+                                    <div style="
+                                        color:{color_estado};
+                                        border:1px solid {color_estado};
+                                        border-radius:999px;
+                                        padding:6px 12px;
+                                        font-weight:800;
+                                    ">
+                                        {estado_deuda}
+                                    </div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    with st.container(key=f"avance_deuda_tarjetas_{posicion}"):
+                        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+                        tarjeta_perfil_panel(c1, '📊 Interés', f"{interes_deuda_pct:.2f}%", help='Tasa de interés mensual registrada para esta obligación, expresada como porcentaje.')
+                        tarjeta_perfil_panel(c2, '💳 Deuda inicial', f"${deuda_inicial:,.0f}", help='Capital inicial registrado para esta obligación.')
+                        tarjeta_perfil_panel(c3, '📊 Pagado', f"${pagado_deuda:,.0f}", help='Reducción del capital calculada como deuda inicial menos saldo pendiente.')
+                        tarjeta_perfil_panel(c4, '🏦 Saldo pendiente', f"${saldo_deuda:,.0f}", help='Capital pendiente de pago según el saldo registrado en el Excel. No incluye intereses estimados adicionales.')
+                        tarjeta_perfil_panel(c5, '📊 Falta para terminar', f"${faltante_deuda:,.0f}", help='Capital que aún falta pagar según el saldo registrado. No incluye intereses futuros.')
+                        inicio_credito = pd.to_datetime(
+                            deuda_row.get("Inicio del crédito"), errors="coerce"
+                        )
+                        analisis_credito = deudas_analisis.iloc[posicion - 1]
+                        meses_credito = float(analisis_credito['Meses transcurridos'])
+                        interes_acumulado_deuda = float(analisis_credito['Interés acumulado estimado'])
+                        tarjeta_perfil_panel(c6, '📊 Inicio',
+                            inicio_credito.strftime("%d/%m/%Y")
+                            if pd.notna(inicio_credito)
+                            else "Sin registrar",
+                         help='Fecha de inicio del crédito registrada en el Excel. Si no es válida, se muestra Sin registrar.')
+                        tarjeta_perfil_panel(c7, '📊 Interés estimado',
+                            f"${interes_acumulado_deuda:,.0f}",
+                            f"{meses_credito:.1f} meses",
+                         help='Saldo promedio × tasa mensual × tiempo hasta el cierre del período. En ingleses son meses completos vencidos desde Inicio del crédito. Si hubo abonos faltan sus fechas: sigue siendo una estimación, no pagos confirmados.')
+
+                    st.progress(avance_deuda_limitado / 100)
+
+                    st.markdown(
+                        f"""
+                        <div style="color:#cbd5e1;margin:4px 0 12px 0;">
+                            📊 Avance: <b style="color:{color_estado};">{avance_deuda:.1f}%</b>
+                            · Falta pagar <b>${faltante_deuda:,.0f}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    fig_avance_deuda = go.Figure()
+                    fig_avance_deuda.add_trace(
+                        go.Bar(
+                            x=[100.0 if pagada_sin_importe else pagado_deuda], y=[nombre_deuda], orientation="h",
+                            name="Pagado", marker_color="#00FF00",
+                            text=['Pagada · 100%' if pagada_sin_importe else f"Pagado ${pagado_deuda:,.0f}"], textposition="inside",
+                            hovertemplate=("<b>✅ Pagada · saldo $0</b><br>💳 %{y}<br>Importe inicial no registrado; avance mostrado en porcentaje.<extra></extra>" if pagada_sin_importe else "<b>✅ Capital amortizado</b><br>💳 %{y}<br>💰 Valor: $%{x:,.0f}<extra></extra>"),
+                        )
+                    )
+                    fig_avance_deuda.add_trace(
+                        go.Bar(
+                            x=[faltante_deuda], y=[nombre_deuda], orientation="h",
+                            name="Pendiente", marker_color="#FF0000",
+                            text=[f"Pendiente ${faltante_deuda:,.0f}"], textposition="inside",
+                            hovertemplate="<b>🔴 Saldo pendiente</b><br>💳 %{y}<br>💰 Valor: $%{x:,.0f}<extra></extra>",
+                        )
+                    )
+                    fig_avance_deuda.update_layout(
+                        barmode="stack", template="plotly_dark", height=190,
+                        paper_bgcolor="#000000", plot_bgcolor="#000000",
+                        xaxis=dict(title="Valor de la deuda", tickprefix="$",
+                            tickformat=",.0f", range=[0, max(deuda_inicial, 1)]),
+                        yaxis=dict(title=""),
+                        legend=dict(orientation="h", y=1.18, x=0),
+                        margin=dict(t=55, b=35, l=20, r=20),
+                        barcornerradius=0, bargap=0.25,
+                    )
+                    if pagada_sin_importe:
+                        fig_avance_deuda.update_xaxes(title='Avance de la deuda', range=[0, 100],
+                            tickprefix='', ticksuffix='%', tickformat='.0f')
+                    st.plotly_chart(
+                        fig_avance_deuda, use_container_width=True,
+                        key=f"avance_deuda_{posicion}",
+                    )
+
+                    from modules.proyeccion_creditos import mostrar_proyeccion_credito
+                    mostrar_proyeccion_credito(deuda_row, key=f"credito_frances_{posicion}")
+
+            tabla_deudas = deudas.copy()
+            tabla_deudas["Interés"] = tabla_deudas["Interés"].map(
+                lambda valor: f"{valor * 100:.2f}%"
+            )
+            tabla_deudas["Deuda inicial"] = tabla_deudas["Deuda inicial"].map(
+                lambda valor: f"${valor:,.0f}"
+            )
+            tabla_deudas["Saldo"] = tabla_deudas["Saldo"].map(
+                lambda valor: f"${valor:,.0f}"
+            )
+            tabla_deudas["Pagado"] = tabla_deudas["Pagado"].map(
+                lambda valor: f"${valor:,.0f}"
+            )
+            tabla_deudas["Avance"] = tabla_deudas["Avance"].map(
+                lambda valor: f"{valor:.1f}%"
+            )
+            tabla_deudas["Inicio del crédito"] = pd.to_datetime(
+                tabla_deudas["Inicio del crédito"], errors="coerce"
+            ).dt.strftime("%d/%m/%Y").fillna("Sin registrar")
+            tabla_deudas = tabla_deudas.merge(
+                deudas_analisis[[
+                    "Nombre",
+                    "Meses transcurridos",
+                    "Interés acumulado estimado",
+                    "Tasa efectiva anual %",
+                ]],
+                on="Nombre",
+                how="left",
+            )
+            tabla_deudas["Meses transcurridos"] = tabla_deudas[
+                "Meses transcurridos"
+            ].map(lambda valor: f"{valor:.1f}")
+            tabla_deudas["Interés acumulado estimado"] = tabla_deudas[
+                "Interés acumulado estimado"
+            ].map(lambda valor: f"${valor:,.0f}")
+            tabla_deudas["Tasa efectiva anual %"] = tabla_deudas[
+                "Tasa efectiva anual %"
+            ].map(lambda valor: f"{valor:.2f}%")
+
+            with st.expander("Ver tabla completa de deudas"):
+                st.dataframe(
+                    tabla_deudas[
+                        [
+                            "Nombre",
+                            "Interés",
+                            "Deuda inicial",
+                            "Pagado",
+                            "Saldo",
+                            "Avance",
+                            "Inicio del crédito",
+                            "Meses transcurridos",
+                            "Interés acumulado estimado",
+                            "Tasa efectiva anual %",
+                            "Pago mensual",
+                            "Cuotas restantes", "Próximo vencimiento", "Total pendiente con intereses y cargos",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            csv_deudas = deudas.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Descargar deudas procesadas (CSV)",
+                csv_deudas,
+                "deudas_procesadas.csv",
+                "text/csv",
+            )
+
+    if pestana_activa == etiquetas_pestanas[6]:
+        st.markdown("""
+        <style>
+        [data-testid="stPlotlyChart"],
+        .st-key-pat_composicion_neon_v20,
+        .st-key-pat_liquidez_indicador_neon_v20,
+        .st-key-pat_renta_indicador_neon_v20,
+        .st-key-patrimonio_liquidez_neon_v20,
+        .st-key-patrimonio_categoria_neon_v20,
+        .st-key-mapa_patrimonio_tarjetas_v20 {
+            position: relative;
+            box-sizing: border-box !important;
+            padding: 0 !important;
+            border: 0 !important;
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+            border-radius: 18px;
+            overflow: hidden;
+            isolation: isolate;
+        }
+        [data-testid="stPlotlyChart"]::after,
+        .st-key-pat_composicion_neon_v20::after,
+        .st-key-pat_liquidez_indicador_neon_v20::after,
+        .st-key-pat_renta_indicador_neon_v20::after,
+        .st-key-patrimonio_liquidez_neon_v20::after,
+        .st-key-patrimonio_categoria_neon_v20::after,
+        .st-key-mapa_patrimonio_tarjetas_v20::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            border: 1px solid rgba(0, 240, 255, 0.55);
+            border-radius: 18px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing: border-box;
+            min-width: 0;
+            max-width: 100%;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        def formato_tooltips_patrimonio(figura):
+            import re
+            def local(valor):
+                if isinstance(valor, str):
+                    return re.sub(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+\.\d+(?=%)", lambda m: m.group().translate(str.maketrans({",": ".", ".": ","})), valor)
+                if isinstance(valor, (list, tuple, np.ndarray)):
+                    return [local(item) for item in valor]
+                return valor
+            figura.update_layout(separators=",.")
+            for traza in figura.data:
+                for campo in ("hovertemplate", "hovertext", "customdata"):
+                    valor = getattr(traza, campo, None)
+                    if valor is not None:
+                        setattr(traza, campo, local(valor))
+            return figura
+
+        contexto_pestana("¿Cuál es mi riqueza?", "Integra activos, pasivos y patrimonio neto para mostrar la posición financiera acumulada y su evolución.")
+        st.markdown("## Composición del patrimonio")
+        st.subheader("🏠 Patrimonio Neto")
+        st.caption(
+            "Lee automáticamente una hoja llamada Patrimonio. Cada fila puede ser un activo o un pasivo. "
+            "El valor neto se calcula automáticamente con el valor actual, el porcentaje de propiedad y la clasificación."
+        )
+
+        plantilla_patrimonio = pd.DataFrame(columns=[
+            "Fecha", "Clasificación", "Tipo de producto", "Disponibilidad de efectivo",
+            "Liquidez", "Categoría", "Subcategoría", "Descripción", "Entidad",
+            "Porcentaje", "Valor actual", "Moneda", "Tasa a COP", "Observaciones",
+        ])
+
+        if patrimonio.empty:
+            st.warning("No encontré datos en una hoja llamada 'Patrimonio'. Crea esa hoja en el Excel con estas columnas y vuelve a subir el archivo.")
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(plantilla_patrimonio, use_container_width=True, hide_index=True)
+            st.markdown("#### Ejemplo de cómo llenar la hoja")
+            ejemplo_patrimonio = pd.DataFrame([
+                {
+                    "Fecha": "06/07/2026", "Clasificación": "Activo", "Tipo de producto": "Sin renta",
+                    "Disponibilidad de efectivo": "No corriente", "Liquidez": "Baja", "Categoría": "Vivienda",
+                    "Subcategoría": "Casa", "Descripción": "Casa principal", "Entidad": "Propia",
+                    "Porcentaje": 0.60, "Valor actual": 420000000, "Moneda": "COP", "Observaciones": "Avalúo comercial 2026",
+                },
+                {
+                    "Fecha": "06/07/2026", "Clasificación": "Activo", "Tipo de producto": "Renta fija",
+                    "Disponibilidad de efectivo": "Corriente", "Liquidez": "Alta", "Categoría": "Bancos",
+                    "Subcategoría": "Cuenta de ahorros", "Descripción": "Cuenta principal", "Entidad": "Bancolombia",
+                    "Porcentaje": 1.00, "Valor actual": 8500000, "Moneda": "COP", "Observaciones": "Saldo actualizado",
+                },
+                {
+                    "Fecha": "06/07/2026", "Clasificación": "Pasivo", "Tipo de producto": "Préstamo",
+                    "Disponibilidad de efectivo": "Corriente", "Liquidez": "No aplica", "Categoría": "Crédito",
+                    "Subcategoría": "Tarjeta", "Descripción": "Tarjeta principal", "Entidad": "BBVA",
+                    "Porcentaje": 1.00, "Valor actual": 3250000, "Moneda": "COP", "Observaciones": "Corte mensual",
+                },
+            ])
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(ejemplo_patrimonio, use_container_width=True, hide_index=True)
+        else:
+            activos_mask = patrimonio["Tipo"].map(normalizar).eq("ACTIVO")
+            total_activos = float(patrimonio.loc[activos_mask, "Valor neto"].sum())
+            inmuebles_mask = patrimonio["Categoría"].fillna("").map(normalizar).str.contains("INMUEBLE", regex=False)
+            valor_inmuebles = float(patrimonio.loc[activos_mask & inmuebles_mask, "Valor neto"].sum())
+            total_pasivos = abs(float(patrimonio.loc[~activos_mask, "Valor neto"].sum()))
+            patrimonio_neto = float(patrimonio["Valor neto"].sum())
+            deuda_activos_pct = (total_pasivos / total_activos * 100) if total_activos else 0
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            ayuda_total_activos = "Suma del valor de los activos incluidos en el análisis patrimonial."
+            m1.markdown(
+                '<div class="perfil-persona">'
+                '<div class="perfil-etiqueta">🏠 TOTAL ACTIVOS '
+                f'<span class="gac-help" tabindex="0" role="note" aria-label="{html.escape(ayuda_total_activos)}">'
+                f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(ayuda_total_activos)}</span></span></div>'
+                f'<div class="perfil-nombre" style="font-size:clamp(1.15rem,1.7vw,1.65rem)">${total_activos:,.0f}</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            tarjeta_perfil_patrimonio(m2, '📊 Valor inmuebles', f"${valor_inmuebles:,.0f}")
+            tarjeta_perfil_patrimonio(m3, '📊 Total pasivos', f"${total_pasivos:,.0f}")
+            tarjeta_perfil_patrimonio(m4, '🏠 Patrimonio neto', f"${patrimonio_neto:,.0f}")
+            tarjeta_perfil_patrimonio(m5, '💳 Endeudamiento', f"{deuda_activos_pct:.1f}%")
+
+            st.markdown("### 💱 Tasa Representativa del Mercado")
+            cotizaciones = personales.get("dolar_efectivo", {})
+            if cotizaciones:
+                importes = " · ".join(f"{operacion}: ${valor:,.2f} COP" for operacion, valor in cotizaciones.items())
+                st.caption(f"Dólar en efectivo · 1 USD · {importes} (según la hoja Personales)")
+            if trm_colombia.get("disponible") and trm_colombia.get("valor"):
+                fecha_trm = pd.to_datetime(
+                    trm_colombia.get("vigencia_desde"), errors="coerce"
+                )
+                vigencia_trm = (
+                    fecha_trm.strftime("%d/%m/%Y") if pd.notna(fecha_trm) else "Vigencia oficial"
+                )
+                trm1, trm2 = st.columns([1, 2])
+                tarjeta_perfil_patrimonio(trm1, '📊 TRM oficial · 1 USD',
+                    f"${float(trm_colombia['valor']):,.2f} COP",
+                )
+                with trm2:
+                    st.info(
+                        f"📅 **Vigencia:** {vigencia_trm}  \n"
+                        "Los activos registrados en USD se convierten automáticamente a pesos "
+                        "para los totales y diagnósticos patrimoniales."
+                    )
+                st.caption(
+                    "Fuente oficial: [Superintendencia Financiera de Colombia · Datos Abiertos]"
+                    "(https://www.datos.gov.co/resource/32sa-8pi3)"
+                )
+            else:
+                st.warning(
+                    "⚠️ No fue posible consultar la TRM oficial. Los valores en USD se conservan "
+                    "en su moneda original, pero se excluyen temporalmente de los totales expresados en COP."
+                )
+
+            # ======================================================
+            # ANÁLISIS EJECUTIVO DE PATRIMONIO V9.17
+            # ======================================================
+            patrimonio_v917 = patrimonio.copy()
+            for col in ["Valor actual", "Saldo pendiente", "Valor neto"]:
+                if col in patrimonio_v917.columns:
+                    patrimonio_v917[col] = pd.to_numeric(patrimonio_v917[col], errors="coerce").fillna(0.0)
+
+            # Nombre legible: nunca se toman fechas como etiquetas del eje.
+            columnas_nombre_pat = [c for c in ["Descripción", "Subcategoría", "Categoría", "Entidad"] if c in patrimonio_v917.columns]
+            if columnas_nombre_pat:
+                patrimonio_v917["Elemento"] = patrimonio_v917[columnas_nombre_pat].astype(str).apply(
+                    lambda fila: next((v.strip() for v in fila if v and v.strip().lower() not in {"nan", "none", "nat", ""}), "Sin nombre"),
+                    axis=1,
+                )
+            else:
+                patrimonio_v917["Elemento"] = "Sin nombre"
+
+            tipo_norm_pat = patrimonio_v917.get("Tipo", pd.Series("", index=patrimonio_v917.index)).map(normalizar)
+            patrimonio_v917["Clase"] = tipo_norm_pat.map(lambda x: "Activo" if x == "ACTIVO" else "Pasivo")
+            patrimonio_v917["Valor visual"] = patrimonio_v917["Valor neto"].abs()
+
+            # 💧 Liquidez: se respeta la clasificación explícita de la hoja.
+            liquidez_norm = patrimonio_v917.get("Liquidez", pd.Series("SIN CLASIFICAR", index=patrimonio_v917.index)).map(normalizar)
+            patrimonio_v917["Nivel liquidez"] = liquidez_norm.map(
+                lambda x: "Alta" if any(k in x for k in ["ALTA", "LIQUID", "INMEDIATA"])
+                else "Media" if "MEDIA" in x
+                else "Baja" if "BAJA" in x
+                else "No aplica" if "NO APLICA" in x
+                else "Sin clasificar"
+            )
+
+            activos_v917 = patrimonio_v917[patrimonio_v917["Clase"].eq("Activo")].copy()
+            pasivos_v917 = patrimonio_v917[patrimonio_v917["Clase"].eq("Pasivo")].copy()
+            diagnostico_patrimonial = calcular_diagnostico_patrimonial(patrimonio_v917)
+            activos_liquidos = diagnostico_patrimonial["activos_liquidos"]
+            activos_no_liquidos = float(activos_v917.loc[activos_v917["Nivel liquidez"].eq("Baja"), "Valor visual"].sum())
+            pct_liquidez_pat = activos_liquidos / total_activos * 100 if total_activos else 0.0
+            activo_principal_valor = float(activos_v917["Valor visual"].max()) if not activos_v917.empty else 0.0
+            activo_principal_nombre = activos_v917.loc[activos_v917["Valor visual"].idxmax(), "Elemento"] if not activos_v917.empty else "Sin registrar"
+            concentracion_principal = activo_principal_valor / total_activos * 100 if total_activos else 0.0
+            top3_activos_pct = activos_v917.nlargest(3, "Valor visual")["Valor visual"].sum() / total_activos * 100 if total_activos else 0.0
+
+            st.markdown("### 🧭 Diagnóstico patrimonial")
+            ep1, ep2, ep3, ep4, ep5 = st.columns(5)
+            tarjeta_perfil_patrimonio(ep1, "💼 Patrimonio financiero", f"${diagnostico_patrimonial['patrimonio_financiero']:,.0f}")
+            tarjeta_perfil_patrimonio(ep2, "💧 Activos líquidos", f"${activos_liquidos:,.0f}", f"{pct_liquidez_pat:.1f}% de activos")
+            tarjeta_perfil_patrimonio(ep3, "⚖️ Solvencia",
+                f"{diagnostico_patrimonial['solvencia']:.1f} veces"
+                if diagnostico_patrimonial["solvencia"] is not None
+                else "Sin pasivos",
+            )
+            tarjeta_perfil_patrimonio(ep4, "🏠 Concentración inmuebles",
+                f"{diagnostico_patrimonial['concentracion_inmuebles_pct']:.1f}%",
+            )
+            tarjeta_perfil_patrimonio(ep5, "🏦 LTV inmobiliario",
+                f"{diagnostico_patrimonial['ltv_pct']:.1f}%"
+                if diagnostico_patrimonial["ltv_pct"] is not None
+                else "Sin hipotecas",
+                f"Deuda hipotecaria: ${diagnostico_patrimonial['saldo_hipotecas']:,.0f}",
+            )
+
+            def tarjeta_fondo_maniobra(titulo, valor, formula, icono):
+                explicacion_fondo = (
+                    "¿Alcanzan los activos líquidos para cubrir las obligaciones consideradas corrientes? Se calcula restando las deudas no hipotecarias a los activos identificados como líquidos. Incluye activos corrientes o de liquidez alta o media; no todos son efectivo inmediato."
+                    if titulo == "Fondo de maniobra" else
+                    "¿Cuánto margen queda al usar solo los recursos más inmediatos? Parte de los activos líquidos identificados como efectivo, cuentas, ahorros o fondos inmediatos y resta las deudas no hipotecarias. Depende de la clasificación registrada en el Excel."
+                )
+                lectura_fondo = (
+                    f"Faltan ${abs(valor):,.0f} para cubrir esas obligaciones con los activos considerados."
+                    if valor < 0 else f"Queda un margen de ${valor:,.0f} después de cubrir esas obligaciones."
+                    if valor > 0 else "Los activos considerados igualan las obligaciones: no queda margen."
+                )
+                explicacion_fondo += " " + lectura_fondo + " La app usa las deudas no hipotecarias como aproximación de pasivos corrientes; no clasifica cada deuda por su vencimiento."
+                tooltip_fondo = html.escape(explicacion_fondo)
+                if valor < 0:
+                    color = "#FF3B4D"
+                    fondo = "rgba(255, 59, 77, 0.13)"
+                    estado = "🔴 Los recursos no cubren las obligaciones"
+                elif valor > 0:
+                    color = "#22C55E"
+                    fondo = "rgba(34, 197, 94, 0.13)"
+                    estado = "🟢 Queda margen tras cubrir las obligaciones"
+                else:
+                    color = "#F59E0B"
+                    fondo = "rgba(245, 158, 11, 0.13)"
+                    estado = "🟡 Cobertura exacta, sin margen"
+                valor_texto = f"-${abs(valor):,.0f}" if valor < 0 else f"${valor:,.0f}"
+                st.markdown(
+                    f"""
+                    <div style="background:linear-gradient(145deg,rgba(15,23,42,.96),rgba(30,41,59,.92));
+                                border:1px solid {color};border-radius:16px;padding:18px 20px;
+                                min-height:174px;box-shadow:0 8px 24px rgba(0,0,0,.22);--card-color:{color};">
+                        <div style="font-size:.95rem;color:#CBD5E1;margin-bottom:8px;">{icono} {titulo}
+                            <span class="gac-help" tabindex="0" role="note" aria-label="{tooltip_fondo}">ⓘ<span class="gac-tooltip" role="tooltip" style="border-top:3px solid #39d7ff;">{tooltip_fondo}</span></span>
+                        </div>
+                        <div style="font-size:1.85rem;font-weight:800;color:#F8FAFC;margin-bottom:12px;">{valor_texto}</div>
+                        <div style="display:inline-block;background:{fondo};color:{color};border:1px solid {color};
+                                    border-radius:999px;padding:5px 10px;font-weight:800;font-size:.78rem;">
+                            {estado}
+                        </div>
+                        <div style="font-size:.76rem;color:#94A3B8;margin-top:12px;">{formula}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            fm1, fm2 = st.columns(2)
+            with fm1:
+                tarjeta_fondo_maniobra(
+                    "Fondo de maniobra",
+                    diagnostico_patrimonial["fondo_maniobra"],
+                    "Activos corrientes − pasivos corrientes",
+                    "🧰",
+                )
+            with fm2:
+                tarjeta_fondo_maniobra(
+                    "Fondo de maniobra inmediato",
+                    diagnostico_patrimonial["fondo_maniobra_inmediato"],
+                    "Efectivo y ahorros − pasivos corrientes",
+                    "⚡",
+                )
+
+            estado_patrimonial = diagnostico_patrimonial["estado"]
+            mensaje_patrimonial = diagnostico_patrimonial["mensaje"]
+            if estado_patrimonial in {"Excelente", "Sólida"}:
+                st.success(f"🟢 **Salud patrimonial {estado_patrimonial.lower()}:** {mensaje_patrimonial}")
+            elif estado_patrimonial == "Estable":
+                st.warning(f"🟡 **Salud patrimonial estable:** {mensaje_patrimonial}")
+            else:
+                st.error(f"🔴 **Salud patrimonial: {estado_patrimonial.lower()}.** {mensaje_patrimonial}")
+
+            st.markdown("### 🎯 Carteras por objetivo y tiempo")
+            st.caption(
+                "Distribuye automáticamente el patrimonio financiero entre ahorro de corto plazo, "
+                "inversión de medio plazo y previsión de largo plazo. Los inmuebles y demás bienes "
+                "físicos se analizan por separado en Patrimonio."
+            )
+            carteras_objetivo = calcular_carteras_por_objetivo(patrimonio_v917)
+            total_carteras = float(carteras_objetivo["Actual"].sum())
+            estilos_cartera = {
+                "A": {"color": "#22D3EE", "fondo": "rgba(34,211,238,.12)", "icono": "💧"},
+                "B": {"color": "#A78BFA", "fondo": "rgba(167,139,250,.12)", "icono": "📈"},
+                "C": {"color": "#F472B6", "fondo": "rgba(244,114,182,.12)", "icono": "🛡️"},
+            }
+            definiciones_cartera = {
+                "A": "Recursos para gastos próximos, imprevistos y necesidades de corto plazo.",
+                "B": "Recursos destinados a inversión y crecimiento durante el medio plazo.",
+                "C": "Recursos orientados al retiro, la previsión y la creación de patrimonio a largo plazo.",
+            }
+            st.markdown(
+                """
+                <style>
+                .tooltip-cartera {position:relative;display:inline-flex;align-items:center;z-index:20;}
+                .tooltip-cartera-icono {display:inline-flex;align-items:center;justify-content:center;width:25px;height:25px;
+                    border-radius:50%;border:1px solid #64748B;color:#E2E8F0;background:#172033;
+                    font-size:.78rem;font-weight:800;cursor:help;}
+                .tooltip-cartera-contenido {visibility:hidden;opacity:0;position:absolute;right:0;top:33px;
+                    width:min(350px,80vw);background:#07111F;border:1px solid #64748B;border-radius:13px;
+                    padding:14px;box-shadow:0 16px 40px rgba(0,0,0,.48);transition:opacity .18s ease;
+                    color:#E2E8F0;text-align:left;z-index:9999;}
+                .tooltip-cartera:hover .tooltip-cartera-contenido,
+                .tooltip-cartera:focus-within .tooltip-cartera-contenido {visibility:visible;opacity:1;}
+                .tooltip-cartera-fila {display:flex;justify-content:space-between;gap:14px;padding:7px 0;
+                    border-bottom:1px solid rgba(148,163,184,.16);font-size:.78rem;}
+                .tooltip-cartera-fila:last-child {border-bottom:0;}
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            columnas_carteras = st.columns(3)
+            for columna_cartera, (_, fila_cartera) in zip(columnas_carteras, carteras_objetivo.iterrows()):
+                codigo_cartera = str(fila_cartera["Cartera"])
+                estilo_cartera = estilos_cartera[codigo_cartera]
+                porcentaje_cartera = float(fila_cartera["Porcentaje"])
+                ancho_barra = min(max(porcentaje_cartera, 0.0), 100.0)
+                badge_rf = "RF ✓" if fila_cartera["Renta fija"] == "Sí" else "RF —"
+                badge_rv = "RV ✓" if fila_cartera["Renta variable"] == "Sí" else "RV —"
+                componentes_cartera = fila_cartera["Componentes"] or []
+                if componentes_cartera:
+                    filas_tooltip = "".join(
+                        f"<div class='tooltip-cartera-fila'>"
+                        f"<span>{html.escape(str(componente['nombre']))}</span>"
+                        f"<span style='white-space:nowrap;font-weight:750;'>"
+                        f"${float(componente['valor']):,.0f} · "
+                        f"{(float(componente['valor']) / total_carteras * 100 if total_carteras else 0):.1f}%"
+                        f"</span></div>"
+                        for componente in componentes_cartera
+                    )
+                else:
+                    filas_tooltip = (
+                        "<div style='font-size:.78rem;color:#94A3B8;padding-top:7px;'>"
+                        "No hay activos clasificados en esta cartera.</div>"
+                    )
+                tooltip_cartera = (
+                    f"<div class='tooltip-cartera' tabindex='0'>"
+                    f"<span class='tooltip-cartera-icono'>ⓘ</span>"
+                    f"<div class='tooltip-cartera-contenido'>"
+                    f"<div style='font-weight:850;color:{estilo_cartera['color']};margin-bottom:6px;'>"
+                    f"¿Qué es {html.escape(str(fila_cartera['Objetivo']))}?</div>"
+                    f"<div style='font-size:.78rem;color:#CBD5E1;line-height:1.4;margin-bottom:10px;'>"
+                    f"{definiciones_cartera[codigo_cartera]}</div>"
+                    f"<div style='font-size:.72rem;color:#94A3B8;font-weight:800;text-transform:uppercase;'>"
+                    f"Qué conforma el {porcentaje_cartera:.1f}%</div>"
+                    f"{filas_tooltip}</div></div>"
+                )
+                with columna_cartera:
+                    st.markdown(
+                        f"""
+                        <div style="background:linear-gradient(145deg,rgba(15,23,42,.97),rgba(30,41,59,.93));
+                                    border:1px solid {estilo_cartera['color']};border-radius:18px;padding:20px;
+                                    min-height:270px;box-shadow:0 10px 28px rgba(0,0,0,.24);">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+                                <span style="font-size:1.9rem;">{estilo_cartera['icono']}</span>
+                                <div style="display:flex;align-items:center;gap:8px;">
+                                    {tooltip_cartera}
+                                    <span style="background:{estilo_cartera['fondo']};color:{estilo_cartera['color']};
+                                                 border:1px solid {estilo_cartera['color']};border-radius:999px;
+                                                 padding:4px 10px;font-size:.76rem;font-weight:800;">
+                                        CARTERA {codigo_cartera}
+                                    </span>
+                                </div>
+                            </div>
+                            <div style="font-size:1.16rem;font-weight:800;color:#F8FAFC;">
+                                {fila_cartera['Objetivo']}
+                            </div>
+                            <div style="font-size:.82rem;color:#94A3B8;margin-top:3px;">
+                                {fila_cartera['Tiempo']} plazo · {fila_cartera['Activo']}
+                            </div>
+                            <div style="font-size:1.65rem;font-weight:850;color:{estilo_cartera['color']};margin-top:18px;">
+                                ${float(fila_cartera['Actual']):,.0f}
+                            </div>
+                            <div style="display:flex;justify-content:space-between;color:#CBD5E1;
+                                        font-size:.79rem;margin:8px 0 6px;">
+                                <span>Participación</span><strong>{porcentaje_cartera:.1f}%</strong>
+                            </div>
+                            <div style="height:8px;background:rgba(148,163,184,.18);border-radius:999px;overflow:hidden;">
+                                <div style="width:{ancho_barra:.2f}%;height:100%;background:{estilo_cartera['color']};
+                                            border-radius:999px;"></div>
+                            </div>
+                            <div style="display:flex;gap:8px;margin-top:17px;">
+                                <span style="background:{estilo_cartera['fondo']};color:{estilo_cartera['color']};
+                                             border-radius:8px;padding:5px 9px;font-size:.75rem;font-weight:700;">{badge_rf}</span>
+                                <span style="background:{estilo_cartera['fondo']};color:{estilo_cartera['color']};
+                                             border-radius:8px;padding:5px 9px;font-size:.75rem;font-weight:700;">{badge_rv}</span>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown(
+                f"""
+                <div style="margin-top:14px;background:linear-gradient(90deg,rgba(34,211,238,.12),rgba(167,139,250,.12),rgba(244,114,182,.12));
+                            border:1px solid rgba(148,163,184,.35);border-radius:14px;padding:14px 18px;
+                            display:flex;justify-content:space-between;align-items:center;gap:16px;">
+                    <span style="color:#CBD5E1;font-weight:700;">💼 Total patrimonio financiero distribuido</span>
+                    <span style="color:#F8FAFC;font-size:1.35rem;font-weight:850;">${total_carteras:,.0f}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if concentracion_principal >= 70:
+                st.warning(f"⚠️ **Concentración alta:** {activo_principal_nombre} representa {concentracion_principal:.1f}% de los activos. Un patrimonio alto puede seguir siendo poco líquido o depender demasiado de un solo bien.")
+            elif concentracion_principal >= 45:
+                st.info(f"ℹ️ **Concentración media:** {activo_principal_nombre} representa {concentracion_principal:.1f}% de los activos.")
+            else:
+                st.success("✅ La composición de activos no depende excesivamente de un único elemento.")
+
+            st.markdown("### 🏦 Composición de activos y pasivos")
+            cp1, cp2 = st.columns(2)
+            with cp1:
+                activos_plot = activos_v917.groupby("Elemento", as_index=False)["Valor visual"].sum().sort_values("Valor visual", ascending=True)
+                fig_activos_v917 = px.bar(
+                    activos_plot, x="Valor visual", y="Elemento", orientation="h", text="Valor visual",
+                    color="Valor visual", color_continuous_scale=["#00D9FF", "#7B2FFF", "#FF2E9A"],
+                )
+                fig_activos_v917.update_traces(
+                    texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                    customdata=activos_plot[["Valor visual"]],
+                    hovertemplate=(
+                        "<b>🏠 %{y}</b><br>💰 💰 Valor neto: $%{x:,.0f}<br>"
+                        "📊 📊 Participación en activos: %{x}<extra></extra>"
+                    ),
+                )
+                # Se calcula el porcentaje en customdata para un tooltip preciso.
+                if not activos_plot.empty:
+                    fig_activos_v917.data[0].customdata = [[v, (v/total_activos*100 if total_activos else 0)] for v in activos_plot["Valor visual"]]
+                    fig_activos_v917.data[0].hovertemplate = (
+                        "<b>🏠 %{y}</b><br><br>"
+                        "💰 Valor neto del activo:<br><b>$%{customdata[0]:,.0f}</b><br><br>"
+                        "📊 Parte del total de activos: <b>%{customdata[1]:.1f}%</b><br>"
+                        f"🏦 Total de activos: ${total_activos:,.0f}"
+                        "<extra></extra>"
+                    )
+                fig_activos_v917.update_layout(hoverlabel=dict(
+                    bgcolor="#0F172A", bordercolor="#00D9FF", align="left",
+                    font=dict(size=13, color="#F8FAFC"), namelength=-1,
+                ))
+                fig_activos_v917.update_yaxes(title="", automargin=True)
+                fig_activos_v917.update_layout(barcornerradius="50%", bargap=0.32)
+                st.plotly_chart(formato_tooltips_patrimonio(estilo_grafico(fig_activos_v917, "🏠 Composición de activos por nombre")), use_container_width=True, key="pat_activos_nombres_v917")
+            with cp2:
+                if not pasivos_v917.empty:
+                    pasivos_plot = pasivos_v917.groupby("Elemento", as_index=False)["Valor visual"].sum().sort_values("Valor visual", ascending=True)
+                    fig_pasivos_v917 = px.bar(
+                        pasivos_plot, x="Valor visual", y="Elemento", orientation="h", text="Valor visual",
+                        color="Valor visual", color_continuous_scale=["#FFB000", "#FF5A36", "#FF003C"],
+                    )
+                    fig_pasivos_v917.update_traces(
+                        texttemplate="$%{text:,.0f}", textposition="outside", cliponaxis=False,
+                        customdata=[[v, (v/total_pasivos*100 if total_pasivos else 0)] for v in pasivos_plot["Valor visual"]],
+                        hovertemplate=(
+                            "<b>💳 %{y}</b><br><br>"
+                            "💰 Saldo pendiente del pasivo:<br><b>$%{customdata[0]:,.0f}</b><br><br>"
+                            "📊 Parte del total de pasivos: <b>%{customdata[1]:.1f}%</b><br>"
+                            f"🏦 Total de pasivos: ${total_pasivos:,.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                    fig_pasivos_v917.update_layout(hoverlabel=dict(
+                        bgcolor="#0F172A", bordercolor="#FF5A36", align="left",
+                        font=dict(size=13, color="#F8FAFC"), namelength=-1,
+                    ))
+                    fig_pasivos_v917.update_yaxes(title="", automargin=True)
+                    fig_pasivos_v917.update_layout(barcornerradius="50%", bargap=0.32)
+                    st.plotly_chart(formato_tooltips_patrimonio(estilo_grafico(fig_pasivos_v917, "💳 Composición de pasivos por nombre")), use_container_width=True, key="pat_pasivos_nombres_v917")
+                else:
+                    st.success("✅ No hay pasivos patrimoniales registrados.")
+
+            st.markdown("### 💧 Liquidez y generación de renta")
+            st.caption(
+                "Compara qué tan disponibles están los activos y qué proporción del patrimonio genera algún rendimiento."
+            )
+            col_liquidez_pat, col_renta_pat = st.columns(2, gap="large")
+
+            def alinear_donas_renta(figura, porcentaje, subtitulo):
+                figura = modernizar_dona_patrimonio(figura)
+                # Elimina las anotaciones previas; Plotly las fusiona por posición
+                # si solo se reemplaza la lista mediante update_layout.
+                figura.layout.annotations = ()
+                figura.update_traces(
+                    hole=.66, domain=dict(x=[.08, .92], y=[.22, .96]),
+                    texttemplate="%{percent:.1%}", textposition="inside",
+                    textfont=dict(size=13),
+                )
+                figura.update_layout(
+                    height=510, margin=dict(t=30, b=40, l=20, r=20),
+                    legend=dict(orientation="h", x=.5, xanchor="center", y=.12,
+                                yanchor="top", font=dict(size=11), title_text="",
+                                entrywidth=.48, entrywidthmode="fraction"),
+                    uniformtext_minsize=10, uniformtext_mode="hide",
+                    annotations=[
+                        dict(x=.5, y=.63, xref="paper", yref="paper", xanchor="center", yanchor="middle",
+                             showarrow=False, text=f"<b>{porcentaje:.1f}%</b>",
+                             font=dict(size=25, color="#F8FAFC")),
+                        dict(x=.5, y=.54, xref="paper", yref="paper", xanchor="center", yanchor="middle",
+                             showarrow=False, text=subtitulo,
+                             font=dict(size=11, color="#94A3B8")),
+                    ],
+                )
+                return figura
+
+            def detalle_activos_tooltip(componentes):
+                import textwrap
+                ordenados = sorted(componentes, key=lambda item: item[1], reverse=True)
+                lineas = []
+                for nombre, monto in ordenados[:5]:
+                    nombre_lineas = "<br>".join(html.escape(linea) for linea in textwrap.wrap(str(nombre), 30))
+                    lineas.append(f"• {nombre_lineas}: <b>${float(monto):,.0f}</b>")
+                if len(ordenados) > 5:
+                    resto = sum(float(monto) for _, monto in ordenados[5:])
+                    lineas.append(f"… y {len(ordenados) - 5} activos más: ${resto:,.0f}")
+                return "<br>".join(lineas) if lineas else "Sin activos en este grupo"
+
+            with col_liquidez_pat:
+                st.markdown("#### 💧 Liquidez patrimonial")
+                liquidez_base = activos_v917.loc[activos_v917["Valor visual"].gt(0)].copy()
+                liquidez_resumen = (
+                    liquidez_base.groupby("Nivel liquidez", as_index=False)["Valor visual"].sum()
+                    if not liquidez_base.empty else pd.DataFrame()
+                )
+                if liquidez_resumen.empty or float(liquidez_resumen["Valor visual"].sum()) <= 0:
+                    st.info("No hay activos con liquidez clasificada para construir la gráfica.")
+                else:
+                    total_liquidez_grafico = float(liquidez_resumen["Valor visual"].sum())
+                    detalles_liquidez = []
+                    for _, fila_liq in liquidez_resumen.iterrows():
+                        nivel_liq = fila_liq["Nivel liquidez"]
+                        componentes_liq = (
+                            liquidez_base.loc[liquidez_base["Nivel liquidez"].eq(nivel_liq)]
+                            .groupby("Elemento", as_index=False)["Valor visual"]
+                            .sum()
+                            .sort_values("Valor visual", ascending=False)
+                        )
+                        detalles_liquidez.append(detalle_activos_tooltip([
+                            (componente["Elemento"], componente["Valor visual"])
+                            for _, componente in componentes_liq.iterrows()
+                        ]))
+
+                    colores_liq = {
+                        "Alta": "#22C55E", "Media": "#22D3EE", "Baja": "#F97316",
+                        "Sin clasificar": "#A78BFA", "No aplica": "#64748B",
+                    }
+                    porcentaje_liquidez_util = float(
+                        liquidez_resumen.loc[
+                            liquidez_resumen["Nivel liquidez"].isin(["Alta", "Media"]), "Valor visual"
+                        ].sum()
+                    ) / total_liquidez_grafico * 100
+                    fig_liq_v917 = go.Figure(go.Pie(
+                        labels=liquidez_resumen["Nivel liquidez"],
+                        values=liquidez_resumen["Valor visual"],
+                        hole=0.60,
+                        sort=False,
+                        marker=dict(
+                            colors=[colores_liq.get(x, "#94A3B8") for x in liquidez_resumen["Nivel liquidez"]],
+                            line=dict(color="#020617", width=3),
+                        ),
+                        customdata=[[detalle] for detalle in detalles_liquidez],
+                        texttemplate="<b>%{label}</b><br>%{percent:.1%}",
+                        textposition="inside",
+                        hovertemplate=(
+                            "<b>💧 Liquidez: %{label}</b><br><br>"
+                            "💰 Valor del grupo: <b>$%{value:,.0f}</b><br>"
+                            "📊 Parte de los activos analizados: <b>%{percent:.1%}</b><br>"
+                            f"🏦 Total analizado: ${total_liquidez_grafico:,.0f}<br><br>"
+                            "<b>🏠 Principales activos del grupo</b><br>%{customdata[0]}<br><br>"
+                            "ℹ️ Liquidez indica disponibilidad del activo;<br>no es dinero ya retirado ni vendido.<extra></extra>"
+                        ),
+                    ))
+                    fig_liq_v917.add_annotation(
+                        text=f"<b>{porcentaje_liquidez_util:.1f}%</b><br><span style='font-size:11px'>alta + media</span>",
+                        x=0.5, y=0.5, showarrow=False,
+                        font=dict(color="#F8FAFC", size=20),
+                    )
+                    fig_liq_v917.update_layout(
+                        template="plotly_dark", height=440,
+                        paper_bgcolor="#000000", plot_bgcolor="#000000",
+                        margin=dict(t=25, b=80, l=20, r=20),
+                        legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center"),
+                        hoverlabel=dict(bgcolor="#0F172A", bordercolor="#22D3EE", align="left", namelength=-1, font=dict(color="#F8FAFC", size=13)),
+                    )
+                    from modules.anillos_neon import mostrar_anillo_neon
+                    from modules.patrimonio_noche import preparar_indicador_patrimonio
+                    mostrar_anillo_neon(
+                        preparar_indicador_patrimonio(fig_liq_v917), total_liquidez_grafico,
+                        "Liquidez patrimonial", "pat_liquidez_indicador_neon_v20", patrimonio=True,
+                        ajustar_marco=True,
+                        centro=f"{porcentaje_liquidez_util:.1f}%".replace(".", ","),
+                        subtitulo="LIQUIDEZ ALTA + MEDIA",
+                    )
+
+            with col_renta_pat:
+                st.markdown("#### 💸 Patrimonio que produce renta")
+                distribucion_renta = calcular_distribucion_renta_patrimonio(patrimonio_v917)
+                if distribucion_renta.empty or float(distribucion_renta["Valor"].sum()) <= 0:
+                    st.info("No hay activos con valor suficiente para calcular esta distribución.")
+                else:
+                    total_renta_pat = float(distribucion_renta["Valor"].sum())
+                    detalles_renta = []
+                    for _, fila_renta in distribucion_renta.iterrows():
+                        componentes_renta = fila_renta["Componentes"] or []
+                        detalles_renta.append(detalle_activos_tooltip([
+                            (componente["nombre"], componente["valor"])
+                            for componente in componentes_renta
+                        ]))
+                    porcentaje_productivo = float(
+                        distribucion_renta.loc[
+                            distribucion_renta["Estado renta"].eq("Produce renta"), "Porcentaje"
+                        ].sum()
+                    )
+                    fig_renta_patrimonio = go.Figure(go.Pie(
+                        labels=distribucion_renta["Estado renta"],
+                        values=distribucion_renta["Valor"],
+                        hole=0.60,
+                        sort=False,
+                        marker=dict(colors=["#22C55E", "#F97316"], line=dict(color="#020617", width=3)),
+                        customdata=[[detalle] for detalle in detalles_renta],
+                        texttemplate="<b>%{label}</b><br>%{percent:.1%}",
+                        textposition="inside",
+                        hovertemplate=(
+                            "<b>💸 %{label}</b><br><br>"
+                            "💰 Valor de los activos del grupo:<br><b>$%{value:,.0f}</b><br>"
+                            "📊 Parte de los activos analizados: <b>%{percent:.1%}</b><br>"
+                            f"🏦 Total analizado: ${total_renta_pat:,.0f}<br><br>"
+                            "<b>🏠 Principales activos del grupo</b><br>%{customdata[0]}<br><br>"
+                            "ℹ️ Muestra el valor de los activos;<br>no el ingreso mensual que generan.<extra></extra>"
+                        ),
+                    ))
+                    fig_renta_patrimonio.add_annotation(
+                        text=f"<b>{porcentaje_productivo:.1f}%</b><br><span style='font-size:11px'>produce renta</span>",
+                        x=0.5, y=0.5, showarrow=False,
+                        font=dict(color="#F8FAFC", size=20),
+                    )
+                    fig_renta_patrimonio.update_layout(
+                        template="plotly_dark", height=440,
+                        paper_bgcolor="#000000", plot_bgcolor="#000000",
+                        margin=dict(t=25, b=80, l=20, r=20),
+                        legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center"),
+                        hoverlabel=dict(bgcolor="#0F172A", bordercolor="#22C55E", align="left", namelength=-1, font=dict(color="#F8FAFC", size=13)),
+                    )
+                    from modules.anillos_neon import mostrar_anillo_neon
+                    from modules.patrimonio_noche import preparar_indicador_patrimonio
+                    mostrar_anillo_neon(
+                        preparar_indicador_patrimonio(fig_renta_patrimonio), total_renta_pat,
+                        "Patrimonio que produce renta", "pat_renta_indicador_neon_v20", patrimonio=True,
+                        ajustar_marco=True,
+                        centro=f"{porcentaje_productivo:.1f}%".replace(".", ","),
+                        subtitulo="PRODUCE RENTA",
+                    )
+
+            produccion_activos = pd.to_numeric(
+                activos_v917.get("Producción mensual", pd.Series(float("nan"), index=activos_v917.index)),
+                errors="coerce",
+            )
+            if produccion_activos.notna().any():
+                st.caption(
+                    f"💰 Producción mensual propia registrada: **${produccion_activos.sum():,.0f} COP**. "
+                    "Se usa tu importe directamente, sin volver a aplicar el porcentaje de propiedad. "
+                    "El gráfico muestra el valor de los activos, no la renta. Un cero indica que no produce renta mensual; "
+                    "si está vacío, se conserva la clasificación por tipo de producto."
+                )
+                with st.expander("Ver producción mensual por activo", expanded=False):
+                    detalle_produccion = activos_v917[["Elemento"]].copy()
+                    detalle_produccion["Producción mensual propia (COP)"] = produccion_activos
+                    st.dataframe(
+                        detalle_produccion.loc[produccion_activos.notna()].sort_values("Producción mensual propia (COP)", ascending=False),
+                        hide_index=True, use_container_width=True,
+                        column_config={"Producción mensual propia (COP)": st.column_config.NumberColumn(format="$%.0f")},
+                    )
+
+            st.markdown("### ⚖️ Solidez patrimonial")
+            sp1, sp2, sp3 = st.columns(3)
+            tarjeta_perfil_patrimonio(sp1, "🏦 Activos por cada $100 de pasivos", f"${(total_activos/total_pasivos*100 if total_pasivos else total_activos):,.0f}" if total_pasivos else "Sin pasivos")
+            tarjeta_perfil_patrimonio(sp2, "💳 Pasivos / activos", f"{deuda_activos_pct:.1f}%")
+            tarjeta_perfil_patrimonio(sp3, "💎 Patrimonio libre", f"{(patrimonio_neto/total_activos*100 if total_activos else 0):.1f}% de activos")
+            st.info(f"⚖️ Por cada $100 en activos existen aproximadamente **${deuda_activos_pct:,.0f} en pasivos**. Esta relación describe estructura patrimonial, no capacidad mensual de pago.")
+
+            # ======================================================
+            # EVOLUCIÓN ACUMULADA MENSUAL DEL PATRIMONIO
+            # - Cada registro del mes se interpreta como un movimiento neto.
+            # - El patrimonio acumulado suma esos movimientos mes a mes.
+            # - Los meses sin movimientos conservan el saldo acumulado anterior.
+            # - El acumulado se calcula desde el primer registro histórico, aunque
+            #   la gráfica solo muestre el periodo seleccionado en los filtros.
+            # ======================================================
+            patrimonio_mensual = pd.DataFrame()
+            patrimonio_hist = patrimonio.copy()
+            patrimonio_hist["Fecha"] = pd.to_datetime(
+                patrimonio_hist["Fecha"],
+                errors="coerce",
+                dayfirst=True,
+            )
+            patrimonio_hist["Valor neto"] = pd.to_numeric(
+                patrimonio_hist["Valor neto"],
+                errors="coerce",
+            ).fillna(0.0)
+            patrimonio_hist = patrimonio_hist.dropna(subset=["Fecha"])
+            patrimonio_hist = patrimonio_hist[
+                patrimonio_hist["Fecha"].le(fecha_hasta_ts)
+            ].copy()
+
+            if patrimonio_hist.empty:
+                st.info(
+                    "No hay movimientos de patrimonio con fecha hasta el periodo seleccionado. "
+                    "Agrega registros mensuales en la columna Fecha para construir la evolución acumulada."
+                )
+            else:
+                patrimonio_hist["Periodo"] = patrimonio_hist["Fecha"].dt.to_period("M")
+                patrimonio_mensual_base = (
+                    patrimonio_hist.groupby("Periodo", as_index=False)["Valor neto"]
+                    .sum()
+                    .rename(columns={"Valor neto": "Movimiento mensual"})
+                    .sort_values("Periodo")
+                )
+
+                periodo_inicio_hist = patrimonio_mensual_base["Periodo"].min()
+                periodo_fin_hist = pd.Period(fecha_hasta_ts, freq="M")
+                periodos_completos = pd.period_range(
+                    start=periodo_inicio_hist,
+                    end=periodo_fin_hist,
+                    freq="M",
+                )
+
+                patrimonio_mensual = (
+                    patrimonio_mensual_base.set_index("Periodo")
+                    .reindex(periodos_completos, fill_value=0.0)
+                    .rename_axis("Periodo")
+                    .reset_index()
+                )
+                patrimonio_mensual["Patrimonio acumulado"] = (
+                    patrimonio_mensual["Movimiento mensual"].cumsum()
+                )
+                patrimonio_mensual["Variación"] = patrimonio_mensual["Movimiento mensual"]
+                patrimonio_mensual["Variación %"] = (
+                    patrimonio_mensual["Variación"]
+                    / patrimonio_mensual["Patrimonio acumulado"].shift(1).abs().replace(0, pd.NA)
+                    * 100
+                ).fillna(0.0)
+
+                periodo_desde = pd.Period(fecha_desde_ts, freq="M")
+                patrimonio_mensual = patrimonio_mensual[
+                    patrimonio_mensual["Periodo"].between(periodo_desde, periodo_fin_hist)
+                ].copy()
+
+                tolerancia_estable = 1.0
+                patrimonio_mensual["Estado"] = patrimonio_mensual["Variación"].apply(
+                    lambda valor: (
+                        "Subió"
+                        if valor > tolerancia_estable
+                        else "Bajó"
+                        if valor < -tolerancia_estable
+                        else "Estable"
+                    )
+                )
+                patrimonio_mensual["Mes"] = patrimonio_mensual["Periodo"].dt.strftime("%b %Y")
+                patrimonio_mensual["Color"] = patrimonio_mensual["Estado"].map(
+                    {
+                        "Subió": "#22C55E",
+                        "Bajó": "#EF4444",
+                        "Estable": "#FBBF24",
+                    }
+                ).fillna("#38BDF8")
+
+                if patrimonio_mensual.empty:
+                    st.info("No hay meses de patrimonio dentro del periodo filtrado.")
+                else:
+                    saldo_inicial_periodo = float(
+                        patrimonio_mensual.iloc[0]["Patrimonio acumulado"]
+                        - patrimonio_mensual.iloc[0]["Movimiento mensual"]
+                    )
+                    saldo_final_periodo = float(
+                        patrimonio_mensual.iloc[-1]["Patrimonio acumulado"]
+                    )
+                    variacion_total_pat = saldo_final_periodo - saldo_inicial_periodo
+                    meses_subida = int(patrimonio_mensual["Estado"].eq("Subió").sum())
+                    meses_bajada = int(patrimonio_mensual["Estado"].eq("Bajó").sum())
+                    meses_estables = int(patrimonio_mensual["Estado"].eq("Estable").sum())
+
+                    st.markdown("#### 🚀 Construcción mensual de tu patrimonio")
+                    st.caption(
+                        "La línea representa el patrimonio acumulado. Cada barra parte del nivel alcanzado el mes anterior "
+                        "y muestra el avance o retroceso del mes; si no hay movimiento, el patrimonio se mantiene estable."
+                    )
+
+                    pm1, pm2, pm3, pm4 = st.columns(4)
+                    tarjeta_perfil_patrimonio(pm1, '🏠 Patrimonio acumulado',
+                        f"${saldo_final_periodo:,.0f}",
+                        delta=f"{'+' if variacion_total_pat >= 0 else ''}${variacion_total_pat:,.0f} en el periodo",
+                    )
+                    tarjeta_perfil_patrimonio(pm2, '📅 Meses creciendo', meses_subida)
+                    tarjeta_perfil_patrimonio(pm3, '📅 Meses estables', meses_estables)
+                    tarjeta_perfil_patrimonio(pm4, '📅 Meses bajando', meses_bajada)
+
+                    # Para que los cambios mensuales sean visibles, el eje vertical
+                    # se expresa como variación respecto al patrimonio inicial del periodo.
+                    # En esta gráfica, $0 equivale al saldo_inicial_periodo.
+                    patrimonio_mensual["Crecimiento desde inicio"] = (
+                        patrimonio_mensual["Patrimonio acumulado"] - saldo_inicial_periodo
+                    )
+
+                    meses_linea = ["Inicio"] + patrimonio_mensual["Mes"].tolist()
+                    crecimiento_linea = [0.0] + patrimonio_mensual["Crecimiento desde inicio"].tolist()
+                    patrimonio_real_linea = [saldo_inicial_periodo] + patrimonio_mensual["Patrimonio acumulado"].tolist()
+                    movimiento_linea = [0.0] + patrimonio_mensual["Movimiento mensual"].tolist()
+                    variacion_pct_linea = [0.0] + patrimonio_mensual["Variación %"].tolist()
+                    estado_linea = ["Patrimonio inicial"] + patrimonio_mensual["Estado"].tolist()
+                    colores_linea = ["#F8FAFC"] + patrimonio_mensual["Color"].tolist()
+
+                    # Cada barra comienza exactamente en el nivel alcanzado al cierre
+                    # del mes anterior. Así funciona como un puente mensual: el ancho
+                    # vertical de la barra es el movimiento del mes y su punto de partida
+                    # es el crecimiento acumulado previo.
+                    patrimonio_mensual["Base mes anterior"] = (
+                        patrimonio_mensual["Crecimiento desde inicio"]
+                        - patrimonio_mensual["Movimiento mensual"]
+                    )
+
+                    fig_pat_mensual = go.Figure()
+                    fig_pat_mensual.add_trace(go.Bar(
+                        x=patrimonio_mensual["Mes"],
+                        y=patrimonio_mensual["Movimiento mensual"],
+                        base=patrimonio_mensual["Base mes anterior"],
+                        name="Movimiento desde el mes anterior",
+                        marker=dict(
+                            color=patrimonio_mensual["Color"],
+                            opacity=0.55,
+                            line=dict(color=patrimonio_mensual["Color"], width=1.2),
+                        ),
+                        customdata=patrimonio_mensual[[
+                            "Estado",
+                            "Patrimonio acumulado",
+                            "Base mes anterior",
+                            "Crecimiento desde inicio",
+                        ]],
+                        hovertemplate=(
+                            "<b>📅 %{x}</b><br>"
+                            "Base del mes anterior: $%{customdata[2]:+,.0f}<br>"
+                            "🔄 Movimiento del mes: $%{y:+,.0f}<br>"
+                            "🚀 Crecimiento acumulado al cierre: $%{customdata[3]:+,.0f}<br>"
+                            "💎 Patrimonio real al cierre: $%{customdata[1]:,.0f}<br>"
+                            "🚦 Estado: %{customdata[0]}<extra></extra>"
+                        ),
+                    ))
+                    fig_pat_mensual.add_trace(go.Scatter(
+                        x=meses_linea,
+                        y=crecimiento_linea,
+                        mode="lines+markers",
+                        name="Crecimiento sobre patrimonio inicial",
+                        line=dict(color="#38BDF8", width=4, shape="spline"),
+                        marker=dict(
+                            size=13,
+                            color=colores_linea,
+                            line=dict(color="#F8FAFC", width=1.5),
+                        ),
+                        fill="tozeroy",
+                        fillcolor="rgba(56,189,248,0.10)",
+                        customdata=list(zip(
+                            patrimonio_real_linea,
+                            movimiento_linea,
+                            [f"{float(valor):+.2f}".replace(".", ",") for valor in variacion_pct_linea],
+                            estado_linea,
+                        )),
+                        hovertemplate=(
+                            "<b>📅 %{x}</b><br>"
+                            "💎 Patrimonio real: $%{customdata[0]:,.0f}<br>"
+                            "🚀 Crecimiento desde el inicio: $%{y:,.0f}<br>"
+                            "🔄 Movimiento del mes: $%{customdata[1]:,.0f}<br>"
+                            "📈 Variación mensual: %{customdata[2]}%<br>"
+                            "🚦 Estado: %{customdata[3]}<extra></extra>"
+                        ),
+                    ))
+                    fig_pat_mensual.add_hline(
+                        y=0,
+                        line_dash="dot",
+                        line_color="rgba(248,250,252,0.65)",
+                        annotation_text=f"Patrimonio inicial = ${saldo_inicial_periodo:,.0f}",
+                        annotation_position="top left",
+                    )
+                    fig_pat_mensual.update_layout(
+                        template="plotly_dark",
+                        height=540,
+                        paper_bgcolor="#000000",
+                        plot_bgcolor="#000000",
+                        title=dict(
+                            text="Crecimiento del patrimonio sobre el valor inicial",
+                            font=dict(color="#F8FAFC"),
+                        ),
+                        separators=",.",
+                        xaxis=dict(
+                            title="Mes",
+                            type="category",
+                            categoryorder="array",
+                            categoryarray=meses_linea,
+                            gridcolor="rgba(148,163,184,0.08)",
+                        ),
+                        yaxis=dict(
+                            title="Cambio frente al patrimonio inicial",
+                            tickprefix="$",
+                            tickformat="+,.0f",
+                            zeroline=True,
+                            zerolinecolor="rgba(248,250,252,0.65)",
+                            zerolinewidth=2,
+                            gridcolor="rgba(148,163,184,0.14)",
+                        ),
+                        legend=dict(orientation="h", y=1.08),
+                        barmode="overlay",
+                        margin=dict(t=95, b=45, l=70, r=35),
+                        hoverlabel=dict(
+                            bgcolor="#0F172A",
+                            bordercolor="#38BDF8",
+                            align="left",
+                            font=dict(color="#F8FAFC", size=13),
+                        ),
+                    )
+                    st.caption(
+                        f"En esta escala, la línea $0 representa tu patrimonio inicial de "
+                        f"${saldo_inicial_periodo:,.0f}. Así se aprecia con claridad cuánto ha subido "
+                        "o bajado el patrimonio respecto a ese punto de partida. Las barras se enlazan desde el cierre de cada mes anterior."
+                    )
+                    st.plotly_chart(
+                        formato_tooltips_patrimonio(fig_pat_mensual),
+                        use_container_width=True,
+                        key="evolucion_patrimonio_base_inicial_v4",
+                    )
+
+                    ultimo_estado = str(patrimonio_mensual.iloc[-1]["Estado"])
+                    ultimo_cambio = float(patrimonio_mensual.iloc[-1]["Movimiento mensual"])
+                    if ultimo_estado == "Subió":
+                        st.success(
+                            f"📈 Este mes agregaste ${ultimo_cambio:,.0f} a tu patrimonio. "
+                            "Ese avance se acumula y fortalece tu base financiera."
+                        )
+                    elif ultimo_estado == "Bajó":
+                        st.warning(
+                            f"📉 Este mes el patrimonio acumulado disminuyó ${abs(ultimo_cambio):,.0f}. "
+                            "Revisa si corresponde a una deuda, retiro, pérdida o ajuste de valoración."
+                        )
+                    else:
+                        st.info(
+                            "⏸️ Este mes no hubo movimiento: el patrimonio conservó todo lo acumulado. "
+                            "Mantenerlo también es una forma de proteger el progreso."
+                        )
+
+                    # ======================================================
+                    # EXPLICACIÓN DEL CRECIMIENTO DEL PATRIMONIO
+                    # Descompone la variación del periodo por categoría para
+                    # responder visualmente qué impulsó o redujo el patrimonio.
+                    # ======================================================
+                    st.markdown("---")
+                    st.markdown("#### 🧭 ¿Qué hizo crecer o reducir tu patrimonio?")
+                    st.caption(
+                        "Esta sección distribuye el cambio del periodo entre las categorías registradas en la hoja Patrimonio. "
+                        "Los valores positivos impulsan el patrimonio y los negativos lo reducen."
+                    )
+
+                    aportes_periodo = patrimonio_hist[
+                        patrimonio_hist["Fecha"].between(fecha_desde_ts, fecha_hasta_ts)
+                    ].copy()
+                    aportes_periodo["Categoría"] = (
+                        aportes_periodo["Categoría"]
+                        .fillna("Sin categoría")
+                        .astype(str)
+                        .str.strip()
+                        .replace("", "Sin categoría")
+                    )
+
+                    contribucion_categoria = (
+                        aportes_periodo.groupby("Categoría", as_index=False)["Valor neto"]
+                        .sum()
+                        .rename(columns={"Valor neto": "Contribución"})
+                    )
+                    contribucion_categoria = contribucion_categoria[
+                        contribucion_categoria["Contribución"].abs() > tolerancia_estable
+                    ].copy()
+                    contribucion_categoria["Impacto absoluto"] = contribucion_categoria["Contribución"].abs()
+                    contribucion_categoria["Estado"] = contribucion_categoria["Contribución"].apply(
+                        lambda valor: "Impulsó" if valor > 0 else "Redujo"
+                    )
+
+                    if contribucion_categoria.empty:
+                        st.info("No hay movimientos por categoría dentro del periodo seleccionado.")
+                    else:
+                        positivos = contribucion_categoria[contribucion_categoria["Contribución"] > 0].copy()
+                        negativos = contribucion_categoria[contribucion_categoria["Contribución"] < 0].copy()
+                        total_impulsos = float(positivos["Contribución"].sum())
+                        total_reducciones = abs(float(negativos["Contribución"].sum()))
+                        aporte_principal = (
+                            positivos.sort_values("Contribución", ascending=False).iloc[0]
+                            if not positivos.empty else None
+                        )
+                        freno_principal = (
+                            negativos.sort_values("Contribución", ascending=True).iloc[0]
+                            if not negativos.empty else None
+                        )
+
+                        q1, q2, q3 = st.columns(3)
+                        tarjeta_perfil_patrimonio(q1, '📊 Impulsos positivos', f"${total_impulsos:,.0f}")
+                        tarjeta_perfil_patrimonio(q2, '📊 Reducciones', f"-${total_reducciones:,.0f}" if total_reducciones else "$0")
+                        tarjeta_perfil_patrimonio(q3, '📊 Resultado neto explicado',
+                            f"${contribucion_categoria['Contribución'].sum():+,.0f}",
+                        )
+
+                        # 1. Cascada: del patrimonio inicial al patrimonio final.
+                        contribucion_ordenada = contribucion_categoria.sort_values(
+                            "Contribución", ascending=False
+                        )
+                        waterfall_x = ["Patrimonio inicial"] + contribucion_ordenada["Categoría"].tolist() + ["Patrimonio final"]
+                        waterfall_y = [saldo_inicial_periodo] + contribucion_ordenada["Contribución"].tolist() + [saldo_final_periodo]
+                        waterfall_measure = ["absolute"] + ["relative"] * len(contribucion_ordenada) + ["total"]
+                        waterfall_text = [
+                            f"${saldo_inicial_periodo:,.0f}"
+                        ] + [
+                            f"{valor:+,.0f}" for valor in contribucion_ordenada["Contribución"]
+                        ] + [f"${saldo_final_periodo:,.0f}"]
+
+                        fig_cascada_pat = go.Figure(go.Waterfall(
+                            orientation="v",
+                            measure=waterfall_measure,
+                            x=waterfall_x,
+                            y=waterfall_y,
+                            text=waterfall_text,
+                            textposition="outside",
+                            connector={"line": {"color": "rgba(148,163,184,0.45)", "dash": "dot"}},
+                            increasing={"marker": {"color": "#22C55E"}},
+                            decreasing={"marker": {"color": "#EF4444"}},
+                            totals={"marker": {"color": "#38BDF8"}},
+                            hovertemplate="<b>📅 %{x}</b><br>⚡ Impacto: $%{y:+,.0f}<extra></extra>",
+                        ))
+                        fig_cascada_pat.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="#000000",
+                            plot_bgcolor="#000000",
+                            height=500,
+                            title="Puente del patrimonio: qué explicó el cambio",
+                            showlegend=False,
+                            xaxis_title="Factor",
+                            yaxis=dict(title="Patrimonio", tickprefix="$", tickformat=",.0f"),
+                            margin=dict(t=70, b=90, l=70, r=30),
+                        )
+                        st.plotly_chart(
+                            formato_tooltips_patrimonio(fig_cascada_pat),
+                            use_container_width=True,
+                            key="cascada_impulsores_patrimonio_v1",
+                        )
+
+                        # 2. Treemap y motor de crecimiento lado a lado.
+                        col_imp1, col_imp2 = st.columns(2)
+                        with col_imp1:
+                            fig_treemap_impulsores = px.treemap(
+                                contribucion_categoria,
+                                path=["Estado", "Categoría"],
+                                values="Impacto absoluto",
+                                color="Contribución",
+                                color_continuous_scale=[
+                                    [0.0, "#EF4444"],
+                                    [0.5, "#64748B"],
+                                    [1.0, "#22C55E"],
+                                ],
+                                color_continuous_midpoint=0,
+                                custom_data=["Contribución", "Estado"],
+                                title="Mapa de contribución",
+                            )
+                            fig_treemap_impulsores.update_traces(
+                                texttemplate="<b>🏷️ %{label}</b><br>$%{customdata[0]:+,.0f}",
+                                hovertemplate=(
+                                    "<b>🏷️ %{label}</b><br>"
+                                    "⚡ Impacto: $%{customdata[0]:+,.0f}<br>"
+                                    "Resultado: %{customdata[1]}<extra></extra>"
+                                ),
+                            )
+                            fig_treemap_impulsores.update_layout(
+                                template="plotly_dark",
+                                paper_bgcolor="#000000",
+                                margin=dict(t=55, b=10, l=10, r=10),
+                                height=440,
+                                coloraxis_colorbar=dict(title="Impacto"),
+                            )
+                            st.plotly_chart(
+                                formato_tooltips_patrimonio(fig_treemap_impulsores),
+                                use_container_width=True,
+                                key="treemap_impulsores_patrimonio_v1",
+                            )
+
+                        with col_imp2:
+                            if positivos.empty:
+                                st.info("No hubo impulsores positivos en el periodo seleccionado.")
+                            else:
+                                motor = positivos.sort_values("Contribución", ascending=True).tail(6).copy()
+                                motor["Participación %"] = (
+                                    motor["Contribución"] / total_impulsos * 100
+                                    if total_impulsos else 0
+                                )
+                                fig_motor_pat = go.Figure(go.Bar(
+                                    x=motor["Participación %"],
+                                    y=motor["Categoría"],
+                                    orientation="h",
+                                    marker=dict(color="#22C55E"),
+                                    customdata=motor[["Contribución"]],
+                                    text=motor["Participación %"].map(lambda x: f"{x:.1f}%"),
+                                    textposition="outside",
+                                    hovertemplate=(
+                                        "<b>🏠 %{y}</b><br>"
+                                        "Aporte: $%{customdata[0]:,.0f}<br>"
+                                        "📊 Participación: %{x:.1f}%<extra></extra>"
+                                    ),
+                                ))
+                                fig_motor_pat.update_layout(
+                                    template="plotly_dark",
+                                    paper_bgcolor="#000000",
+                                    plot_bgcolor="#000000",
+                                    title="Motor del crecimiento",
+                                    height=440,
+                                    xaxis=dict(title="Participación en los impulsos positivos", ticksuffix="%"),
+                                    yaxis=dict(title=""),
+                                    margin=dict(t=55, b=55, l=110, r=35),
+                                    showlegend=False,
+                                )
+                                st.plotly_chart(
+                                    formato_tooltips_patrimonio(fig_motor_pat),
+                                    use_container_width=True,
+                                    key="motor_crecimiento_patrimonio_v1",
+                                )
+
+                        if aporte_principal is not None:
+                            participacion_principal = (
+                                float(aporte_principal["Contribución"]) / total_impulsos * 100
+                                if total_impulsos else 0
+                            )
+                            mensaje = (
+                                f"🏆 El principal impulsor fue **{aporte_principal['Categoría']}**, "
+                                f"con un aporte de **${float(aporte_principal['Contribución']):,.0f}**, "
+                                f"equivalente al **{participacion_principal:.1f}%** de todos los movimientos positivos."
+                            )
+                            if freno_principal is not None:
+                                mensaje += (
+                                    f" El mayor freno fue **{freno_principal['Categoría']}**, "
+                                    f"que redujo el patrimonio en **${abs(float(freno_principal['Contribución'])):,.0f}**."
+                                )
+                            st.success(mensaje)
+
+            resumen_tipo = patrimonio.groupby("Tipo", as_index=False)["Valor neto"].sum()
+            col1, col2 = st.columns(2, vertical_alignment="center")
+            with col1:
+                from modules.anillos_neon import mostrar_anillo_neon
+                from modules.patrimonio_noche import preparar_indicador_patrimonio
+                figura_composicion = preparar_indicador_patrimonio(fig_patrimonio_donut(resumen_tipo))
+                mostrar_anillo_neon(
+                    figura_composicion,
+                    float(sum(figura_composicion.data[0].values)) if figura_composicion.data else 0,
+                    "Composición: activos vs pasivos", "pat_composicion_neon_v20", patrimonio=True,
+                    ajustar_marco=True,
+                    centro="COMPOSICIÓN", subtitulo="ACTIVOS Y PASIVOS", etiqueta_total="ACTIVOS + PASIVOS",
+                )
+            with col2:
+                if patrimonio_mensual.empty:
+                    st.info("No hay suficientes fechas mensuales para mostrar la tendencia del patrimonio.")
+                else:
+                    tendencia_pat = patrimonio_mensual.copy().sort_values("Periodo")
+                    tendencia_pat["Mes gráfico"] = tendencia_pat["Periodo"].dt.to_timestamp()
+                    meses_etiqueta_pat = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+                    etiquetas_tendencia_pat = [f"{meses_etiqueta_pat[d.month-1]} {d.year}" for d in tendencia_pat["Mes gráfico"]]
+                    paso_etiquetas_pat = max(1, int(np.ceil(len(tendencia_pat) / 7)))
+                    datos_hover_pat = [[
+                        etiquetas_tendencia_pat[i],
+                        "$" + f"{r['Patrimonio acumulado']:,.0f}".replace(",", "."),
+                        "$" + f"{r['Movimiento mensual']:+,.0f}".replace(",", "."),
+                        str(r['Estado']),
+                    ] for i, (_, r) in enumerate(tendencia_pat.iterrows())]
+                    fig_tendencia_pat = go.Figure(go.Scatter(
+                        x=tendencia_pat["Mes gráfico"], y=tendencia_pat["Patrimonio acumulado"],
+                        mode="lines+markers", name="Patrimonio acumulado",
+                        line=dict(width=3, color="#38BDF8", shape="linear"),
+                        marker=dict(size=9, color=["#00FF88" if v>=0 else "#FF3B4F" for v in tendencia_pat["Movimiento mensual"]],
+                            line=dict(color="#07111F", width=2)),
+                        fill="tozeroy", fillcolor="rgba(56,189,248,0.12)",
+                        customdata=datos_hover_pat,
+                        hovertemplate="<b>%{customdata[0]}</b><br>Patrimonio: <b>%{customdata[1]}</b><br>Movimiento del mes: %{customdata[2]}<br>%{customdata[3]}<extra></extra>",
+                    ))
+                    fig_tendencia_pat.update_layout(
+                        template="plotly_dark", height=460, separators=",.",
+                        paper_bgcolor="#07111F", plot_bgcolor="#07111F",
+                        title=dict(text="Tendencia mensual del patrimonio", x=.04, y=.95,
+                            xanchor="left", font=dict(size=17, color="#F8FAFC")),
+                        font=dict(family="Arial, sans-serif", color="#B4C9D9", size=11),
+                        xaxis=dict(title=None, tickmode="array",
+                            tickvals=tendencia_pat["Mes gráfico"].tolist()[::paso_etiquetas_pat],
+                            ticktext=etiquetas_tendencia_pat[::paso_etiquetas_pat],
+                            tickangle=-25, showgrid=False, automargin=True, linecolor="#284562"),
+                        yaxis=dict(title="Patrimonio (COP)", tickprefix="$", tickformat=",.0f",
+                            nticks=5, automargin=True, gridcolor="rgba(148,163,184,.12)",
+                            zerolinecolor="#284562"),
+                        margin=dict(t=80, b=70, l=105, r=35), hovermode="closest",
+                        hoverlabel=dict(bgcolor="#111F33", bordercolor="#38BDF8",
+                            font=dict(size=13, color="#F8FAFC"), align="left"),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(
+                        formato_tooltips_patrimonio(fig_tendencia_pat),
+                        use_container_width=True, theme=None,
+                        key="tendencia_mensual_patrimonio_resumen_v1",
+                        config={"displaylogo": False},
+                    )
+                    st.caption("Los puntos verdes indican meses con movimiento positivo o cero; los rojos, movimiento negativo. Pasa el cursor para consultar los importes completos.")
+
+            st.markdown("#### Mapa del patrimonio")
+            from modules.patrimonio_noche import crear_tarjetas_patrimonio
+            import streamlit.components.v1 as componentes_mapa_patrimonio
+            html_mapa_pat, altura_mapa_pat = crear_tarjetas_patrimonio(fig_patrimonio_treemap(patrimonio))
+            if html_mapa_pat:
+                st.markdown(
+                    f'<style>.st-key-mapa_patrimonio_tarjetas_v20 iframe {{width:100% !important;'
+                    f'height:auto !important;aspect-ratio:1200 / {altura_mapa_pat};'
+                    f'display:block;border:0;max-height:none !important;}}</style>',unsafe_allow_html=True,
+                )
+                with st.container(key="mapa_patrimonio_tarjetas_v20"):
+                    componentes_mapa_patrimonio.html(html_mapa_pat,height=altura_mapa_pat,scrolling=False)
+            else:
+                st.info("No hay valores para mostrar el mapa del patrimonio.")
+
+            from modules.anillos_neon import mostrar_anillo_neon
+            fig_liquidez_activos = fig_patrimonio_liquidez(patrimonio)
+            fig_categoria_activos = fig_patrimonio_concentracion_categoria(patrimonio)
+            if fig_liquidez_activos.data:
+                paleta_liquidez = {"MUY ALTA": "#00E5A0", "ALTA": "#38BDF8", "MEDIA": "#168BFF", "BAJA": "#F59E0B", "MUY BAJA": "#A78BFA"}
+                fig_liquidez_activos.update_traces(marker=dict(colors=[
+                    paleta_liquidez.get(str(nombre).upper(), "#38BDF8")
+                    for nombre in fig_liquidez_activos.data[0].labels
+                ]))
+            col3, col4 = st.columns(2)
+            with col3:
+                mostrar_anillo_neon(
+                    fig_liquidez_activos,
+                    float(sum(fig_liquidez_activos.data[0].values)) if fig_liquidez_activos.data else 0,
+                    "Activos por liquidez", "patrimonio_liquidez_neon_v20", patrimonio=True,
+                    ajustar_marco=True,
+                )
+            with col4:
+                mostrar_anillo_neon(
+                    fig_categoria_activos,
+                    float(sum(fig_categoria_activos.data[0].values)) if fig_categoria_activos.data else 0,
+                    "Concentración por categoría", "patrimonio_categoria_neon_v20", patrimonio=True,
+                    ajustar_marco=True,
+                )
+
+            encabezado_moneda, encabezado_inversiones = st.columns(2)
+            with encabezado_moneda:
+                st.markdown("### 🌎 Patrimonio por moneda")
+                st.caption("Composición de activos por moneda y por activo, usando su equivalente en COP.")
+            with encabezado_inversiones:
+                st.markdown("### 💼 Inversiones por moneda")
+                st.caption("Solo Fondo de Emergencia e Inversiones; compara los valores en COP.")
+            activos_monedas = patrimonio.loc[
+                patrimonio["Tipo"].map(normalizar).eq("ACTIVO")
+            ].copy()
+            if activos_monedas.empty:
+                st.info("No hay activos para construir la distribución por moneda.")
+            else:
+                activos_monedas["Moneda"] = activos_monedas.get(
+                    "Moneda", pd.Series("COP", index=activos_monedas.index)
+                ).fillna("COP").astype(str).str.upper().str.strip()
+                activos_monedas["Valor original"] = pd.to_numeric(
+                    activos_monedas.get("Valor original", activos_monedas["Valor actual"]),
+                    errors="coerce",
+                ).fillna(0.0)
+                activos_monedas["Porcentaje"] = pd.to_numeric(
+                    activos_monedas.get("Porcentaje", 1.0), errors="coerce"
+                ).fillna(1.0)
+                activos_monedas["Saldo original propio"] = (
+                    activos_monedas["Valor original"] * activos_monedas["Porcentaje"]
+                )
+                activos_monedas["Equivalente COP"] = pd.to_numeric(
+                    activos_monedas["Valor neto"], errors="coerce"
+                ).fillna(0.0).clip(lower=0.0)
+                activos_monedas["Tasa a COP"] = pd.to_numeric(
+                    activos_monedas.get("Tasa a COP", pd.NA), errors="coerce"
+                )
+                resumen_monedas = (
+                    activos_monedas.groupby("Moneda", as_index=False)
+                    .agg(
+                        **{
+                            "Saldo original": ("Saldo original propio", "sum"),
+                            "Equivalente COP": ("Equivalente COP", "sum"),
+                            "Tasa a COP": ("Tasa a COP", "max"),
+                            "Activos": ("Descripción", "count"),
+                        }
+                    )
+                    .sort_values("Equivalente COP", ascending=True)
+                )
+
+                simbolos_moneda = {"COP": "$", "USD": "US$", "EUR": "€", "GBP": "£"}
+                resumen_monedas["Saldo mostrado"] = resumen_monedas.apply(
+                    lambda fila: (
+                        f"{simbolos_moneda.get(fila['Moneda'], '')}{float(fila['Saldo original']):,.2f} "
+                        f"{fila['Moneda']}"
+                    ),
+                    axis=1,
+                )
+                resumen_monedas["Conversión"] = resumen_monedas["Tasa a COP"].apply(
+                    lambda tasa: f"1 = ${float(tasa):,.2f} COP" if pd.notna(tasa) else "Sin tasa a COP"
+                )
+                resumen_monedas["Equivalente mostrado"] = resumen_monedas.apply(
+                    lambda fila: (
+                        f"${float(fila['Equivalente COP']):,.0f} COP"
+                        if pd.notna(fila["Tasa a COP"]) else "Pendiente de tasa a COP"
+                    ),
+                    axis=1,
+                )
+                monedas_grafico = resumen_monedas[
+                    resumen_monedas["Equivalente COP"].gt(0)
+                ].sort_values("Equivalente COP", ascending=True).copy()
+
+                if not monedas_grafico.empty:
+                    # Diagrama solar: centro = total, segundo nivel = moneda, exterior = activo.
+                    activos_solares = activos_monedas.loc[
+                        activos_monedas["Equivalente COP"].gt(0)
+                    ].copy()
+                    colores_monedas = ["#00D9A6", "#38BDF8", "#A78BFA", "#FBBF24", "#F472B6", "#FB7185"]
+                    ids_solares = ["patrimonio_total"]
+                    etiquetas_solares = ["Patrimonio"]
+                    padres_solares = [""]
+                    valores_solares = [float(activos_solares["Equivalente COP"].sum())]
+                    colores_solares = ["#0F172A"]
+                    detalle_solar = ["Total de activos convertido a COP"]
+
+                    for posicion_moneda, moneda_row in monedas_grafico.reset_index(drop=True).iterrows():
+                        moneda = str(moneda_row["Moneda"])
+                        id_moneda = f"moneda_{moneda}"
+                        color_moneda = colores_monedas[posicion_moneda % len(colores_monedas)]
+                        nombre_moneda = {
+                            "COP": "Pesos colombianos (COP)",
+                            "USD": "Dólares estadounidenses (USD)",
+                            "EUR": "Euros (EUR)",
+                            "GBP": "Libras esterlinas (GBP)",
+                        }.get(moneda, moneda)
+                        ids_solares.append(id_moneda)
+                        etiquetas_solares.append(nombre_moneda)
+                        padres_solares.append("patrimonio_total")
+                        valores_solares.append(float(moneda_row["Equivalente COP"]))
+                        colores_solares.append(color_moneda)
+                        detalle_solar.append(
+                            f"Saldo original: {moneda_row['Saldo mostrado']}<br>"
+                            f"Equivalente: {moneda_row['Equivalente mostrado']}<br>"
+                            f"Activos incluidos: {int(moneda_row['Activos'])}"
+                        )
+
+                        activos_moneda = activos_solares.loc[
+                            activos_solares["Moneda"].eq(moneda)
+                        ].reset_index(drop=True)
+                        for posicion_activo, activo_row in activos_moneda.iterrows():
+                            # La subcategoría identifica el activo (p. ej., Franyer, ARQ, AMAZON);
+                            # la descripción puede contener solo la moneda y se usa como respaldo.
+                            descripcion = str(activo_row.get("Subcategoría", "")).strip()
+                            if normalizar(descripcion) in {"", "NAN", "SIN SUBCATEGORIA", "SIN CLASIFICAR"}:
+                                descripcion = str(activo_row.get("Descripción", "Activo sin nombre")).strip()
+                            descripcion = descripcion or "Activo sin nombre"
+                            ids_solares.append(f"{id_moneda}_activo_{posicion_activo}")
+                            etiquetas_solares.append(descripcion)
+                            padres_solares.append(id_moneda)
+                            valores_solares.append(float(activo_row["Equivalente COP"]))
+                            colores_solares.append(color_moneda)
+                            detalle_solar.append(
+                                f"Moneda: {moneda}<br>"
+                                f"Saldo original: {float(activo_row['Saldo original propio']):,.2f} {moneda}<br>"
+                                f"Equivalente: ${float(activo_row['Equivalente COP']):,.0f} COP"
+                            )
+
+                    fig_monedas_pat = go.Figure(go.Sunburst(
+                        ids=ids_solares,
+                        labels=etiquetas_solares,
+                        parents=padres_solares,
+                        values=valores_solares,
+                        branchvalues="total",
+                        maxdepth=2,
+                        insidetextorientation="radial",
+                        marker=dict(colors=colores_solares, line=dict(color="#020617", width=2)),
+                        customdata=detalle_solar,
+                        hovertemplate="<b>%{label}</b><br>%{customdata}<br>Participación: %{percentParent:.1%}<extra></extra>",
+                    ))
+                    fig_monedas_pat.update_layout(
+                        template="plotly_dark",
+                        height=520,
+                        paper_bgcolor="#000000",
+                        plot_bgcolor="#000000",
+                        title="Patrimonio por moneda y activo",
+                        margin=dict(t=65, b=25, l=25, r=25),
+                        hoverlabel=dict(bgcolor="#0F172A", font=dict(color="#F8FAFC")),
+                    )
+                    col_graf_moneda, col_graf_inversiones = st.columns(2)
+                    with col_graf_moneda:
+                        from modules.patrimonio_noche import modernizar_monedas
+                        st.plotly_chart(
+                            modernizar_monedas(formato_tooltips_patrimonio(fig_monedas_pat), "Patrimonio por moneda y activo", colores_vivos=True),
+                            use_container_width=True,
+                            key="patrimonio_por_moneda_v1",
+                        )
+                    with col_graf_inversiones:
+                        categorias_inversion = activos_monedas["Categoría"].map(normalizar)
+                        inversiones_monedas = activos_monedas.loc[
+                            categorias_inversion.str.contains(
+                                "FONDO DE EMERGENCIA|INVERSION", regex=True, na=False
+                            )
+                        ].copy()
+                        resumen_inversiones = (
+                            inversiones_monedas.groupby("Moneda", as_index=False)
+                            .agg(
+                                **{
+                                    "Equivalente COP": ("Equivalente COP", "sum"),
+                                    "Activos": ("Descripción", "count"),
+                                }
+                            )
+                            .sort_values("Equivalente COP", ascending=True)
+                        ) if not inversiones_monedas.empty else pd.DataFrame()
+
+                        if not resumen_inversiones.empty:
+                            ids_inversiones = ["inversiones_total"]
+                            etiquetas_inversiones = ["Inversiones"]
+                            padres_inversiones = [""]
+                            valores_inversiones = [float(inversiones_monedas["Equivalente COP"].sum())]
+                            colores_inversiones = ["#111827"]
+                            detalle_inversiones = ["Fondo de Emergencia e Inversiones · equivalente en COP"]
+                            paleta_inversiones = ["#A78BFA", "#22D3EE", "#34D399", "#FBBF24"]
+
+                            for posicion_moneda, moneda_row in resumen_inversiones.reset_index(drop=True).iterrows():
+                                moneda = str(moneda_row["Moneda"])
+                                id_moneda = f"inversion_{moneda}"
+                                color_moneda = paleta_inversiones[posicion_moneda % len(paleta_inversiones)]
+                                etiqueta_moneda = {
+                                    "COP": "Pesos colombianos (COP)",
+                                    "USD": "Dólares estadounidenses (USD)",
+                                    "EUR": "Euros (EUR)",
+                                    "GBP": "Libras esterlinas (GBP)",
+                                }.get(moneda, moneda)
+                                ids_inversiones.append(id_moneda)
+                                etiquetas_inversiones.append(etiqueta_moneda)
+                                padres_inversiones.append("inversiones_total")
+                                valores_inversiones.append(float(moneda_row["Equivalente COP"]))
+                                colores_inversiones.append(color_moneda)
+                                detalle_inversiones.append(
+                                    f"Capital invertido: ${float(moneda_row['Equivalente COP']):,.0f} COP<br>"
+                                    f"Activos incluidos: {int(moneda_row['Activos'])}"
+                                )
+
+                                activos_moneda = inversiones_monedas.loc[
+                                    inversiones_monedas["Moneda"].eq(moneda)
+                                ].reset_index(drop=True)
+                                for posicion_activo, activo_row in activos_moneda.iterrows():
+                                    etiqueta_activo = str(activo_row.get("Subcategoría", "")).strip()
+                                    if normalizar(etiqueta_activo) in {"", "NAN", "SIN SUBCATEGORIA", "SIN CLASIFICAR"}:
+                                        etiqueta_activo = str(activo_row.get("Descripción", "Activo sin nombre")).strip()
+                                    etiqueta_activo = etiqueta_activo or "Activo sin nombre"
+                                    ids_inversiones.append(f"{id_moneda}_activo_{posicion_activo}")
+                                    etiquetas_inversiones.append(etiqueta_activo)
+                                    padres_inversiones.append(id_moneda)
+                                    valores_inversiones.append(float(activo_row["Equivalente COP"]))
+                                    colores_inversiones.append(color_moneda)
+                                    detalle_inversiones.append(
+                                        f"Moneda: {moneda}<br>"
+                                        f"Equivalente: ${float(activo_row['Equivalente COP']):,.0f} COP"
+                                    )
+
+                            fig_inversiones_moneda = go.Figure(go.Sunburst(
+                                ids=ids_inversiones,
+                                labels=etiquetas_inversiones,
+                                parents=padres_inversiones,
+                                values=valores_inversiones,
+                                branchvalues="total",
+                                maxdepth=2,
+                                insidetextorientation="radial",
+                                marker=dict(colors=colores_inversiones, line=dict(color="#020617", width=2)),
+                                customdata=detalle_inversiones,
+                                hovertemplate="<b>%{label}</b><br>%{customdata}<br>Participación: %{percentParent:.1%}<extra></extra>",
+                            ))
+                            fig_inversiones_moneda.update_layout(
+                                template="plotly_dark",
+                                height=520,
+                                paper_bgcolor="#000000",
+                                plot_bgcolor="#000000",
+                                title="Inversiones por moneda y activo",
+                                margin=dict(t=65, b=25, l=25, r=25),
+                            )
+                            st.plotly_chart(
+                                modernizar_monedas(formato_tooltips_patrimonio(fig_inversiones_moneda), "Inversiones por moneda y activo"),
+                                use_container_width=True,
+                                key="inversiones_por_moneda_v1",
+                            )
+                        else:
+                            st.info("No hay activos clasificados como Fondo de Emergencia o Inversiones.")
+
+                monedas_sin_tasa = resumen_monedas[
+                    resumen_monedas["Tasa a COP"].isna()
+                ]["Moneda"].tolist()
+                if monedas_sin_tasa:
+                    st.warning(
+                        "Estas monedas aparecen en el resumen, pero necesitan una tasa para convertirlas a COP: "
+                        + ", ".join(monedas_sin_tasa)
+                        + ". Puedes agregar la columna 'Tasa a COP' en la hoja Patrimonio."
+                    )
+
+                with st.expander("Ver saldos originales por moneda"):
+                    tabla_monedas = resumen_monedas[[
+                        "Moneda", "Saldo mostrado", "Equivalente COP", "Conversión", "Activos"
+                    ]].copy()
+                    tabla_monedas["Equivalente COP"] = tabla_monedas["Equivalente COP"].map(
+                        lambda valor: f"${valor:,.0f}"
+                    )
+                    st.dataframe(tabla_monedas, use_container_width=True, hide_index=True)
+
+            st.markdown("#### Detalle de patrimonio")
+            with st.expander("Ver tabla", expanded=False):
+                st.dataframe(
+                    patrimonio.sort_values(["Tipo", "Categoría", "Valor neto"], ascending=[True, True, False]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            csv_patrimonio = patrimonio.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Descargar patrimonio procesado (CSV)",
+                csv_patrimonio,
+                "patrimonio_procesado.csv",
+                "text/csv",
+            )
+
+    if pestana_activa == etiquetas_pestanas[7]:
+        # Reubica el borde existente delante del lienzo sin añadir otro marco.
+        st.markdown("""<style>
+        [data-testid="stPlotlyChart"] {
+            position:relative;box-sizing:border-box !important;
+            padding:0 !important;border:0 !important;
+            width:100%;max-width:100%;min-width:0;
+            border-radius:18px;overflow:hidden;isolation:isolate;
+        }
+        [data-testid="stPlotlyChart"]::after {
+            content:"";position:absolute;inset:0;box-sizing:border-box;
+            border:1px solid rgba(0,240,255,.55);border-radius:18px;
+            pointer-events:none;z-index:10;
+        }
+        [data-testid="stPlotlyChart"] > div {
+            box-sizing:border-box;width:100% !important;max-width:100%;min-width:0;
+        }
+        </style>""", unsafe_allow_html=True)
+        contexto_pestana(
+            "¿Mi dinero está alineado con mi bienestar?",
+            "Relaciona ingresos, tiempo, eficiencia laboral, diversificación y patrimonio. Es una lectura financiera del bienestar laboral; no mide satisfacción psicológica.",
+        )
+        st.markdown("## Trabajo, tiempo y bienestar financiero")
+        st.caption(
+            "Esta pestaña usa los trabajos registrados en **Ingresos**: fecha, valor, empresa, mes, categoría, horas y valor hora. "
+            "Todos los resultados respetan los filtros globales Desde/Hasta."
+        )
+
+        gasto_mensual_promedio = score_actual["gasto_mensual"]
+        gasto_promedio_diario_fondo = gasto_mensual_promedio / 30 if gasto_mensual_promedio else 0.0
+        fondo_emergencia_valor = score_actual["fondo"]
+        meta_fondo_emergencia = gasto_mensual_promedio * 3
+        avance_fondo_emergencia = (
+            fondo_emergencia_valor / meta_fondo_emergencia * 100
+            if meta_fondo_emergencia
+            else 0.0
+        )
+        avance_fondo_emergencia = normalizar_pct_0_100(avance_fondo_emergencia)
+        avance_fondo_emergencia_limitado = min(max(avance_fondo_emergencia, 0), 100)
+        faltante_fondo_emergencia = max(meta_fondo_emergencia - fondo_emergencia_valor, 0.0)
+        meses_emergencia = (
+            fondo_emergencia_valor / gasto_mensual_promedio
+            if gasto_mensual_promedio
+            else 0.0
+        )
+        dias_cubiertos_fondo = (
+            fondo_emergencia_valor / gasto_promedio_diario_fondo
+            if gasto_promedio_diario_fondo
+            else 0.0
+        )
+
+        # ======================================================
+        # 10. FONDO DE EMERGENCIA
+        # ======================================================
+        st.divider()
+        st.markdown("### 🛡️ Fondo de emergencia")
+        estado_fondo = estado_meta(avance_fondo_emergencia)
+
+        fe1, fe2, fe3, fe4, fe5 = st.columns(5)
+        tarjeta_perfil_felicidad(fe1, "💰 Fondo actual", f"${fondo_emergencia_valor:,.0f}")
+        tarjeta_perfil_felicidad(fe2, "🎯 Meta 3 meses", f"${meta_fondo_emergencia:,.0f}")
+        tarjeta_perfil_felicidad(fe3, "📊 Cumplimiento", f"{avance_fondo_emergencia:.1f}%", estado_fondo)
+        tarjeta_perfil_felicidad(fe4, "📅 Días cubiertos",
+            f"{dias_cubiertos_fondo:,.0f} días",
+            f"Gasto diario ${gasto_promedio_diario_fondo:,.0f}",
+        )
+        tarjeta_perfil_felicidad(fe5, "⚠️ Faltante",
+            f"${faltante_fondo_emergencia:,.0f}",
+            f"{meses_emergencia:.1f} meses cubiertos",
+        )
+
+        st.progress(avance_fondo_emergencia_limitado / 100)
+        fig_fondo = fig_progreso_meta(
+            "Fondo de emergencia",
+            fondo_emergencia_valor,
+            meta_fondo_emergencia,
+            faltante_fondo_emergencia,
+            texto_meta="Meta 3 meses",
+        )
+        fig_fondo.update_traces(
+            customdata=[[
+                fondo_emergencia_valor,
+                meta_fondo_emergencia,
+                avance_fondo_emergencia,
+                faltante_fondo_emergencia,
+            ]],
+            hovertemplate=(
+                "<b>🛡️ Fondo de emergencia</b><br>"
+                "Tramo: %{fullData.name}<br>"
+                "💰 Valor actual: $%{customdata[0]:,.0f}<br>"
+                "🎯 Objetivo: $%{customdata[1]:,.0f}<br>"
+                "📊 Cumplimiento: %{customdata[2]:.1f}%<br>"
+                "⚠️ Faltante: $%{customdata[3]:,.0f}"
+                "<extra></extra>"
+            ),
+        )
+        fig_fondo.update_traces(marker_color="#00FF00", selector=dict(name="Actual"))
+        fig_fondo.update_traces(marker_color="#FF0000", selector=dict(name="Faltante"))
+        fig_fondo.update_layout(height=260, barcornerradius="50%", bargap=0.32)
+        st.plotly_chart(fig_fondo, use_container_width=True)
+
+        # ======================================================
+        # 11. METAS FINANCIERAS: CUMPLIMIENTO 0–100
+        # ======================================================
+        st.divider()
+        st.markdown("### 🏁 Metas financieras")
+        st.caption(
+            "El porcentaje de cumplimiento se muestra siempre en una escala de 0 a 100."
+        )
+
+        if metas.empty:
+            st.info(
+                "ℹ️ No se encontró la hoja **Metas** o está vacía. "
+                "Agrega Meta, Objetivo y Actual para evaluar el cumplimiento."
+            )
+        else:
+            for _, meta_row in metas.iterrows():
+                nombre_meta = (
+                    str(meta_row["Meta"]).strip()
+                    if pd.notna(meta_row["Meta"]) and str(meta_row["Meta"]).strip()
+                    else "Meta sin nombre"
+                )
+                objetivo_meta = float(meta_row["Objetivo"])
+                actual_meta = float(meta_row["Actual"])
+
+                avance_original = meta_row.get("Avance", 0.0)
+                avance_meta_pct = normalizar_pct_0_100(avance_original)
+                if objetivo_meta > 0:
+                    avance_calculado = normalizar_pct_0_100(actual_meta / objetivo_meta)
+                    # Se prioriza el cálculo directo cuando la columna Avance está vacía
+                    # o no coincide razonablemente con Objetivo y Actual.
+                    if (
+                        pd.isna(avance_original)
+                        or abs(avance_meta_pct - avance_calculado) > 1.0
+                    ):
+                        avance_meta_pct = avance_calculado
+
+                avance_meta_limitado = min(max(avance_meta_pct, 0), 100)
+                faltante_meta = max(objetivo_meta - actual_meta, 0)
+                estado_meta_actual = estado_meta(avance_meta_pct)
+
+                st.markdown(f"#### 🎯 {nombre_meta}")
+                m1, m2, m3, m4 = st.columns(4)
+                tarjeta_perfil_felicidad(m1, "💰 Valor actual", f"${actual_meta:,.0f}")
+                tarjeta_perfil_felicidad(m2, "🏁 Valor objetivo", f"${objetivo_meta:,.0f}")
+                tarjeta_perfil_felicidad(m3, "📊 Porcentaje de cumplimiento",
+                    f"{avance_meta_pct:.1f}%",
+                    estado_meta_actual,
+                )
+                tarjeta_perfil_felicidad(m4, "⚠️ Faltante", f"${faltante_meta:,.0f}")
+
+                st.progress(avance_meta_limitado / 100)
+                fig_meta = fig_progreso_meta(
+                    nombre_meta,
+                    actual_meta,
+                    objetivo_meta,
+                    faltante_meta,
+                )
+                fig_meta.update_traces(
+                    hovertemplate=(
+                        f"<b>🎯 Meta: {nombre_meta}</b><br>"
+                        "💰 Valor actual: $%{x:,.0f}<br>"
+                        f"🏁 Objetivo: ${objetivo_meta:,.0f}<br>"
+                        f"📊 Cumplimiento: {avance_meta_pct:.1f}%<br>"
+                        f"⚠️ Faltante: ${faltante_meta:,.0f}"
+                        "<extra></extra>"
+                    )
+                )
+                fig_meta.update_traces(marker_color="#00FF00", selector=dict(name="Actual"))
+                fig_meta.update_traces(marker_color="#FF0000", selector=dict(name="Faltante"))
+                st.plotly_chart(fig_meta, use_container_width=True)
+                st.divider()
+
+        st.divider()
+        if felicidad_trabajos_filtrados.empty:
+            espacio_indicadores_felicidad = st.container()
+            st.info(
+                "No hay trabajos registrados en las columnas K:Q para el rango seleccionado. "
+                "Cambia el filtro Desde/Hasta o registra nuevos trabajos."
+            )
+        else:
+            trabajos_validos = felicidad_trabajos_filtrados.copy()
+            trabajos_validos["FECHA"] = pd.to_datetime(trabajos_validos["FECHA"], errors="coerce")
+            trabajos_validos["VALOR"] = pd.to_numeric(trabajos_validos["VALOR"], errors="coerce").fillna(0)
+            trabajos_validos["HORAS"] = pd.to_numeric(trabajos_validos["HORAS"], errors="coerce").fillna(0).clip(lower=0)
+            trabajos_validos["VALOR_HORA"] = pd.to_numeric(trabajos_validos["VALOR_HORA"], errors="coerce").fillna(0)
+
+            total_valor_trabajos = float(trabajos_validos["VALOR"].sum())
+            total_horas_trabajadas = float(trabajos_validos["HORAS"].sum())
+            valor_hora_promedio = total_valor_trabajos / total_horas_trabajadas if total_horas_trabajadas > 0 else float(trabajos_validos["VALOR_HORA"].mean() or 0)
+            empresas_activas = int(trabajos_validos["EMPRESA"].fillna("Sin empresa").nunique())
+            dias_actividad = int(trabajos_validos["FECHA"].dropna().dt.date.nunique())
+            ingreso_dia_activo = total_valor_trabajos / dias_actividad if dias_actividad else 0.0
+
+            ingresos_felicidad_base = trabajos_validos.rename(columns={"VALOR": "INGRESOS_CANTIDAD", "CATEGORIA": "INGRESOS_CATEGORIA"}).copy()
+            ingresos_felicidad = resumen_ingresos_laborales_no_laborales(ingresos_felicidad_base)
+            ingreso_laboral = float(ingresos_felicidad["Laborales"].sum()) if not ingresos_felicidad.empty else 0.0
+            ingreso_no_laboral = float(ingresos_felicidad["Residuales"].sum()) if not ingresos_felicidad.empty else 0.0
+            ingreso_sin_clasificar = float(ingresos_felicidad["Sin clasificar"].sum()) if not ingresos_felicidad.empty and "Sin clasificar" in ingresos_felicidad.columns else 0.0
+            participacion_no_laboral = ingreso_no_laboral / total_valor_trabajos * 100 if total_valor_trabajos else 0.0
+
+            fecha_min_f = trabajos_validos["FECHA"].min()
+            fecha_max_f = trabajos_validos["FECHA"].max()
+            if pd.notna(fecha_min_f) and pd.notna(fecha_max_f):
+                meses_periodo_completo = max((fecha_max_f.year - fecha_min_f.year) * 12 + fecha_max_f.month - fecha_min_f.month + 1, 1)
+            else:
+                meses_periodo_completo = 1
+            meses_activos = max(int(trabajos_validos["FECHA"].dropna().dt.to_period("M").nunique()), 1)
+            promedio_laboral_mensual = ingreso_laboral / meses_periodo_completo
+            promedio_no_laboral_mensual = ingreso_no_laboral / meses_periodo_completo
+            promedio_total_mensual = total_valor_trabajos / meses_periodo_completo
+
+            resumen_empresas = resumen_felicidad_por_empresa(trabajos_validos)
+            principal_ingreso = resumen_empresas.sort_values("PART_INGRESOS", ascending=False).iloc[0] if not resumen_empresas.empty else None
+            principal_horas = resumen_empresas.sort_values("PART_HORAS", ascending=False).iloc[0] if not resumen_empresas.empty else None
+            mas_eficiente = resumen_empresas.sort_values("VALOR_HORA", ascending=False).iloc[0] if not resumen_empresas.empty else None
+            menos_eficiente = resumen_empresas[resumen_empresas["HORAS"].gt(0)].sort_values("VALOR_HORA").iloc[0] if not resumen_empresas[resumen_empresas["HORAS"].gt(0)].empty else None
+
+            seccion_resumen("1", "Panorama del periodo", "Cuánto dinero se generó, cuánto tiempo requirió y cuántas fuentes participaron.")
+            k1, k2, k3, k4, k5 = st.columns(5)
+            tarjeta_perfil_felicidad(k1, '💰 Ingresos registrados', f"${total_valor_trabajos:,.0f}")
+            tarjeta_perfil_felicidad(k2, '⏱️ Horas trabajadas', f"{total_horas_trabajadas:,.1f} h")
+            tarjeta_perfil_felicidad(k3, '⏱️ Valor promedio por hora', f"${valor_hora_promedio:,.0f}")
+            tarjeta_perfil_felicidad(k4, '🏢 Empresas activas', empresas_activas)
+            tarjeta_perfil_felicidad(k5, '📅 Meses analizados', meses_periodo_completo, help=f"{meses_activos} meses contienen registros.")
+
+            p1, p2, p3, p4 = st.columns(4)
+            tarjeta_perfil_felicidad(p1, '💰 Ingreso laboral', f"${ingreso_laboral:,.0f}")
+            tarjeta_perfil_felicidad(p2, '💰 Ingreso residual', f"${ingreso_no_laboral:,.0f}", delta=f"{participacion_no_laboral:.1f}% del total")
+            tarjeta_perfil_felicidad(p3, '📊 Promedio mensual del periodo', f"${promedio_total_mensual:,.0f}")
+            tarjeta_perfil_felicidad(p4, '💰 Ingreso por día activo', f"${ingreso_dia_activo:,.0f}", help="Ingreso total dividido entre fechas distintas con actividad registrada.")
+
+            seccion_resumen("2", "Eficiencia del tiempo", "Compara remuneración, carga laboral y aporte económico de cada empresa.")
+            e1, e2 = st.columns(2)
+            with e1:
+                st.plotly_chart(fig_felicidad_valor_hora_por_empresa(trabajos_validos), use_container_width=True)
+            with e2:
+                st.plotly_chart(fig_felicidad_matriz_eficiencia(resumen_empresas), use_container_width=True)
+
+            e3, e4 = st.columns(2)
+            with e3:
+                st.plotly_chart(fig_felicidad_ingresos_horas_mes(trabajos_validos), use_container_width=True)
+            with e4:
+                st.plotly_chart(fig_felicidad_concentracion_empresa(resumen_empresas), use_container_width=True)
+
+            st.plotly_chart(fig_felicidad_valor_hora_por_mes(trabajos_validos), use_container_width=True)
+
+            st.markdown("#### Ranking ejecutivo de trabajos")
+            ranking = resumen_empresas.copy()
+            if not ranking.empty:
+                ranking["LECTURA"] = ranking["EFICIENCIA_RELATIVA"].map(lambda x: "Favorable" if x >= 1.15 else "Equilibrada" if x >= 0.85 else "Revisar")
+                ranking_mostrar = ranking.rename(columns={
+                    "EMPRESA": "Empresa", "INGRESOS": "Ingresos", "HORAS": "Horas", "VALOR_HORA": "Valor/hora",
+                    "PART_INGRESOS": "% ingresos", "PART_HORAS": "% horas", "EFICIENCIA_RELATIVA": "Eficiencia relativa",
+                    "BRECHA_PARTICIPACION": "Brecha ingresos-horas", "LECTURA": "Lectura",
+                })
+                with st.expander("Ver tabla", expanded=False):
+                    st.dataframe(
+                        ranking_mostrar.style.format({"Ingresos": "${:,.0f}", "Horas": "{:,.1f}", "Valor/hora": "${:,.0f}", "% ingresos": "{:.1f}%", "% horas": "{:.1f}%", "Eficiencia relativa": "{:.2f}x", "Brecha ingresos-horas": "{:+.1f} pp"}),
+                        use_container_width=True, hide_index=True,
+                    )
+                st.caption("Eficiencia relativa = participación en ingresos ÷ participación en horas. Es una comparación interna entre los trabajos registrados, no una evaluación de satisfacción personal.")
+
+            seccion_resumen("3", "Diversificación y estabilidad", "Mide dependencia de las fuentes y composición laboral/residual.")
+            d1, d2, d3, d4 = st.columns(4)
+            tarjeta_perfil_felicidad(d1, '🎯 Fuente principal', str(principal_ingreso["EMPRESA"]) if principal_ingreso is not None else "Sin dato")
+            tarjeta_perfil_felicidad(d2, '📊 Concentración principal', f"{float(principal_ingreso['PART_INGRESOS']):.1f}%" if principal_ingreso is not None else "0%")
+            tarjeta_perfil_felicidad(d3, '📊 Mayor concentración de tiempo', str(principal_horas["EMPRESA"]) if principal_horas is not None else "Sin dato", delta=f"{float(principal_horas['PART_HORAS']):.1f}% de horas" if principal_horas is not None else None)
+            tarjeta_perfil_felicidad(d4, '🔎 Sin clasificar', f"${ingreso_sin_clasificar:,.0f}", help="Ingresos cuya categoría no permite determinar si son laborales o residuales.")
+            st.plotly_chart(fig_felicidad_ingresos_laborales_vs_no_laborales(ingresos_felicidad_base), use_container_width=True)
+
+            seccion_resumen("4", "Simulador de decisión laboral", "Explora cambios de horas y tarifa sin modificar los datos del archivo.")
+            if not resumen_empresas.empty:
+                empresa_sim = st.selectbox("Empresa o trabajo para simular", resumen_empresas["EMPRESA"].tolist(), key="felicidad_empresa_sim_v920")
+                fila_sim = resumen_empresas.loc[resumen_empresas["EMPRESA"].eq(empresa_sim)].iloc[0]
+                s1, s2 = st.columns(2)
+                horas_sim = s1.number_input("Horas simuladas", min_value=0.0, value=float(fila_sim["HORAS"]), step=1.0, key="felicidad_horas_sim_v920")
+                tarifa_sim = s2.number_input("Valor por hora simulado", min_value=0.0, value=float(fila_sim["VALOR_HORA"]), step=1000.0, key="felicidad_tarifa_sim_v920")
+                ingreso_actual_sim = float(fila_sim["INGRESOS"])
+                ingreso_simulado = horas_sim * tarifa_sim
+                horas_liberadas = float(fila_sim["HORAS"]) - horas_sim
+                diferencia_ingreso = ingreso_simulado - ingreso_actual_sim
+                tarifa_equilibrio = ingreso_actual_sim / horas_sim if horas_sim > 0 else 0.0
+                s3, s4, s5, s6 = st.columns(4)
+                tarjeta_perfil_felicidad(s3, '💰 Ingreso actual', f"${ingreso_actual_sim:,.0f}")
+                tarjeta_perfil_felicidad(s4, '💰 Ingreso simulado', f"${ingreso_simulado:,.0f}", delta=f"${diferencia_ingreso:,.0f}")
+                tarjeta_perfil_felicidad(s5, '⏱️ Horas liberadas', f"{horas_liberadas:,.1f} h")
+                tarjeta_perfil_felicidad(s6, '💰 Tarifa para conservar ingreso', f"${tarifa_equilibrio:,.0f}/h" if horas_sim > 0 else "No aplica")
+
+            seccion_resumen("5", "Patrimonio e IDR", "Conserva el análisis existente y muestra la relación entre patrimonio actual e ingreso de referencia.")
+            if "idr_incluir_no_laborales" not in st.session_state:
+                st.session_state["idr_incluir_no_laborales"] = True
+            incluir_no_laborales_idr = bool(st.session_state.get("idr_incluir_no_laborales", True))
+            ingresos_totales_idr = ingreso_laboral + (ingreso_no_laboral if incluir_no_laborales_idr else 0.0)
+            texto_fuentes_idr = "laborales y residuales" if incluir_no_laborales_idr else "laborales"
+            sueldo_promedio_mensual = ingresos_totales_idr / meses_periodo_completo if meses_periodo_completo > 0 else 0.0
+            try:
+                edad_para_idr = float(edad_persona) if edad_persona is not None else 0.0
+            except (TypeError, ValueError):
+                edad_para_idr = 0.0
+            idr = sueldo_promedio_mensual * edad_para_idr * 1.2
+            patrimonio_neto_idr = float(patrimonio["Valor neto"].sum()) if not patrimonio.empty else 0.0
+            ratio_idr = patrimonio_neto_idr / idr if idr > 0 else 0.0
+            nivel_idr = max(0.0, min(float(ratio_idr), 3.0))
+
+            if ratio_idr >= 2:
+                resultado_riqueza, color_medidor = "Excelente constructor de patrimonio", "#22C55E"
+                popup_riqueza = "El patrimonio es dos veces o más la referencia IDR calculada con los datos disponibles."
+            elif ratio_idr >= 1:
+                resultado_riqueza, color_medidor = "Constructor de patrimonio", "#FACC15"
+                popup_riqueza = "El patrimonio neto es igual o superior a 1 vez el IDR y menor a 2 veces el IDR."
+            else:
+                resultado_riqueza, color_medidor = "Destructor de patrimonio", "#EF4444"
+                popup_riqueza = "El patrimonio neto es menor a 1 vez el IDR. Esta categoría corresponde a la clasificación definida por el usuario."
+            popup_idr = "El IDR es una referencia orientativa basada en ingreso mensual, edad y el factor 1.2; no incorpora todas las circunstancias financieras personales."
+
+            fig_medidor_idr = medidor_idr_con_tooltips(ratio_idr, idr, patrimonio_neto_idr, resultado_riqueza)
+
+            idr_panel, medidor_panel = st.columns([1, 1.25], gap="large")
+            with idr_panel:
+                promedio_col1, promedio_col2 = st.columns(2)
+                tarjeta_perfil_felicidad(promedio_col1, '📊 Promedio laboral mensual', f"${promedio_laboral_mensual:,.0f}")
+                tarjeta_perfil_felicidad(promedio_col2, '📊 Promedio residual mensual', f"${promedio_no_laboral_mensual:,.0f}")
+                tarjeta_perfil_felicidad(st, '📊 IDR', f"${idr:,.0f}", help=popup_idr + f" Fórmula: promedio mensual de ingresos {texto_fuentes_idr} × edad × 1.2.")
+                st.markdown(f'''<div title="{popup_riqueza}" style="background:#0a0a0a;border:1px solid rgba(0,240,255,.40);border-radius:14px;padding:.75rem 1rem;margin-bottom:.75rem"><div style="color:#bfdbfe;font-size:.86rem;font-weight:700">Resultado generación de riqueza</div><div style="color:{color_medidor};font-size:1.25rem;font-weight:900">{resultado_riqueza}</div><div style="color:#94a3b8;font-size:.82rem">Patrimonio / IDR: {ratio_idr:.2f}x</div></div>''', unsafe_allow_html=True)
+                st.markdown(f'''<div style="background:#0a0a0a;border:1px solid rgba(0,240,255,.40);border-radius:14px;padding:.75rem 1rem;margin-bottom:.75rem"><div style="color:#bfdbfe;font-size:.86rem;font-weight:700">Medidor IDR (1 a 3)</div><div style="color:{color_medidor};font-size:1.35rem;font-weight:900">{nivel_idr:.2f}</div></div>''', unsafe_allow_html=True)
+            with medidor_panel:
+                st.markdown("<div style='text-align:center;color:#cbd5e1;font-weight:700'>Patrimonio neto / IDR</div>", unsafe_allow_html=True)
+                st.markdown('<div class="checkbox-center">', unsafe_allow_html=True)
+                st.checkbox("Incluir ingresos residuales", key="idr_incluir_no_laborales", help="Cambia la base del IDR entre ingresos laborales y el total laboral + residual.")
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.plotly_chart(fig_medidor_idr, use_container_width=True)
+
+            cumplimiento_idr_pct = patrimonio_neto_idr / idr * 100 if idr > 0 else 0.0
+            cumplimiento_barra = max(0.0, min(cumplimiento_idr_pct, 300.0))
+            color_cumplimiento = "#22C55E" if cumplimiento_idr_pct >= 200 else "#FACC15" if cumplimiento_idr_pct > 55 else "#EF4444"
+            st.markdown(f'''<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:.6rem 0 1.2rem"><div style="background:#0a0a0a;border:1px solid rgba(0,240,255,.45);border-radius:16px;padding:15px 17px"><div style="color:#bfdbfe;font-weight:700">IDR esperado</div><div style="color:#f8fafc;font-size:1.35rem;font-weight:800">${idr:,.0f}</div></div><div style="background:#0a0a0a;border:1px solid rgba(0,240,255,.45);border-radius:16px;padding:15px 17px"><div style="color:#bfdbfe;font-weight:700">Patrimonio actual</div><div style="color:#f8fafc;font-size:1.35rem;font-weight:800">${patrimonio_neto_idr:,.0f}</div></div><div style="background:#0a0a0a;border:1px solid rgba(0,240,255,.45);border-radius:16px;padding:15px 17px"><div style="display:flex;justify-content:space-between"><div style="color:#bfdbfe;font-weight:700">Cumplimiento del IDR</div><div style="color:{color_cumplimiento};font-weight:900">{cumplimiento_idr_pct:,.1f}%</div></div><div style="height:13px;background:#111827;border-radius:999px;overflow:hidden;margin-top:13px"><div style="height:100%;width:{cumplimiento_barra/3:.2f}%;background:{color_cumplimiento}"></div></div><div style="display:flex;justify-content:space-between;color:#94a3b8;font-size:.72rem"><span>0%</span><span>100%</span><span>200%</span><span>300%</span></div></div></div>''', unsafe_allow_html=True)
+
+            espacio_indicadores_felicidad = st.container()
+
+            # Se conservan las cuatro métricas originales de la pestaña.
+            f1, f2, f3, f4 = st.columns(4)
+            tarjeta_perfil_felicidad(f1, '⏱️ Valor hora promedio', f"${valor_hora_promedio:,.0f}")
+            tarjeta_perfil_felicidad(f2, '⏱️ Horas registradas', f"{total_horas_trabajadas:,.1f}")
+            tarjeta_perfil_felicidad(f3, '💰 Ingreso laboral', f"${ingreso_laboral:,.0f}")
+            tarjeta_perfil_felicidad(f4, '💰 Ingreso residual', f"${ingreso_no_laboral:,.0f}")
+
+            seccion_resumen("6", "Hallazgos y prioridad", "Convierte los indicadores en observaciones concretas para revisar.")
+            hallazgos = []
+            if mas_eficiente is not None:
+                hallazgos.append(f"<b>{mas_eficiente['EMPRESA']}</b> registra el mayor valor por hora: <b>${mas_eficiente['VALOR_HORA']:,.0f}</b>.")
+            if principal_ingreso is not None:
+                hallazgos.append(f"<b>{principal_ingreso['EMPRESA']}</b> concentra el <b>{principal_ingreso['PART_INGRESOS']:.1f}%</b> de los ingresos.")
+            if principal_horas is not None:
+                hallazgos.append(f"<b>{principal_horas['EMPRESA']}</b> consume el <b>{principal_horas['PART_HORAS']:.1f}%</b> de las horas registradas.")
+            hallazgos.append(f"Los ingresos residuales representan el <b>{participacion_no_laboral:.1f}%</b> del total.")
+            st.markdown("<div style='background:#07111f;border:1px solid rgba(56,189,248,.45);border-radius:16px;padding:16px 20px'><ol style='margin:0;color:#cbd5e1'>" + "".join(f"<li style='margin:.4rem 0'>{h}</li>" for h in hallazgos) + "</ol></div>", unsafe_allow_html=True)
+            if menos_eficiente is not None and menos_eficiente["PART_HORAS"] > menos_eficiente["PART_INGRESOS"]:
+                st.warning(f"Prioridad sugerida: revisar **{menos_eficiente['EMPRESA']}**, porque utiliza {menos_eficiente['PART_HORAS']:.1f}% de las horas y genera {menos_eficiente['PART_INGRESOS']:.1f}% de los ingresos. Evalúa tarifa, carga o reasignación de tiempo.")
+            elif principal_ingreso is not None and principal_ingreso["PART_INGRESOS"] > 60:
+                st.warning(f"Prioridad sugerida: reducir el riesgo de concentración. **{principal_ingreso['EMPRESA']}** aporta {principal_ingreso['PART_INGRESOS']:.1f}% de los ingresos.")
+            else:
+                st.success("No se detectó una desalineación dominante entre participación de ingresos y participación de horas.")
+
+            # ============================================================
+            # BRÚJULA ALTIUM
+            # Síntesis propia de equilibrio entre dinero, tiempo y bienestar
+            # financiero estimado. No pretende medir felicidad psicológica.
+            # ============================================================
+            seccion_resumen(
+                "8",
+                "Brújula Altium",
+                "Resume el equilibrio entre fortaleza económica, uso del tiempo y estabilidad de las fuentes de ingreso.",
+            )
+
+            def _limitar_0_100(valor):
+                try:
+                    return max(0.0, min(float(valor), 100.0))
+                except (TypeError, ValueError):
+                    return 0.0
+
+            # DINERO (0-100)
+            # 40% capacidad de ahorro, 35% patrimonio frente al IDR y
+            # 25% estabilidad de los ingresos mensuales registrados.
+            ahorro_pct_brujula = (balance / total_ingresos * 100) if total_ingresos > 0 else 0.0
+            puntaje_ahorro_brujula = _limitar_0_100(ahorro_pct_brujula / 30 * 100)
+            puntaje_idr_brujula = _limitar_0_100(ratio_idr / 2 * 100)
+
+            mensual_brujula = (
+                trabajos_validos.dropna(subset=["FECHA"])
+                .assign(PERIODO=lambda x: x["FECHA"].dt.to_period("M").astype(str))
+                .groupby("PERIODO")["VALOR"]
+                .sum()
+            )
+            if len(mensual_brujula) >= 2 and float(mensual_brujula.mean()) > 0:
+                cv_ingresos_brujula = float(mensual_brujula.std(ddof=0) / mensual_brujula.mean())
+                puntaje_estabilidad_brujula = _limitar_0_100((1 - min(cv_ingresos_brujula, 1.0)) * 100)
+            elif len(mensual_brujula) == 1:
+                cv_ingresos_brujula = None
+                puntaje_estabilidad_brujula = 50.0
+            else:
+                cv_ingresos_brujula = None
+                puntaje_estabilidad_brujula = 0.0
+
+            puntaje_dinero_brujula = _limitar_0_100(
+                puntaje_ahorro_brujula * 0.40
+                + puntaje_idr_brujula * 0.35
+                + puntaje_estabilidad_brujula * 0.25
+            )
+
+            # TIEMPO (0-100)
+            # Se estima la carga semanal del periodo y se complementa con la
+            # proporción de horas ubicada en trabajos de eficiencia relativa >= 1.
+            dias_calendario_brujula = max((fecha_hasta - fecha_desde).days + 1, 1)
+            semanas_brujula = max(dias_calendario_brujula / 7, 1)
+            horas_semana_brujula = total_horas_trabajadas / semanas_brujula
+            if horas_semana_brujula <= 30:
+                puntaje_carga_brujula = 100.0
+            elif horas_semana_brujula <= 40:
+                puntaje_carga_brujula = 100 - (horas_semana_brujula - 30) * 3
+            elif horas_semana_brujula <= 48:
+                puntaje_carga_brujula = 70 - (horas_semana_brujula - 40) * 3.75
+            elif horas_semana_brujula <= 70:
+                puntaje_carga_brujula = 40 - (horas_semana_brujula - 48) * (40 / 22)
+            else:
+                puntaje_carga_brujula = 0.0
+            puntaje_carga_brujula = _limitar_0_100(puntaje_carga_brujula)
+
+            if not resumen_empresas.empty and total_horas_trabajadas > 0:
+                horas_eficientes_brujula = float(
+                    resumen_empresas.loc[
+                        resumen_empresas["EFICIENCIA_RELATIVA"].ge(1.0), "HORAS"
+                    ].sum()
+                )
+                pct_horas_eficientes_brujula = horas_eficientes_brujula / total_horas_trabajadas * 100
+            else:
+                pct_horas_eficientes_brujula = 0.0
+            puntaje_tiempo_brujula = _limitar_0_100(
+                puntaje_carga_brujula * 0.70 + pct_horas_eficientes_brujula * 0.30
+            )
+
+            # BIENESTAR FINANCIERO ESTIMADO (0-100)
+            # Combina diversificación, independencia parcial del trabajo y
+            # estabilidad. No utiliza respuestas subjetivas de bienestar.
+            concentracion_principal_brujula = (
+                float(principal_ingreso["PART_INGRESOS"])
+                if principal_ingreso is not None else 100.0
+            )
+            puntaje_diversificacion_brujula = _limitar_0_100(
+                (1 - max(concentracion_principal_brujula - 25, 0) / 75) * 100
+            )
+            puntaje_no_laboral_brujula = _limitar_0_100(participacion_no_laboral / 30 * 100)
+            puntaje_bienestar_brujula = _limitar_0_100(
+                puntaje_diversificacion_brujula * 0.45
+                + puntaje_no_laboral_brujula * 0.25
+                + puntaje_estabilidad_brujula * 0.30
+            )
+
+            valores_brujula = [
+                puntaje_dinero_brujula,
+                puntaje_tiempo_brujula,
+                puntaje_bienestar_brujula,
+            ]
+            ejes_brujula = ["Dinero", "Tiempo", "Bienestar financiero"]
+            valores_cerrados_brujula = valores_brujula + [valores_brujula[0]]
+            ejes_cerrados_brujula = ejes_brujula + [ejes_brujula[0]]
+
+            fig_brujula = go.Figure()
+            fig_brujula.add_trace(go.Scatterpolar(
+                r=[100, 100, 100, 100],
+                theta=ejes_cerrados_brujula,
+                fill="toself",
+                fillcolor="rgba(148,163,184,0.10)",
+                line=dict(color="rgba(148,163,184,0.65)", width=2, dash="dot"),
+                name="Equilibrio ideal",
+                hovertemplate="Objetivo ideal: 100<extra></extra>",
+            ))
+            fig_brujula.add_trace(go.Scatterpolar(
+                r=valores_cerrados_brujula,
+                theta=ejes_cerrados_brujula,
+                fill="toself",
+                fillcolor="rgba(0,217,255,0.28)",
+                line=dict(color="#00D9FF", width=4),
+                marker=dict(size=11, color=["#22C55E", "#FACC15", "#A855F7", "#22C55E"]),
+                name="Situación actual",
+                text=[
+                    f"Ahorro: {ahorro_pct_brujula:.1f}%<br>Patrimonio/IDR: {ratio_idr:.2f}x",
+                    f"Carga: {horas_semana_brujula:.1f} h/semana<br>Horas eficientes: {pct_horas_eficientes_brujula:.1f}%",
+                    f"Fuente principal: {concentracion_principal_brujula:.1f}%<br>Residuales: {participacion_no_laboral:.1f}%",
+                    f"Ahorro: {ahorro_pct_brujula:.1f}%<br>Patrimonio/IDR: {ratio_idr:.2f}x",
+                ],
+                hovertemplate="<b>%{theta}</b><br>Puntaje: %{r:.1f}/100<br>%{text}<extra></extra>",
+            ))
+            fig_brujula.update_layout(
+                template="plotly_dark",
+                height=600,
+                paper_bgcolor="#000000",
+                plot_bgcolor="#000000",
+                margin=dict(t=110, b=100, l=80, r=80),
+                title=dict(
+                    text="Brújula Altium<br><span style='font-size:13px'>Equilibrio actual frente al ideal</span>",
+                    x=0.5,
+                    y=0.97,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(color="#F8FAFC", size=21),
+                ),
+                polar=dict(
+                    bgcolor="#050505",
+                    radialaxis=dict(
+                        visible=True,
+                        range=[0, 100],
+                        tickvals=[20, 40, 60, 80, 100],
+                        ticksuffix="",
+                        gridcolor="rgba(148,163,184,0.22)",
+                        linecolor="rgba(0,217,255,0.35)",
+                        tickfont=dict(color="#94A3B8"),
+                    ),
+                    angularaxis=dict(
+                        gridcolor="rgba(0,217,255,0.25)",
+                        linecolor="rgba(0,217,255,0.45)",
+                        tickfont=dict(color="#E2E8F0", size=14),
+                    ),
+                ),
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=-0.14,
+                    xanchor="center",
+                    x=0.5,
+                    bgcolor="rgba(0,0,0,0)",
+                ),
+            )
+
+            equilibrio_brujula = min(valores_brujula)
+            promedio_brujula = sum(valores_brujula) / 3
+            eje_debil_idx = valores_brujula.index(min(valores_brujula))
+            eje_fuerte_idx = valores_brujula.index(max(valores_brujula))
+            eje_debil_brujula = ejes_brujula[eje_debil_idx]
+            eje_fuerte_brujula = ejes_brujula[eje_fuerte_idx]
+
+            bcol1, bcol2 = st.columns([1.35, 0.65], gap="large")
+            with bcol1:
+                st.plotly_chart(fig_brujula, use_container_width=True)
+            with bcol2:
+                st.markdown("#### Lectura de la brújula")
+                bm1, bm2 = st.columns(2)
+                tarjeta_perfil_felicidad(bm1, '📊 Equilibrio Altium', f"{equilibrio_brujula:.0f}/100", help="Se usa el menor de los tres ejes para evitar que una fortaleza oculte un desequilibrio importante.")
+                tarjeta_perfil_felicidad(bm2, '📊 Promedio general', f"{promedio_brujula:.0f}/100")
+                tarjeta_perfil_felicidad(st, '📊 Eje más fuerte', eje_fuerte_brujula, delta=f"{max(valores_brujula):.1f}/100")
+                tarjeta_perfil_felicidad(st, '📊 Prioridad de mejora', eje_debil_brujula, delta=f"{min(valores_brujula):.1f}/100", delta_color="inverse")
+
+                if equilibrio_brujula >= 75:
+                    st.success("La brújula muestra un equilibrio alto: ningún eje cae por debajo de 75 puntos.")
+                elif equilibrio_brujula >= 50:
+                    st.warning(f"El equilibrio es intermedio. La mejora con mayor impacto está en **{eje_debil_brujula}**.")
+                else:
+                    st.error(f"Existe un desequilibrio relevante en **{eje_debil_brujula}**. Conviene intervenir ese eje antes de optimizar los demás.")
+
+            explicaciones_brujula = {
+                "Dinero": "Combina capacidad de ahorro (40%), patrimonio frente al IDR (35%) y estabilidad mensual de ingresos (25%).",
+                "Tiempo": "Combina carga semanal estimada (70%) y proporción de horas en trabajos con eficiencia relativa igual o superior a 1 (30%).",
+                "Bienestar financiero": "Combina diversificación de fuentes (45%), participación de ingresos residuales (25%) y estabilidad mensual (30%).",
+            }
+            with st.expander("Cómo se calcula la Brújula Altium", expanded=False):
+                st.markdown(
+                    f"""
+                    - **Dinero ({puntaje_dinero_brujula:.1f}/100):** {explicaciones_brujula['Dinero']}
+                    - **Tiempo ({puntaje_tiempo_brujula:.1f}/100):** {explicaciones_brujula['Tiempo']}
+                    - **Bienestar financiero ({puntaje_bienestar_brujula:.1f}/100):** {explicaciones_brujula['Bienestar financiero']}
+                    - **Equilibrio Altium ({equilibrio_brujula:.1f}/100):** corresponde al eje con menor puntuación. Así se penalizan los desequilibrios y no se ocultan detrás de un promedio alto.
+
+                    La brújula es un indicador orientativo construido con los datos financieros y laborales disponibles. No mide felicidad psicológica, salud mental ni satisfacción personal.
+                    """
+                )
+
+
+
+
+        st.divider()
+        with espacio_indicadores_felicidad:
+            st.markdown("## Indicadores de prosperidad y dependencia financiera")
+            indicadores_finales = calcular_indicadores_panel(total_ingresos, total_gastos, periodos_sel, score_actual, ingresos_filtrados, df)
+            meses_indicadores = indicadores_finales["meses_indicadores"]
+            ingreso_mensual_ind = indicadores_finales["ingreso_mensual_ind"]
+            egreso_mensual_ind = indicadores_finales["egreso_mensual_ind"]
+            activos_ind = indicadores_finales["activos_ind"]
+            pasivos_ind = indicadores_finales["pasivos_ind"]
+            liquido_ind = indicadores_finales["liquido_ind"]
+            prosperidad_ind = indicadores_finales["prosperidad_ind"]
+            dependencia_ind = indicadores_finales["dependencia_ind"]
+            pago_deuda_ind = indicadores_finales["pago_deuda_ind"]
+            flujo_deuda_ind = indicadores_finales["flujo_deuda_ind"]
+            estado_flujo_ind = indicadores_finales["estado_flujo_ind"]
+            tono_flujo_ind = indicadores_finales["tono_flujo_ind"]
+            endeudamiento_ind = indicadores_finales["endeudamiento_ind"]
+            estado_endeudamiento_ind = indicadores_finales["estado_endeudamiento_ind"]
+            tono_endeudamiento_ind = indicadores_finales["tono_endeudamiento_ind"]
+            fila_ind1 = st.columns(3)
+            tarjeta_perfil_felicidad(
+                fila_ind1[0], "💵 Flujo de efectivo mensual (FEM)", f"${ingreso_mensual_ind-egreso_mensual_ind:,.0f}",
+                delta="Ingreso promedio mensual menos egreso promedio mensual",
+                help="Promedio mensual de ingresos menos gastos registrados. Usa todos los meses del período seleccionado, incluidos meses sin movimientos; no equivale al saldo de una cuenta.",
+            )
+            tarjeta_perfil_felicidad(
+                fila_ind1[1], "💧 Patrimonio líquido (PL)", f"${liquido_ind:,.0f}",
+                delta="Total activos menos total pasivos",
+                help=f"Definición del usuario solo para Felicidad: total activos (${activos_ind:,.0f}) menos total pasivos (${pasivos_ind:,.0f}). Incluye todos los activos; no representa necesariamente efectivo disponible. La pestaña Patrimonio conserva su cálculo de liquidez.",
+            )
+            tarjeta_perfil_felicidad(
+                fila_ind1[2], "🌱 Prosperidad financiera (IPF)", formatear_prosperidad(prosperidad_ind),
+                delta=f"Egreso promedio mensual: ${egreso_mensual_ind:,.0f}",
+                help="Patrimonio líquido dividido entre el egreso promedio mensual. Expresa el patrimonio en meses equivalentes de gasto.",
+            )
+            st.markdown("""
+            <style>
+            .st-key-medidores_financieros {
+                border:1px solid #00a8d2; border-radius:24px; padding:12px;
+                background:linear-gradient(155deg,#0d2340,#060e20 72%);
+            }
+            .st-key-medidores_financieros [class*="st-key-tarjeta_medidor_"] {
+                border:1px solid #00d5f7; border-radius:12px; padding:8px 12px;
+                box-shadow:inset 0 0 14px #00bde52e, 0 0 7px #00d5f72b;
+                background:radial-gradient(ellipse at top left,#07334c,#03172b 58%,#031325);
+                transition:border-color .2s ease;
+            }
+            .st-key-medidores_financieros [class*="st-key-tarjeta_medidor_"]:hover {
+                border-color:#409ac1;
+            }
+            .st-key-medidores_financieros [data-testid="stPlotlyChart"] {
+                border:0 !important; box-shadow:none !important; background:transparent !important;
+            }
+            .st-key-medidores_financieros [data-testid="stPlotlyChart"]::after {
+                display:none !important;
+            }
+            .st-key-medidores_financieros .perfil-etiqueta {
+            text-align:left; color:#eef7ff; font-size:15px; font-weight:750;
+            letter-spacing:.01em; padding:4px 4px 0;
+            }
+            .st-key-medidores_financieros .medidor-nivel {
+                display:table; margin:0 auto; padding:5px 14px;
+                border-radius:999px; font-size:12px; font-weight:700;
+                color:#fff; text-shadow:0 1px 2px #000; min-width:104px; text-align:center;
+                border:1px solid color-mix(in srgb,var(--nivel) 36%,transparent);
+                background:linear-gradient(180deg,color-mix(in srgb,var(--nivel) 72%,#102037),color-mix(in srgb,var(--nivel) 42%,#020c15));
+            }
+        .st-key-medidores_financieros [data-testid="stCaptionContainer"] {
+            text-align:center; color:#b8d4e6;
+        }
+        .st-key-medidores_financieros .medidor-encabezado {
+            display:flex; align-items:center; flex-wrap:wrap; gap:12px;
+        }
+        .st-key-medidores_financieros .medidor-nombre {
+            flex:1 1 120px; font-size:17px; line-height:1.25; min-width:0;
+        }
+        .st-key-medidores_financieros .medidor-explicacion {
+            box-sizing:border-box; flex:1 1 160px; max-width:230px; margin-left:auto; padding:11px 14px;
+            border:1px solid #215879; border-radius:12px;
+            background:linear-gradient(145deg,#102f49,#091c31);
+            box-shadow:inset 0 1px 0 #65e1ff20;
+            font-size:15px; line-height:1.4; font-weight:500; color:#d3e9f7;
+            text-align:left;
+        }
+        .st-key-medidores_financieros .medidor-explicacion strong {
+            display:block; margin-bottom:3px; color:#69eaff;
+            font-size:12px; font-weight:750; letter-spacing:.06em; text-transform:uppercase;
+        }
+        .st-key-medidores_financieros .medidor-icono {
+            display:inline-grid; place-items:center; flex:0 0 76px; height:76px;
+            border-radius:18px; background:radial-gradient(circle at 25% 15%,#164b68,#0a2038 78%);
+            border:1px solid #287492; color:#42E7FF;
+            box-shadow:0 0 14px #00c9f324;
+        }
+        .st-key-medidores_financieros .medidor-icono svg {
+            width:56px; height:56px; display:block;
+        }
+        .st-key-medidores_financieros .scatterlayer .js-fill {
+            filter:none;
+        }
+            .st-key-medidores_financieros [class*="st-key-tarjeta_medidor_"] {
+                container-type:inline-size;
+            }
+            @container (max-width: 420px) {
+                .st-key-medidores_financieros .medidor-explicacion {
+                    flex-basis:100%; max-width:none; margin-left:0;
+                }
+            }
+            @media (max-width: 650px) {
+                .st-key-medidores_financieros [data-testid="stHorizontalBlock"] { flex-wrap:wrap; }
+                .st-key-medidores_financieros [data-testid="stColumn"] { flex:1 1 100% !important; }
+            }
+            .st-key-medidores_financieros .medidores-titulo {
+                display:flex; align-items:center; gap:12px;
+                color:#f2faff; font-size:clamp(17px,2vw,23px); font-weight:800;
+            }
+            .st-key-medidores_financieros .medidores-titulo span {
+                display:grid; place-items:center; width:34px; height:34px;
+                border-radius:50%; background:linear-gradient(145deg,#64f3ff,#009bc8);
+                color:#03182d; flex-shrink:0;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            puntaje_crediticio = personales.get("score_crediticio")
+            nivel_crediticio = ("Sin registrar" if puntaje_crediticio is None else
+                                "Bajo" if puntaje_crediticio < 500 else "Regular" if puntaje_crediticio < 650 else "Bueno")
+            nivel_id = ("No calculable" if dependencia_ind is None else
+                        "Gastos cubiertos" if dependencia_ind <= 0 else "Gastos por cubrir")
+            with st.container(key="medidores_financieros"):
+                st.markdown('<div class="medidores-titulo"><span>1</span>Tarjetas de Indicadores (Dashboard)</div>',
+                            unsafe_allow_html=True)
+                flujo_col, deuda_col = st.columns(2, gap="medium")
+                score_col, id_col = st.columns(2, gap="medium")
+                medidores = [
+                    (flujo_col, "Flujo de deuda mensual (IFdM)", flujo_deuda_ind, estado_flujo_ind, [10, 30, 40],
+                     "Pagos de CRÉDITOS del período ÷ ingresos del período × 100.",
+                     f"Por cada 100 pesos de ingreso, {flujo_deuda_ind:.2f} pesos van a CRÉDITOS." if flujo_deuda_ind is not None else "Faltan ingresos positivos."),
+                    (deuda_col, "Índice de Endeudamiento (IdE)", endeudamiento_ind, estado_endeudamiento_ind, [15, 40, 60],
+                     "Saldo total de pasivos ÷ valor de los activos × 100.",
+                     f"Por cada 100 pesos en activos, debes {endeudamiento_ind:.2f} pesos." if endeudamiento_ind is not None else "Faltan activos positivos."),
+                    (score_col, "Score crediticio", puntaje_crediticio, nivel_crediticio, [500, 650],
+                     "Puntaje de Personales!C18. Escala de Mi DataCrédito de 150 a 950. Colores orientativos de Altium.",
+                     "Puntaje registrado en Personales." if puntaje_crediticio is not None else "Registra el puntaje en Personales!C18."),
+                    (id_col, "Índice de Dependencia (ID)", dependencia_ind, nivel_id, [],
+                     "(Egresos − ingresos residuales) ÷ egresos × 100 para el período seleccionado.",
+                     "Parte de tus gastos que queda por cubrir." if dependencia_ind is not None and dependencia_ind > 0 else
+                     "Tus residuales cubren tus gastos." if dependencia_ind is not None else "Faltan egresos positivos."),
+                ]
+                iconos_medidores = (
+                    '<ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v5c0 4 14 4 14 0V5M5 10v5c0 4 14 4 14 0v-5M5 15v4c0 4 14 4 14 0v-4"/>',
+                    '<rect x="3" y="13" width="4" height="8" rx="1"/><rect x="10" y="8" width="4" height="13" rx="1"/><rect x="17" y="3" width="4" height="18" rx="1"/>',
+                    '<rect x="2" y="5" width="20" height="14" rx="3"/><path d="M2 10h20M6 15h4"/>',
+                    '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+                )
+                explicaciones_medidores = (
+                    "Parte de tus ingresos destinada a pagar créditos.",
+                    "Cuánto debes en relación con el valor de tus activos.",
+                    "Tu puntaje crediticio en una escala de 150 a 950.",
+                    "Parte de tus gastos que tus ingresos residuales dejan por cubrir.",
+                )
+                for indice, (columna, titulo, valor, estado, limites, ayuda, nota) in enumerate(medidores):
+                    with columna.container(border=True, key=f"tarjeta_medidor_{indice}"):
+                        icono = (
+                            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                            'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+                            f'{iconos_medidores[indice]}</svg>'
+                        )
+                        st.markdown(
+                            f'<div class="perfil-etiqueta medidor-encabezado"><span class="medidor-icono" aria-hidden="true">{icono}</span><span class="medidor-nombre">{html.escape(titulo)}</span>'
+                            f'<span class="gac-help" style="--card-color:#39d7ff" tabindex="0" role="note" aria-label="{html.escape(ayuda)}">'
+                            f'ⓘ<span class="gac-tooltip" role="tooltip">{html.escape(ayuda)}</span></span>'
+                            f'<span class="medidor-explicacion"><strong>Qué mide</strong>{html.escape(explicaciones_medidores[indice])}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                        detalle_resultado = None
+                        if valor is not None:
+                            if indice == 0:
+                                detalle_resultado = (
+                                    f"💡 De cada 100 pesos que ingresan, <b>{valor:.2f} pesos</b><br>"
+                                    "se destinan a pagos registrados en CRÉDITOS.<br><br>"
+                                    "<b>📅 Promedios mensuales del período</b><br>"
+                                    f"💳 Pagos de créditos: ${pago_deuda_ind:,.0f}<br>"
+                                    f"💵 Ingresos: ${ingreso_mensual_ind:,.0f}"
+                                )
+                            elif indice == 1:
+                                detalle_resultado = (
+                                    f"💡 Por cada 100 pesos en activos,<br>tienes <b>{valor:.2f} pesos de deuda</b>.<br><br>"
+                                    "<b>📊 Saldos registrados en el Excel</b><br>"
+                                    f"💳 Pasivos: ${pasivos_ind:,.0f}<br>"
+                                    f"🏠 Activos: ${activos_ind:,.0f}"
+                                )
+                            elif indice == 2:
+                                detalle_resultado = (
+                                    "📄 Puntaje leído de Personales, celda C18.<br>"
+                                    "📏 Escala de Mi DataCrédito de 150 a 950 puntos.<br><br>"
+                                    "<b>🎨 Rangos visuales de Altium</b><br>"
+                                    "🔴 Bajo 150–499 · 🟡 Regular 500–649<br>"
+                                    "🟢 Bueno 650–950"
+                                )
+                            else:
+                                cobertura = 100 - valor
+                                lectura_id = (f"Queda por cubrir el {valor:.1f}% de tus gastos."
+                                              if valor > 0 else
+                                              "Tus ingresos residuales cubren todos tus gastos.")
+                                detalle_resultado = (
+                                    f"🌱 Tus ingresos residuales equivalen al <b>{cobertura:.1f}%</b><br>"
+                                    "de tus gastos del período.<br>"
+                                    f"🎯 <b>{lectura_id}</b><br><br>"
+                                    "📅 Se comparan los ingresos residuales y los gastos<br>"
+                                    "del mismo período seleccionado."
+                                )
+                        figura = medidor_indice_financiero(
+                            "", valor, estado, limites, score_crediticio=indice == 2,
+                            dependencia=indice == 3, detalle_resultado=detalle_resultado, radio_interior=.68,
+                        )
+                        color_nivel = "#94A3B8"
+                        if len(figura.data) > 1:
+                            figura.layout.annotations = figura.layout.annotations[:-1]
+                            if indice < 2:
+                                tramo = sum(valor > limite for limite in limites)
+                            elif indice == 2:
+                                tramo = sum(valor >= limite for limite in limites)
+                            else:
+                                tramo = min(47, max(0, round(valor * 47 / max(100, (int(valor // 10) + 1) * 10))))
+                            color_nivel = figura.data[tramo].fillcolor
+                        if len(figura.data) > 1:
+                            for banda in figura.data[:-1]:
+                                banda.update(line=dict(width=0))
+                            figura.layout.annotations[-1].update(font=dict(size=36, color="#F5FBFF"))
+                        figura.update_layout(height=194, margin=dict(t=2, b=0, l=8, r=8),
+                                             xaxis_range=[-1.24, 1.24], yaxis_range=[-.08, 1.22],
+                                             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                        st.plotly_chart(figura, use_container_width=True, key=f"medidor_felicidad_{indice}",
+                                        config={"displayModeBar": False})
+                        st.markdown(f'<div class="medidor-nivel" style="--nivel:{color_nivel}">{html.escape(estado)}</div>',
+                                    unsafe_allow_html=True)
+                        st.caption(nota)
+
+        st.divider()
+        tiempo_semanal = personales.get("tiempo_semanal", {})
+        if tiempo_semanal:
+            with st.expander("Tiempo disponible · semana"):
+                tabla_tiempo = pd.DataFrame({
+                    "Día": list(tiempo_semanal),
+                    "Horas registradas": list(tiempo_semanal.values()),
+                    "Horas sin asignar": [24 - horas for horas in tiempo_semanal.values()],
+                })
+                st.dataframe(tabla_tiempo, hide_index=True, use_container_width=True)
+                st.caption("Datos de la hoja Personales. Se muestran los días con horas registradas.")
+                if any(horas > 24 for horas in tiempo_semanal.values()):
+                    st.warning("Hay días con más de 24 horas registradas. Revisa si se superponen actividades.")
+
+        st.markdown("## 🐾 Tu nivel de progreso financiero")
+        st.caption("Según la escala de animales que definiste y los filtros seleccionados. Se suman los movimientos clasificados como Residual.")
+        base_progreso = ingresos_filtrados.copy()
+        if base_progreso.empty or df.empty or egreso_mensual_ind <= 0:
+            st.info("Para determinar tu nivel hacen falta ingresos y gastos positivos registrados en el período seleccionado.")
+        else:
+            tipos_progreso = base_progreso["INGRESOS_CATEGORIA"].map(etiqueta_tipo_ingreso)
+            residuales_progreso = base_progreso.loc[tipos_progreso.eq("Residuales")].copy()
+            residual_mensual_progreso = float(residuales_progreso["INGRESOS_CANTIDAD"].sum()) / meses_indicadores
+            cobertura_progreso = residual_mensual_progreso / egreso_mensual_ind
+            fuentes_progreso = residuales_progreso.loc[
+                pd.to_numeric(residuales_progreso["INGRESOS_CANTIDAD"], errors="coerce").gt(0), "INGRESOS_FUENTE"
+            ].dropna().map(normalizar)
+            cantidad_fuentes_progreso = int(fuentes_progreso.loc[~fuentes_progreso.isin(["", "NAN", "NONE", "SIN FUENTE", "SIN EMPRESA"])].nunique())
+            colibri_confirmado = False
+            if cobertura_progreso >= 10 and cantidad_fuentes_progreso >= 2:
+                colibri_confirmado = st.checkbox(
+                    "Además, mis ingresos residuales pueden seguir creciendo y comparto mis conocimientos con otras personas.",
+                    key="felicidad_colibri_confirmado_v19",
+                    help="La prosperidad del Colibrí incluye condiciones personales que no pueden deducirse únicamente de los importes del archivo.",
+                )
+            if colibri_confirmado:
+                animal_progreso, subtitulo_progreso, archivo_progreso = "Colibrí", "Prosperidad financiera", "colibri.png"
+                lectura_progreso = "Tus ingresos residuales superan ampliamente tus gastos, provienen de varias fuentes y confirmas que sigues desarrollándolos y compartiendo tus conocimientos con otras personas."
+            elif cobertura_progreso >= 10 and cantidad_fuentes_progreso >= 2:
+                animal_progreso, subtitulo_progreso, archivo_progreso = "Rinoceronte", "Libertad financiera", "rinoceronte.png"
+                lectura_progreso = "Tus ingresos residuales provienen de varias fuentes y cubren al menos diez veces tus gastos. Según tu escala, cuentas con un margen amplio para sostener tu estilo de vida."
+            elif cobertura_progreso >= 3:
+                animal_progreso, subtitulo_progreso, archivo_progreso = "Águila", "Autonomía financiera", "aguila.png"
+                lectura_progreso = "Tus ingresos residuales cubren al menos tres veces tus gastos. Esta cobertura te da autonomía y un margen para afrontar cambios sin depender exclusivamente de tu trabajo."
+                if cobertura_progreso >= 10:
+                    lectura_progreso += " Para alcanzar Rinoceronte falta registrar al menos dos fuentes distintas de ingresos residuales."
+            elif cobertura_progreso >= 1:
+                animal_progreso, subtitulo_progreso, archivo_progreso = "Delfín", "Independencia financiera", "delfin.png"
+                lectura_progreso = "Tus ingresos residuales alcanzan para cubrir tus gastos. Has llegado a la independencia financiera de esta escala; el siguiente nivel consiste en cubrir tres veces tus gastos."
+            else:
+                animal_progreso, subtitulo_progreso, archivo_progreso = "Hámster", "Dependencia financiera", "hamster.png"
+                lectura_progreso = "Tus ingresos residuales todavía no cubren tus gastos, por lo que sigues dependiendo de ingresos laborales u otros recursos. El siguiente objetivo es que el ingreso residual alcance el total de tus gastos."
+            texto_progreso, imagen_progreso = st.columns([1.35, 1], gap="large")
+            with texto_progreso:
+                st.markdown(f"### {animal_progreso} · {subtitulo_progreso}")
+                st.write(
+                    f"En el período seleccionado, tu ingreso residual mensual estimado es de **${residual_mensual_progreso:,.0f}** "
+                    f"frente a **${egreso_mensual_ind:,.0f}** de gastos mensuales: **{cobertura_progreso:.2f} veces** tus gastos. "
+                    + lectura_progreso
+                )
+                st.caption(f"Fuentes residuales con ingresos positivos: {cantidad_fuentes_progreso}. Ambos promedios usan los mismos {meses_indicadores} meses seleccionados.")
+                if tipos_progreso.eq("Sin clasificar").any():
+                    st.caption("Hay ingresos sin clasificar que no se incluyen como residuales. Completa sus categorías para afinar el resultado.")
+                with st.expander("Ver los criterios de tu escala"):
+                    st.markdown("Hámster: menos de 1× · Delfín: desde 1× · Águila: desde 3× · Rinoceronte: desde 10× y varias fuentes · Colibrí: además, crecimiento y transmisión de conocimientos confirmados por ti.")
+            with imagen_progreso:
+                ruta_progreso = Path(__file__).resolve().parent / "imagenes" / archivo_progreso
+                if ruta_progreso.is_file():
+                    imagen_progreso_b64 = base64.b64encode(ruta_progreso.read_bytes()).decode("ascii")
+                    etiqueta_progreso = html.escape(f"{animal_progreso} — {subtitulo_progreso}")
+                    st.markdown(
+                        f'''<figure style="width:82%;max-width:360px;margin:0 auto 1rem">
+                        <div style="padding:3px;border-radius:22px;background:linear-gradient(135deg,#39d7ff,rgba(139,92,246,.7),#52e0a4);box-shadow:0 12px 32px rgba(0,0,0,.35),0 0 20px rgba(57,215,255,.15)">
+                        <div style="padding:6px;background:#09111f;border-radius:19px">
+                        <img src="data:image/png;base64,{imagen_progreso_b64}" alt="{etiqueta_progreso}" style="display:block;width:100%;height:auto;border-radius:14px" />
+                        </div></div>
+                        <figcaption style="text-align:center;color:#94a3b8;font-size:.82rem;margin-top:12px">{etiqueta_progreso}</figcaption>
+                        </figure>''',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.info("La imagen de este nivel no está disponible en la carpeta imagenes.")
+
+
+else:
+    st.info("Sube tu archivo Excel o elige un enlace público de Google para comenzar el análisis presupuestal.")
+
