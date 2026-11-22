@@ -339,7 +339,15 @@ section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
 }
 
 /* Menús desplegables se renderizan fuera del sidebar mediante un portal. */
-div[data-baseweb="popover"] ul[role="listbox"] {
+div[data-baseweb="popover"]:has([role="option"]) > div {
+    background: #080F1E !important;
+    border-radius: 14px !important;
+    color-scheme: dark;
+}
+
+div[data-baseweb="popover"] ul,
+div[data-baseweb="popover"] [role="listbox"],
+[data-testid="stSelectboxVirtualDropdown"] {
     background: linear-gradient(160deg, #030B12, #10051D) !important;
     border: 1px solid rgba(0, 240, 255, 0.62) !important;
     border-radius: 14px !important;
@@ -348,15 +356,21 @@ div[data-baseweb="popover"] ul[role="listbox"] {
 }
 
 div[data-baseweb="popover"] li[role="option"] {
+    background: #080F1E !important;
     color: #EAFBFF !important;
     border-radius: 9px !important;
     margin: 2px 0;
 }
 
 div[data-baseweb="popover"] li[role="option"]:hover,
+div[data-baseweb="popover"] li[role="option"]:focus,
 div[data-baseweb="popover"] li[aria-selected="true"] {
-    background: linear-gradient(90deg, rgba(0,217,255,0.25), rgba(123,47,255,0.32)) !important;
+    background: linear-gradient(90deg, #123F53, #35224F) !important;
     color: #FFFFFF !important;
+}
+
+div[data-baseweb="popover"] li[role="option"] * {
+    color: inherit !important;
 }
 
 section[data-testid="stSidebar"]::-webkit-scrollbar,

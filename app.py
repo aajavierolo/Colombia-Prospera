@@ -1791,11 +1791,22 @@ if archivo:
             padding: 0.35rem 0 0.7rem 0;
         }
         [data-testid="stRadio"] [role="radiogroup"] label {
+            color: #EAFBFF !important;
             border: 1px solid rgba(56, 189, 248, 0.30);
             border-radius: 999px;
             padding: 0.38rem 0.72rem;
             background: linear-gradient(145deg, rgba(15,23,42,0.90), rgba(2,6,23,0.96));
             transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+        }
+        [data-testid="stRadio"] [role="radiogroup"] label p,
+        [data-testid="stRadio"] [role="radiogroup"] label [data-testid="stMarkdownContainer"] {
+            color: #EAFBFF !important;
+            opacity: 1 !important;
+            font-weight: 550;
+        }
+        [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) p {
+            color: #FFFFFF !important;
+            font-weight: 650;
         }
         [data-testid="stRadio"] [role="radiogroup"] label:hover {
             border-color: rgba(0, 240, 255, 0.85);
