@@ -8111,6 +8111,12 @@ if archivo:
             "Prioridad de pago por método avalancha: primero la tasa de interés más alta. "
             "Cuando dos deudas tienen el mismo interés, se muestra primero la de mayor saldo pendiente."
         )
+        st.caption(
+            "En Pasivos usa F: Tasa ingresada y G: Tipo de tasa. "
+            "NM significa Nominal Mensual y EA significa Efectivo Anual. "
+            "Escribe el porcentaje con %, por ejemplo 24% EA o 2% NM. "
+            "Los cálculos y simulaciones utilizan su equivalente mensual."
+        )
 
         if deudas.empty:
             st.info(

@@ -1,6 +1,7 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 from modules.prioridades import aplicar_prioridades
 import plotly.express as px
 import plotly.graph_objects as go
@@ -2294,6 +2295,8 @@ def leer_deudas_excel(file):
         "INTERES": "Interés",
         "INTERES NM": "Interés",
         "INTERES MENSUAL": "Interés",
+        "TASA INGRESADA": "Tasa ingresada",
+        "TIPO DE TASA": "Tipo de tasa",
         "SALDO": "Saldo",
         "SALDO PENDIENTE": "Saldo",
         "AVANCE": "Avance Excel",
@@ -2357,6 +2360,25 @@ def leer_deudas_excel(file):
                 "Interés EA", "Interés del pago", "Capital", "Seguro", "Costos extra",
                 "Cuotas restantes", "Total pendiente con intereses y cargos"]:
         deudas[col] = pd.to_numeric(deudas[col], errors="coerce")
+    # Las nuevas entradas son porcentajes de Excel (24 % se almacena como 0.24).
+    # Se calculan aquí también para no depender del valor guardado de F/G.
+    if {"Tasa ingresada", "Tipo de tasa"}.issubset(deudas.columns):
+        entrada = deudas["Tasa ingresada"]
+        presentes = entrada.notna() & entrada.astype(str).str.strip().ne("")
+        tasas = pd.to_numeric(entrada, errors="coerce")
+        tipos = deudas["Tipo de tasa"].map(normalizar).replace({
+            "NM": "MENSUAL", "NOMINAL MENSUAL": "MENSUAL",
+            "EFECTIVO ANUAL": "EA", "EFECTIVA ANUAL": "EA",
+        })
+        invalidas = presentes & (tasas.isna() | ~np.isfinite(tasas) | tasas.lt(0) | ~tipos.isin(["MENSUAL", "EA"]))
+        if invalidas.any():
+            nombres = ", ".join(deudas.loc[invalidas, "Nombre"].astype(str))
+            raise ValueError("Revisa la tasa ingresada y elige NM (Nominal Mensual) o EA (Efectivo Anual) en Pasivos: " + nombres)
+        mensuales = presentes & tipos.eq("MENSUAL")
+        anuales = presentes & tipos.eq("EA")
+        deudas.loc[mensuales, "Interés"] = tasas.loc[mensuales]
+        deudas.loc[anuales, "Interés"] = np.expm1(np.log1p(tasas.loc[anuales]) / 12)
+        deudas.loc[presentes, "Interés EA"] = np.expm1(np.log1p(deudas.loc[presentes, "Interés"]) * 12)
     deudas["Deuda inicial"] = deudas["Deuda inicial"].fillna(deudas["Saldo"]).fillna(0).clip(lower=0)
     deudas["Saldo"] = deudas["Saldo"].fillna(deudas["Deuda inicial"]).fillna(0).clip(lower=0)
     deudas["Interés"] = deudas["Interés"].fillna(0).clip(lower=0)

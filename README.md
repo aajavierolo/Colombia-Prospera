@@ -79,6 +79,8 @@ La vista **Básico** muestra el resumen. La vista **Avanzado** habilita las ocho
 
 Actualiza el **saldo pendiente** y las condiciones de cada obligación en **Pasivos**. En el dashboard, las deudas con saldo positivo se priorizan por mayor tasa de interés y, en caso de empate, por mayor saldo.
 
+Para registrar intereses, usa las columnas **F: Tasa ingresada** y **G: Tipo de tasa**. Escribe la tasa con el símbolo **%** y elige **NM (Nominal Mensual)** o **EA (Efectivo Anual)**. Por ejemplo, `24%` con tipo **EA** equivale aproximadamente a **1,81% mensual**; `2%` con tipo **NM** conserva ese valor mensual. Las columnas **H: interes NM** y **I: Interes EA** se calculan automáticamente: conserva sus fórmulas. Altium lee los encabezados, calcula la conversión al leer el archivo y sigue admitiendo las plantillas anteriores, incluidos los selectores Mensual, Nominal Mensual y Efectivo Anual.
+
 Abre **Amortización** en la tarjeta del crédito para ver las opciones disponibles según sus datos. Puedes ajustar la cuota y los abonos extraordinarios y pulsar **Aplicar simulación** para comparar el resultado.
 
 **La simulación no registra pagos reales ni cambia el saldo del Sheets.** Los intereses y tiempos proyectados son estimaciones a partir de los datos cargados.
