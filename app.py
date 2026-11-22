@@ -1193,8 +1193,8 @@ if archivo is None or st.session_state.get("mostrar_carga_datos", False):
                     with st.spinner("Leyendo el archivo de Google…"):
                         contenido_publico = descargar_libro_publico(enlace_publico)
                         with pd.ExcelFile(BytesIO(contenido_publico)) as libro_publico:
-                            if not any(nombre in libro_publico.sheet_names for nombre in ("Gastos", "Transaccional")):
-                                raise ValueError('El archivo debe tener la hoja Gastos o Transaccional de la plantilla de Altium.')
+                            if not any(nombre in libro_publico.sheet_names for nombre in ("Egresos", "Gastos", "Transaccional")):
+                                raise ValueError('El archivo debe tener la hoja Egresos, Gastos o Transaccional de la plantilla.')
                         st.session_state["libro_enlace_publico"] = contenido_publico
                         st.session_state["mostrar_carga_datos"] = False
                         carga_solicitada = True
@@ -1222,6 +1222,14 @@ if archivo:
         trm_usd_cop=trm_colombia.get("valor"),
         incluir_deudas=True,
     )
+
+    # Nombre visible actualizado, también al cargar archivos anteriores.
+    if "INGRESOS_CATEGORIA" in ingresos.columns:
+        ingresos = ingresos.copy()
+        ingresos["INGRESOS_CATEGORIA"] = ingresos["INGRESOS_CATEGORIA"].map(nombre_visible_categoria_ingreso)
+    if "CATEGORIA" in felicidad_trabajos.columns:
+        felicidad_trabajos = felicidad_trabajos.copy()
+        felicidad_trabajos["CATEGORIA"] = felicidad_trabajos["CATEGORIA"].map(nombre_visible_categoria_ingreso)
 
     st.session_state["libro_activo_altium"] = archivo.getvalue()
     if carga_solicitada:
@@ -1337,6 +1345,9 @@ if archivo:
         deudas["Saldo"] = deudas["Saldo"].fillna(
             deudas["Deuda inicial"]
         ).clip(lower=0)
+
+        # Solo las obligaciones con saldo pendiente participan en el informe.
+        deudas = deudas.loc[deudas["Saldo"].gt(0)].copy()
 
         # El avance se recalcula para no depender de fórmulas guardadas en Excel.
         deudas["Pagado"] = (
@@ -2329,7 +2340,7 @@ if archivo:
 
         col1, col2 = st.columns(2, gap="large")
         with st.expander("Acciones de control: mantener, reducir o eliminar"):
-            st.caption("Gastos prevalece sobre Datos. Las acciones son decisiones previstas: no cambian los importes ni representan ahorro ya realizado.")
+            st.caption("Egresos prevalece sobre Presupuesto_Mes. Las acciones son decisiones previstas: no cambian los importes ni representan ahorro ya realizado.")
             if not df.empty and "ACCION_CONTROL" in df.columns:
                 resumen_control = df.groupby("ACCION_CONTROL").agg(
                     Monto_registrado=("GASTOS_CANTIDAD", "sum"), Movimientos=("GASTOS_CANTIDAD", "size")
@@ -2339,7 +2350,7 @@ if archivo:
                 detalle_control = df[["GASTOS_FECHA", "GASTOS_CATEGORIA", "GASTOS_SUBCATEGORIA", "GASTOS_CANTIDAD",
                                       "CONTROL_DATOS", "CONTROL_MANUAL", "ACCION_CONTROL", "ORIGEN_CONTROL"]].rename(columns={
                     "GASTOS_FECHA":"Fecha", "GASTOS_CATEGORIA":"Categoría", "GASTOS_SUBCATEGORIA":"Subcategoría",
-                    "GASTOS_CANTIDAD":"Monto", "CONTROL_DATOS":"Acción en Datos", "CONTROL_MANUAL":"Elección en Gastos",
+                    "GASTOS_CANTIDAD":"Monto", "CONTROL_DATOS":"Acción en Presupuesto_Mes", "CONTROL_MANUAL":"Elección en Egresos",
                     "ACCION_CONTROL":"Acción aplicada", "ORIGEN_CONTROL":"Origen",
                 })
                 st.dataframe(detalle_control, hide_index=True, use_container_width=True,
@@ -2347,10 +2358,10 @@ if archivo:
             else:
                 st.info("No hay gastos para mostrar con los filtros actuales.")
 
-        with st.expander("Prioridad de los gastos: Datos y excepciones por movimiento"):
+        with st.expander("Prioridad de los gastos: Presupuesto_Mes y excepciones por movimiento"):
             st.caption(
                 "La prioridad de Gastos prevalece cuando esta diligenciada. "
-                "Si esta vacia, se usa la de la subcategoria en Datos. "
+                "Si esta vacia, se usa la de la subcategoria en Presupuesto_Mes. "
                 "Sin ninguna de las dos, el movimiento figura como Sin clasificar."
             )
             if not df.empty and "PRIORIDAD_GASTO" in df.columns:
@@ -2375,7 +2386,7 @@ if archivo:
                                         "PRIORIDAD_GASTO", "ORIGEN_PRIORIDAD"]].rename(columns={
                     "GASTOS_FECHA":"Fecha", "GASTOS_CATEGORIA":"Categoría",
                     "GASTOS_SUBCATEGORIA":"Subcategoría", "GASTOS_CANTIDAD":"Monto",
-                    "PRIORIDAD_DATOS":"Predeterminada en Datos", "PRIORIDAD_MANUAL":"Elección en Gastos",
+                    "PRIORIDAD_DATOS":"Predeterminada en Presupuesto_Mes", "PRIORIDAD_MANUAL":"Elección en Egresos",
                     "PRIORIDAD_GASTO":"Prioridad aplicada", "ORIGEN_PRIORIDAD":"Origen",
                 })
                 st.dataframe(detalle_prioridad, hide_index=True, use_container_width=True,
@@ -8092,8 +8103,8 @@ if archivo:
 
         if deudas.empty:
             st.info(
-                "No se encontraron registros válidos en la hoja **Deudas**. "
-                "Usa las columnas: nombre, deuda, interés mensual, saldo, avance e inicio del crédito."
+                "No hay deudas con saldo pendiente para mostrar. "
+                "Revisa tus registros en la hoja **Pasivos** o **Deudas**."
             )
         else:
             total_deuda_inicial = float(deudas["Deuda inicial"].sum())

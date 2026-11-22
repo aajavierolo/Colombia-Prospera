@@ -1571,7 +1571,7 @@ def presupuesto_subcategoria_mes(historico, categoria, subcategoria, mes, anio=N
 
 
 def parse_presupuesto_datos(file):
-    df = _leer_hoja_excel(file, sheet_name="Datos", header=None)
+    df = _leer_presupuesto_excel(file, header=None)
     presupuesto_cat = {}
     presupuesto_sub = {}
 
@@ -1621,7 +1621,7 @@ def leer_presupuesto_mensual_general(file):
     except (ValueError, TypeError, KeyError, IndexError):
         pass
     try:
-        datos = _leer_hoja_excel(file, sheet_name="Datos", header=None)
+        datos = _leer_presupuesto_excel(file, header=None)
         # AA19 contiene el total actual; V19, R19 y O19 respaldan plantillas anteriores.
         for col in (26, 21, 17, 14):
             if datos.shape[0] > 18 and datos.shape[1] > col:
@@ -1865,6 +1865,12 @@ def parse_ingresos_hoja(file, anio_ref=2026):
 
     return ingresos
 
+
+
+def nombre_visible_categoria_ingreso(valor):
+    """Actualiza el nombre anterior sin alterar las otras categorías."""
+    clave = " ".join(normalizar(valor).replace("-", " ").split())
+    return "Residual" if clave.startswith("NO LABOR") else valor
 
 
 def etiqueta_tipo_ingreso(tipo):
@@ -3843,6 +3849,15 @@ def convertir_trabajos_a_ingresos(trabajos):
     return ingresos[columnas].reset_index(drop=True)
 
 
+def _leer_presupuesto_excel(file, **kwargs):
+    """Lee Presupuesto_Mes y conserva las plantillas anteriores con Datos."""
+    if not isinstance(file, pd.ExcelFile):
+        with pd.ExcelFile(file) as libro:
+            return _leer_presupuesto_excel(libro, **kwargs)
+    nombre = next((n for n in ("Presupuesto_Mes", "Datos") if n in file.sheet_names), "Presupuesto_Mes")
+    return _leer_hoja_excel(file, sheet_name=nombre, **kwargs)
+
+
 def _leer_hoja_excel(file, **kwargs):
     """Reutiliza hojas idénticas durante una carga; entrega copias independientes."""
     if isinstance(file, pd.ExcelFile) and hasattr(file, "_altium_hojas"):
@@ -3870,10 +3885,12 @@ def cargar_excel(file, trm_usd_cop=None, incluir_deudas=False):
 def _cargar_excel_abierto(file, trm_usd_cop=None):
     """Carga el Excel de Altium de forma flexible.
 
-    Acepta Gastos e Ingresos separados y la plantilla Transaccional anterior.
+    Acepta Egresos e Ingresos separados (también Gastos en archivos anteriores) y la plantilla Transaccional anterior.
     También conserva compatibilidad con versiones anteriores de la plantilla.
     """
-    hoja_gastos = "Gastos" if "Gastos" in file.sheet_names else "Transaccional"
+    # Las versiones anteriores pueden tener un resumen oculto llamado Egresos.
+    # Si aún existe Gastos, esa sigue siendo la tabla de movimientos.
+    hoja_gastos = next((n for n in ("Gastos", "Egresos", "Transaccional") if n in file.sheet_names), "Egresos")
     try:
         df_raw = _leer_hoja_excel(file, sheet_name=hoja_gastos)
     except Exception:
@@ -3886,7 +3903,7 @@ def _cargar_excel_abierto(file, trm_usd_cop=None):
 
     df_prioridades_original = df_raw.copy()
     # Renombrado por posición para evitar problemas con columnas duplicadas: FECHA, CANTIDAD, etc.
-    if hoja_gastos == "Gastos" and df_raw.shape[1] >= 8:
+    if hoja_gastos in {"Egresos", "Gastos"} and df_raw.shape[1] >= 8:
         df_raw = df_raw.iloc[:, :8].copy()
         df_raw.columns = [
             "MES", "GASTOS_FECHA", "GASTOS_CANTIDAD", "GASTOS_DESCRIPCION",
@@ -3942,7 +3959,7 @@ def _cargar_excel_abierto(file, trm_usd_cop=None):
     gastos["GASTOS_FECHA"] = pd.to_datetime(gastos["GASTOS_FECHA"], errors="coerce")
     gastos["ANIO"] = gastos["GASTOS_FECHA"].dt.year
     try:
-        datos_prioridad = _leer_hoja_excel(file, sheet_name="Datos", header=None)
+        datos_prioridad = _leer_presupuesto_excel(file, header=None)
     except (ValueError, KeyError):
         datos_prioridad = pd.DataFrame()
     gastos = aplicar_prioridades(gastos, datos_prioridad, df_prioridades_original)

@@ -1,4 +1,4 @@
-"""Prioridad del movimiento: Transaccional prevalece sobre Datos."""
+"""Prioridad del movimiento: Transaccional prevalece sobre Presupuesto_Mes."""
 import unicodedata
 
 import pandas as pd
@@ -60,7 +60,7 @@ def aplicar_prioridades(gastos, datos, transaccional):
             origen = "Transaccional" if aplicada else "Revisar Transaccional"
         else:
             aplicada = prioridad_valida(predeterminada)
-            origen = "Datos" if aplicada else ("Revisar Datos" if predeterminada else "Sin clasificar")
+            origen = "Presupuesto_Mes" if aplicada else ("Revisar Presupuesto_Mes" if predeterminada else "Sin clasificar")
         aplicadas.append(aplicada or "Sin clasificar")
         origenes.append(origen)
     resultado["PRIORIDAD_DATOS"] = defaults
@@ -99,7 +99,7 @@ def aplicar_control(gastos, datos, transaccional):
         manual = "" if pd.isna(manual) else str(manual).strip()
         valor = manual or default
         aplicada = validas.get(clave(valor),"")
-        origen = ("Transaccional" if manual else "Datos") if aplicada else ("Revisar Transaccional" if manual else "Revisar Datos" if default else "Sin acción")
+        origen = ("Transaccional" if manual else "Presupuesto_Mes") if aplicada else ("Revisar Transaccional" if manual else "Revisar Presupuesto_Mes" if default else "Sin acción")
         defaults.append(default);overrides.append(manual);aplicadas.append(aplicada or "Sin acción");origenes.append(origen)
     resultado["CONTROL_DATOS"] = defaults
     resultado["CONTROL_MANUAL"] = overrides
