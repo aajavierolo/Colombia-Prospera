@@ -6,6 +6,7 @@ import html
 import unicodedata
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -143,6 +144,25 @@ def proyectar_ingles(saldo, tasa, cuotas, abonos=None, cuota=None):
     return pd.DataFrame(filas, columns=['Cuota', 'Saldo pendiente', 'Pago', 'Capital', 'Intereses', 'Abono extra'])
 
 
+def _texto_plazo(cuota):
+    anios, meses = divmod(max(0, int(cuota)), 12)
+    partes = []
+    if anios:
+        partes.append(f'{anios} año' + ('s' if anios != 1 else ''))
+    if meses:
+        partes.append(f'{meses} mes' + ('es' if meses != 1 else ''))
+    return ' y '.join(partes) if partes else 'hoy'
+
+
+def _agregar_plazo_tooltip(fig):
+    """Expresa cada cuota mensual como tiempo desde el saldo actual."""
+    traza = fig.data[0]
+    traza.text = ['Dentro de ' + _texto_plazo(n) if int(n) > 0 else 'Saldo actual · hoy' for n in traza.x]
+    traza.textposition = 'none'
+    traza.hovertemplate = '<b>⏳ %{text}</b><br>' + traza.hovertemplate
+    return fig
+
+
 def crear_grafico_saldo(tabla):
     """Cada barra es una cuota: capital amortizado y saldo pendiente."""
     base = float(tabla.iloc[0]['Saldo pendiente'])
@@ -186,7 +206,7 @@ def crear_grafico_saldo(tabla):
     fig.add_annotation(xref='paper', yref='paper', x=0, y=1.14,
         text='Cómo se transforma el saldo pendiente en capital pagado',
         showarrow=False, xanchor='left', font=dict(size=12, color='#94A3B8'))
-    return fig
+    return _agregar_plazo_tooltip(fig)
 
 
 def crear_grafico_cuotas_aleman(tabla, separar_abonos=True):
@@ -246,13 +266,50 @@ def crear_grafico_cuotas_aleman(tabla, separar_abonos=True):
         fig.add_annotation(xref='paper', yref='paper', x=0, y=1.12, xanchor='left',
             text='Barras: cuota normal · Rombos amarillos: abonos adicionales (escala derecha)',
             showarrow=False, font=dict(size=11, color='#B4C9D9'))
-    return fig
+    return _agregar_plazo_tooltip(fig)
 
 
 def crear_grafico_cuotas_ingles(tabla):
-    """Muestra intereses periódicos y devolución del capital en la cuota final."""
-    fig = crear_grafico_cuotas_aleman(tabla, separar_abonos=False)
-    fig.update_layout(title='Método inglés/americano · intereses y capital al vencimiento')
+    """Separa el pago final para conservar la escala de los pagos habituales."""
+    pagos = tabla.loc[tabla['Cuota'].gt(0)]
+    fig = make_subplots(rows=1, cols=2, column_widths=[.72, .28], horizontal_spacing=.16,
+        subplot_titles=('Pagos durante el plazo', 'Última cuota · pago de cierre'))
+    for columna, tramo in [(1, pagos.iloc[:-1]), (2, pagos.iloc[-1:])]:
+        if tramo.empty:
+            continue
+        datos = tramo[['Capital', 'Intereses', 'Pago', 'Abono extra', 'Saldo pendiente']].copy()
+        datos['Capital'] -= datos['Abono extra']
+        for indice, (nombre, valores, color) in enumerate([
+            ('Intereses', tramo['Intereses'], '#FF0000'),
+            ('Capital', datos['Capital'], '#00FF00'),
+            ('Abono adicional', tramo['Abono extra'], '#FBBF24'),
+        ]):
+            fig.add_trace(go.Bar(x=tramo['Cuota'], y=valores, name=nombre,
+                marker_color=color, legendgroup=nombre, showlegend=columna == 2,
+                customdata=datos.to_numpy(),
+                text=['Dentro de ' + _texto_plazo(n) for n in tramo['Cuota']], textposition='none',
+                hovertemplate=('<b>⏳ %{text}</b><br><b>Cuota %{x}</b><br>'
+                    'Intereses: $%{customdata[1]:,.0f}<br>Capital: $%{customdata[0]:,.0f}<br>'
+                    'Abono adicional: $%{customdata[3]:,.0f}<br><b>Total: $%{customdata[2]:,.0f}</b><br>'
+                    'Saldo después del pago: $%{customdata[4]:,.0f}<extra></extra>') if indice == 0 else None,
+                hoverinfo=None if indice == 0 else 'skip'), row=1, col=columna)
+    if len(pagos) == 1:
+        fig.add_annotation(text='Solo queda el pago de cierre', x=.3, y=.5,
+            xref='paper', yref='paper', showarrow=False, font=dict(color='#B4C9D9'))
+    fig.update_layout(template='plotly_dark', height=470, barmode='stack', bargap=.3,
+        title=dict(text='Amortización inglesa · pagos y cierre', font=dict(size=20)),
+        paper_bgcolor='#07111F', plot_bgcolor='#0B1829', separators=',.',
+        font=dict(color='#D8E7F3'), margin=dict(l=85, r=35, t=100, b=75),
+        hovermode='x unified', hoverlabel=dict(bgcolor='#0B1829', bordercolor='#38BDF8',
+            font=dict(color='#F8FAFC', size=14), namelength=-1),
+        legend=dict(orientation='h', y=-.13, x=.5, xanchor='center'))
+    fig.update_yaxes(title='Pago (COP)', tickprefix='$', tickformat=',.0f', rangemode='tozero',
+        gridcolor='rgba(148,163,184,.12)', automargin=True)
+    fig.update_xaxes(title='Número de cuota', dtick=1 if len(pagos) < 20 else None, row=1, col=1)
+    if not pagos.empty:
+        ultima = int(pagos.iloc[-1]['Cuota'])
+        fig.update_xaxes(tickvals=[ultima], ticktext=[f'Cuota {ultima} · cierre'],
+            range=[ultima - 1, ultima + 1], row=1, col=2)
     return fig
 
 
@@ -281,7 +338,7 @@ def mejorar_tooltips_frances(fig, tabla):
         hoverlabel=dict(bgcolor='#0B1829', bordercolor='#38BDF8',
             font=dict(family='Arial, sans-serif', size=14, color='#F8FAFC'),
             align='left', namelength=-1))
-    return fig
+    return _agregar_plazo_tooltip(fig)
 
 
 def cargos_mensuales(deuda):
@@ -566,7 +623,11 @@ def _mostrar_proyeccion_no_frances(deuda, key, metodo, nombre_metodo, constructo
         st.session_state[key + '_firma_plazo'] = firma
     plazo = int(sugeridas)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    if ingles:
+        m1, m2, m4 = st.columns(3)
+        m3, m5 = st.columns([1, 2])
+    else:
+        m1, m2, m3, m4, m5 = st.columns(5)
     clave_cuota = key + '_cuota_editable'
     firma_cuota = (metodo, saldo, tasa, int(plazo))
     cuota_recomendada = round(saldo * tasa + (0 if ingles else saldo / int(plazo)), 2)
@@ -621,15 +682,21 @@ def _mostrar_proyeccion_no_frances(deuda, key, metodo, nombre_metodo, constructo
         st.info(str(exc))
         return
     cuota_mensual = float(tabla.iloc[1]['Pago'] - tabla.iloc[1]['Abono extra']) if len(tabla) > 1 else 0.0
+    seguro, costos = cargos_mensuales(deuda)
     with m1.container(border=True, height=170):
-        st.metric('Cuotas restantes estimadas', len(tabla) - 1)
+        meses = len(tabla) - 1
+        st.metric('Tiempo hasta terminar' if ingles else 'Cuotas restantes estimadas',
+            _texto_plazo(meses) if ingles else meses)
     with m2.container(border=True, height=170):
-        st.metric('Cuota con seguro y cargos', f'${cuota_total_registrada(deuda):,.0f}',
-                  help='Pago mensual total registrado en el Excel, incluido seguro y costos extra.')
+        st.metric('Pago mensual inicial' if ingles else 'Cuota con seguro y cargos',
+            ('$' + f'{cuota_mensual + seguro + costos:,.0f}'.replace(',', '.')) if ingles else f'${cuota_total_registrada(deuda):,.0f}',
+            help='Primera cuota proyectada con seguro y cargos, sin abonos adicionales; si solo queda una cuota, incluye el cierre.' if ingles else 'Pago mensual total registrado en el Excel, incluido seguro y costos extra.')
     with m3.container(border=True, height=170):
         st.metric('Intereses futuros estimados', f"${tabla['Intereses'].sum():,.0f}")
     with m4.container(border=True, height=170):
-        st.metric('Total por pagar estimado', f"${tabla['Pago'].sum():,.0f}")
+        st.metric('Pago final estimado' if ingles else 'Total por pagar estimado',
+            ('$' + f"{float(tabla.iloc[-1]['Pago']) + seguro + costos:,.0f}".replace(',', '.')) if ingles else f"${tabla['Pago'].sum():,.0f}",
+            help='Última cuota de la simulación: capital, intereses, abono adicional, seguro y cargos.' if ingles else None)
     st.caption('La cuota cubre intereses y cualquier excedente reduce capital; la última incluye el saldo pendiente.' if ingles
         else 'Se muestra la primera cuota ordinaria de la proyección, sin abono extra. Las siguientes disminuyen al bajar los intereses.')
 
@@ -646,12 +713,20 @@ def _mostrar_proyeccion_no_frances(deuda, key, metodo, nombre_metodo, constructo
     </style>''', unsafe_allow_html=True)
     if vista_grafico == 'Cuota mensual':
         constructor_grafico = crear_grafico_cuotas_ingles if ingles else crear_grafico_cuotas_aleman
-        fig = mejorar_tooltips_frances(constructor_grafico(tabla), tabla)
-        fig.update_layout(title=f'Amortización {nombre_metodo} · composición de la cuota mensual')
+        fig = constructor_grafico(tabla) if ingles else mejorar_tooltips_frances(constructor_grafico(tabla), tabla)
+        if not ingles:
+            fig.update_layout(title=f'Amortización {nombre_metodo} · composición de la cuota mensual')
     with st.container(key=panel):
         st.plotly_chart(fig, use_container_width=True, key=key + '_grafico', theme=None,
             config={'displaylogo': False, 'toImageButtonOptions': {
                 'format': 'png', 'filename': key + '_proyeccion', 'width': 1400, 'height': 650, 'scale': 2}})
+    if ingles:
+        st.caption('El pago de cierre aparece a la derecha y usa su propia escala vertical. Los gráficos desglosan capital, intereses y abonos; el seguro y los cargos se incluyen en las tarjetas y en la tabla.')
+        if vista_grafico == 'Cuota mensual':
+            st.markdown('##### Así cambia lo que debes')
+            st.plotly_chart(mejorar_tooltips_frances(crear_grafico_saldo(tabla), tabla),
+                use_container_width=True, key=key + '_saldo_ingles', theme=None,
+                config={'displaylogo': False})
     nota = ('La cuota cubre los intereses y cualquier excedente reduce capital; al vencimiento se paga el saldo restante.' if ingles
         else 'El capital ordinario por cuota es constante; al reducir cuota con un abono se recalcula para el plazo restante.')
     st.caption(nota + ' Se parte del saldo actual, con tasa mensual constante. El valor de la cuota incluye seguro y costos extra del Excel. El desembolso total agrega los abonos extraordinarios. El plazo se estima con las cuotas registradas y los meses completos desde Inicio del crédito.')
